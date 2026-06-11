@@ -1,0 +1,17 @@
+[package]
+name = "openmgmt-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+openmgmt-core = { path = "../openmgmt-core" }
+rmcp = { version = "1.7.0", features = ["server", "transport-io"] }
+schemars = "1.0.4"
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "io-std"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }

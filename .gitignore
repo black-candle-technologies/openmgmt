@@ -1,0 +1,10 @@
+/target/
+/apps/desktop/src-tauri/gen/
+/data/*.sqlite
+/data/*.sqlite-*
+/apps/desktop/ui/dist/*
+!/apps/desktop/ui/dist/index.html
+/.trunk/
+*.log
+.DS_Store
+Thumbs.db

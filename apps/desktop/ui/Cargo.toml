@@ -1,0 +1,23 @@
+[package]
+name = "openmgmt-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "openmgmt-ui"
+path = "src/main.rs"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+chrono.workspace = true
+console_error_panic_hook = "0.1.7"
+gloo-timers = "0.3.0"
+leptos = { version = "0.8.10", features = ["csr"] }
+openmgmt-core = { path = "../../../crates/openmgmt-core", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+serde-wasm-bindgen = "0.6.5"
+wasm-bindgen = "0.2.104"
+wasm-bindgen-futures = "0.4.54"
+js-sys = "0.3.81"
+web-sys = { version = "0.3.81", features = ["HtmlInputElement", "HtmlSelectElement", "Location", "Window"] }
