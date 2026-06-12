@@ -423,6 +423,7 @@ impl Database {
 
     pub fn update_task(&self, id: &str, patch: TaskPatch) -> Result<Task> {
         let mut task = self.get_task(id)?;
+        let now = Utc::now();
         if let Some(value) = patch.title {
             require_name(&value)?;
             task.title = value;
@@ -431,6 +432,12 @@ impl Database {
             task.description = patch.description;
         }
         if let Some(value) = patch.status {
+            if value == TaskStatus::InProgress && task.started_at.is_none() {
+                task.started_at = Some(now);
+            }
+            if value == TaskStatus::Done && task.completed_at.is_none() {
+                task.completed_at = Some(now);
+            }
             task.status = value;
         }
         if let Some(value) = patch.priority {
@@ -458,7 +465,7 @@ impl Database {
         if let Some(value) = patch.tags {
             task.tags = value;
         }
-        task.updated_at = Utc::now();
+        task.updated_at = now;
         self.save_task(&task)?;
         Ok(task)
     }

@@ -233,19 +233,22 @@ fn ProjectsView(
 
 #[component]
 fn ProjectView(id: String, snapshot: RwSignal<Snapshot>, refresh: Callback<()>) -> impl IntoView {
-    let project = snapshot.get().projects.into_iter().find(|p| p.id == id);
-    match project {
-        Some(project) => {
-            let project_id = project.id.clone();
-            view! {
-                <header class="page-header"><div><p class="eyebrow">{project.project_type.to_string()}</p><h1>{project.name}</h1><p>{project.description.unwrap_or("No project description.".into())}</p></div></header>
-                <section class="panel"><div class="section-title"><h2>Project tasks</h2></div><div class="task-list">
-                    {move || snapshot.get().tasks.into_iter().filter(|task|task.project_id==project_id).map(|task|view!{<TaskCard task refresh />}).collect_view()}
-                </div></section>
-            }.into_any()
-        }
-        None => view! { <div class="empty">Project not found.</div> }.into_any(),
-    }
+    let project_id = id.clone();
+    let header_id = id.clone();
+    view! {
+        {move || {
+            let project = snapshot.get().projects.into_iter().find(|p| p.id == header_id);
+            match project {
+                Some(project) => view! {
+                    <header class="page-header"><div><p class="eyebrow">{project.project_type.to_string()}</p><h1>{project.name}</h1><p>{project.description.unwrap_or("No project description.".into())}</p></div></header>
+                }.into_any(),
+                None => view! { <div class="empty">Project not found.</div> }.into_any(),
+            }
+        }}
+        <section class="panel"><div class="section-title"><h2>Project tasks</h2></div><div class="task-list">
+            {move || snapshot.get().tasks.into_iter().filter(|task|task.project_id==project_id).map(|task|view!{<TaskCard task refresh />}).collect_view()}
+        </div></section>
+    }.into_any()
 }
 
 #[component]
@@ -319,10 +322,12 @@ fn TaskCard(
     let elapsed = task
         .started_at
         .map(|at| (Utc::now() - at).num_minutes().max(0));
+    let time_limit = task.time_limit_minutes;
     view! {
         <article class="task-card"><span class="task-dot">{task.priority}</span><div><strong>{task.title}</strong><p>
             <Status value=task.status.to_string() /> {(!project.is_empty()).then(||view!{<span>{project}</span>})}
             {elapsed.map(|minutes|view!{<span class="timer">{format!("{minutes}m active")}</span>})}
+            {time_limit.map(|m|view!{<span>{format!("limit {m}m")}</span>})}
         </p></div>
         {refresh.map(|refresh| view! { <div class="actions">
             <button class="ghost" disabled=active on:click=move |_| {
