@@ -7,7 +7,10 @@ use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 type CommandResult<T> = Result<T, String>;
 
 fn core<T>(result: openmgmt_core::db::Result<T>) -> CommandResult<T> {
-    result.map_err(|error| error.to_string())
+    result.map_err(|error| {
+        tracing::error!(%error, "Tauri command failed");
+        error.to_string()
+    })
 }
 
 #[tauri::command]
@@ -135,15 +138,12 @@ pub fn open_tv_board_window(app: AppHandle) -> CommandResult<()> {
         window.set_focus().map_err(|error| error.to_string())?;
         return Ok(());
     }
-    WebviewWindowBuilder::new(
-        &app,
-        "tv-board",
-        WebviewUrl::App("index.html?board=1".into()),
-    )
-    .title("OpenMgmt TV Board")
-    .fullscreen(true)
-    .decorations(false)
-    .build()
-    .map_err(|error| error.to_string())?;
+    WebviewWindowBuilder::new(&app, "tv-board", WebviewUrl::App("index.html".into()))
+        .initialization_script("window.__OPENMGMT_BOARD__ = true;")
+        .title("OpenMgmt TV Board")
+        .fullscreen(true)
+        .decorations(false)
+        .build()
+        .map_err(|error| error.to_string())?;
     Ok(())
 }

@@ -166,14 +166,14 @@ impl Database {
         if let Some(slug) = patch.slug {
             current.slug = slugify(&slug);
         }
-        if patch.description.is_some() {
-            current.description = patch.description;
+        if let Some(value) = patch.description {
+            current.description = value;
         }
-        if patch.color.is_some() {
-            current.color = patch.color;
+        if let Some(value) = patch.color {
+            current.color = value;
         }
-        if patch.icon.is_some() {
-            current.icon = patch.icon;
+        if let Some(value) = patch.icon {
+            current.icon = value;
         }
         current.updated_at = Utc::now();
         self.connection()?.execute(
@@ -218,10 +218,11 @@ impl Database {
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id,organization_id,name,slug,description,type,status,priority,deadline,repo_url,
-                    notes,created_at,updated_at,archived_at
-             FROM projects WHERE archived_at IS NULL AND status != 'archived'
-             ORDER BY priority DESC,name",
+            "SELECT p.id,p.organization_id,p.name,p.slug,p.description,p.type,p.status,p.priority,
+                    p.deadline,p.repo_url,p.notes,p.created_at,p.updated_at,p.archived_at
+             FROM projects p JOIN organizations o ON o.id=p.organization_id
+             WHERE p.archived_at IS NULL AND p.status != 'archived' AND o.archived_at IS NULL
+             ORDER BY p.priority DESC,p.name",
         )?;
         Ok(statement
             .query_map([], map_project)?
@@ -292,8 +293,8 @@ impl Database {
         if let Some(value) = patch.slug {
             project.slug = slugify(&value);
         }
-        if patch.description.is_some() {
-            project.description = patch.description;
+        if let Some(value) = patch.description {
+            project.description = value;
         }
         if let Some(value) = patch.project_type {
             project.project_type = value;
@@ -305,14 +306,14 @@ impl Database {
             validate_priority(value)?;
             project.priority = value;
         }
-        if patch.deadline.is_some() {
-            project.deadline = patch.deadline;
+        if let Some(value) = patch.deadline {
+            project.deadline = value;
         }
-        if patch.repo_url.is_some() {
-            project.repo_url = patch.repo_url;
+        if let Some(value) = patch.repo_url {
+            project.repo_url = value;
         }
-        if patch.notes.is_some() {
-            project.notes = patch.notes;
+        if let Some(value) = patch.notes {
+            project.notes = value;
         }
         project.updated_at = Utc::now();
         self.connection()?.execute(
@@ -348,10 +349,16 @@ impl Database {
 
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare(&format!(
-            "{} WHERE status != 'canceled' ORDER BY priority DESC,created_at",
-            TASK_SELECT
-        ))?;
+        let mut statement = connection.prepare(
+            "SELECT t.id,t.project_id,t.title,t.description,t.status,t.priority,t.due_at,
+                    t.scheduled_at,t.started_at,t.completed_at,t.estimated_minutes,
+                    t.time_limit_minutes,t.pinned,t.blocked_reason,t.tags,t.created_at,t.updated_at
+             FROM tasks t JOIN projects p ON p.id=t.project_id
+             JOIN organizations o ON o.id=p.organization_id
+             WHERE t.status != 'canceled' AND p.archived_at IS NULL
+               AND p.status != 'archived' AND o.archived_at IS NULL
+             ORDER BY t.priority DESC,t.created_at",
+        )?;
         Ok(statement
             .query_map([], map_task)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -428,8 +435,8 @@ impl Database {
             require_name(&value)?;
             task.title = value;
         }
-        if patch.description.is_some() {
-            task.description = patch.description;
+        if let Some(value) = patch.description {
+            task.description = value;
         }
         if let Some(value) = patch.status {
             if value == TaskStatus::InProgress && task.started_at.is_none() {
@@ -444,23 +451,23 @@ impl Database {
             validate_priority(value)?;
             task.priority = value;
         }
-        if patch.due_at.is_some() {
-            task.due_at = patch.due_at;
+        if let Some(value) = patch.due_at {
+            task.due_at = value;
         }
-        if patch.scheduled_at.is_some() {
-            task.scheduled_at = patch.scheduled_at;
+        if let Some(value) = patch.scheduled_at {
+            task.scheduled_at = value;
         }
-        if patch.estimated_minutes.is_some() {
-            task.estimated_minutes = patch.estimated_minutes;
+        if let Some(value) = patch.estimated_minutes {
+            task.estimated_minutes = value;
         }
-        if patch.time_limit_minutes.is_some() {
-            task.time_limit_minutes = patch.time_limit_minutes;
+        if let Some(value) = patch.time_limit_minutes {
+            task.time_limit_minutes = value;
         }
         if let Some(value) = patch.pinned {
             task.pinned = value;
         }
-        if patch.blocked_reason.is_some() {
-            task.blocked_reason = patch.blocked_reason;
+        if let Some(value) = patch.blocked_reason {
+            task.blocked_reason = value;
         }
         if let Some(value) = patch.tags {
             task.tags = value;
@@ -524,7 +531,7 @@ impl Database {
               p.name,p.type,p.status,p.priority,o.name,o.color
              FROM tasks t JOIN projects p ON p.id=t.project_id
              JOIN organizations o ON o.id=p.organization_id
-             WHERE p.archived_at IS NULL AND o.archived_at IS NULL",
+             WHERE p.archived_at IS NULL AND p.status != 'archived' AND o.archived_at IS NULL",
         )?;
         let contexts = statement
             .query_map([], |row| {
@@ -570,13 +577,26 @@ impl Database {
                 })?;
             }
         }
-        if self.list_projects()?.is_empty() {
-            let personal = self
-                .list_organizations()?
-                .into_iter()
-                .find(|org| org.slug == "personal")
-                .ok_or(CoreError::NotFound("seed organization"))?;
-            let project = self.create_project(NewProject {
+        let personal = self
+            .list_organizations()?
+            .into_iter()
+            .find(|org| org.slug == "personal")
+            .ok_or(CoreError::NotFound("seed organization"))?;
+        let existing_project = {
+            let connection = self.connection()?;
+            connection
+                .query_row(
+                    "SELECT id,organization_id,name,slug,description,type,status,priority,deadline,
+                        repo_url,notes,created_at,updated_at,archived_at
+                 FROM projects WHERE organization_id=?1 AND slug='openmgmt'
+                   AND archived_at IS NULL",
+                    [&personal.id],
+                    map_project,
+                )
+                .optional()?
+        };
+        let project = existing_project.map(Ok).unwrap_or_else(|| {
+            self.create_project(NewProject {
                 organization_id: personal.id,
                 name: "OpenMgmt".into(),
                 slug: Some("openmgmt".into()),
@@ -587,49 +607,89 @@ impl Database {
                 deadline: None,
                 repo_url: Some("https://github.com/LaneBucher/openmgmt".into()),
                 notes: None,
-            })?;
-            for input in [
-                NewTask {
+            })
+        })?;
+
+        let now = Utc::now();
+        let seeds = [
+            (
+                "Review the MVP on the TV board",
+                TaskStatus::InProgress,
+                5,
+                Some(now + Duration::hours(2)),
+                Some(now),
+                true,
+                None,
+            ),
+            (
+                "Document local backup workflow",
+                TaskStatus::Ready,
+                3,
+                Some(now + Duration::hours(20)),
+                None,
+                false,
+                None,
+            ),
+            (
+                "Resolve overdue launch decision",
+                TaskStatus::Ready,
+                4,
+                Some(now - Duration::hours(3)),
+                None,
+                false,
+                None,
+            ),
+            (
+                "Confirm external dependency",
+                TaskStatus::Blocked,
+                4,
+                Some(now + Duration::hours(8)),
+                None,
+                false,
+                Some("Waiting for confirmation"),
+            ),
+            (
+                "Plan the afternoon review",
+                TaskStatus::Scheduled,
+                2,
+                Some(now + Duration::hours(30)),
+                Some(now + Duration::hours(4)),
+                false,
+                None,
+            ),
+            (
+                "Capture launch notes",
+                TaskStatus::Inbox,
+                2,
+                None,
+                None,
+                false,
+                None,
+            ),
+        ];
+        for (title, status, priority, due_at, scheduled_at, pinned, blocked_reason) in seeds {
+            let exists: bool = self.connection()?.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE project_id=?1 AND title=?2)",
+                params![project.id, title],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                let task = self.create_task(NewTask {
                     project_id: project.id.clone(),
-                    title: "Review the MVP on the TV board".into(),
+                    title: title.into(),
                     description: None,
-                    status: TaskStatus::InProgress,
-                    priority: 5,
-                    due_at: Some(Utc::now() + Duration::hours(2)),
-                    scheduled_at: Some(Utc::now()),
-                    estimated_minutes: Some(45),
-                    time_limit_minutes: Some(60),
-                    pinned: true,
-                    tags: vec!["mvp".into()],
-                },
-                NewTask {
-                    project_id: project.id.clone(),
-                    title: "Document local backup workflow".into(),
-                    description: None,
-                    status: TaskStatus::Ready,
-                    priority: 3,
-                    due_at: Some(Utc::now() + Duration::hours(20)),
-                    scheduled_at: None,
+                    status,
+                    priority,
+                    due_at,
+                    scheduled_at,
                     estimated_minutes: Some(30),
-                    time_limit_minutes: Some(30),
-                    pinned: false,
-                    tags: vec!["docs".into()],
-                },
-                NewTask {
-                    project_id: project.id.clone(),
-                    title: "Resolve overdue launch decision".into(),
-                    description: None,
-                    status: TaskStatus::Ready,
-                    priority: 4,
-                    due_at: Some(Utc::now() - Duration::hours(3)),
-                    scheduled_at: None,
-                    estimated_minutes: Some(15),
-                    time_limit_minutes: Some(20),
-                    pinned: false,
-                    tags: vec!["launch".into()],
-                },
-            ] {
-                self.create_task(input)?;
+                    time_limit_minutes: Some(45),
+                    pinned,
+                    tags: vec!["seed".into()],
+                })?;
+                if let Some(reason) = blocked_reason {
+                    self.transition_task(&task.id, TaskStatus::Blocked, Some(reason.into()))?;
+                }
             }
         }
         Ok(())
@@ -772,13 +832,101 @@ fn changed(rows: usize, entity: &'static str) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn migration_and_seed_are_idempotent() {
+    fn seeded_database() -> Database {
         let db = Database::in_memory().unwrap();
         db.seed().unwrap();
+        db
+    }
+
+    #[test]
+    fn migration_and_seed_are_idempotent() {
+        let db = seeded_database();
         db.seed().unwrap();
         assert_eq!(db.list_organizations().unwrap().len(), 4);
         assert!(!db.list_projects().unwrap().is_empty());
-        assert!(!db.list_tasks().unwrap().is_empty());
+        assert!(db.list_tasks().unwrap().len() >= 6);
+    }
+
+    #[test]
+    fn start_task_persists_in_progress_and_started_at() {
+        let db = seeded_database();
+        let task = db
+            .list_tasks()
+            .unwrap()
+            .into_iter()
+            .find(|task| task.status == TaskStatus::Inbox)
+            .unwrap();
+        db.transition_task(&task.id, TaskStatus::InProgress, None)
+            .unwrap();
+        let persisted = db.get_task(&task.id).unwrap();
+        assert_eq!(persisted.status, TaskStatus::InProgress);
+        assert!(persisted.started_at.is_some());
+        assert!(
+            db.board_state()
+                .unwrap()
+                .now
+                .iter()
+                .any(|item| item.context.task.id == task.id)
+        );
+    }
+
+    #[test]
+    fn complete_task_persists_and_appears_in_done_today() {
+        let db = seeded_database();
+        let task = db
+            .list_tasks()
+            .unwrap()
+            .into_iter()
+            .find(|task| task.status == TaskStatus::Inbox)
+            .unwrap();
+        db.transition_task(&task.id, TaskStatus::Done, None)
+            .unwrap();
+        let persisted = db.get_task(&task.id).unwrap();
+        assert_eq!(persisted.status, TaskStatus::Done);
+        assert!(persisted.completed_at.is_some());
+        assert!(
+            db.board_state()
+                .unwrap()
+                .done_today
+                .iter()
+                .any(|item| item.context.task.id == task.id)
+        );
+    }
+
+    #[test]
+    fn organization_updates_are_persisted() {
+        let db = seeded_database();
+        let organization = db.list_organizations().unwrap().remove(0);
+        db.update_organization(
+            &organization.id,
+            OrganizationPatch {
+                name: Some("Updated Organization".into()),
+                description: Some(Some("Updated description".into())),
+                color: Some(Some("#123456".into())),
+                icon: Some(Some("UP".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let persisted = db.get_organization(&organization.id).unwrap();
+        assert_eq!(persisted.name, "Updated Organization");
+        assert_eq!(
+            persisted.description.as_deref(),
+            Some("Updated description")
+        );
+        assert_eq!(persisted.color.as_deref(), Some("#123456"));
+        assert_eq!(persisted.icon.as_deref(), Some("UP"));
+    }
+
+    #[test]
+    fn seeded_active_tasks_produce_a_non_empty_board() {
+        let board = seeded_database().board_state().unwrap();
+        let active_count = board.now.len()
+            + board.next_up.len()
+            + board.due_soon.len()
+            + board.waiting_blocked.len()
+            + board.later_today.len()
+            + board.overdue.len();
+        assert!(active_count > 0);
     }
 }

@@ -172,9 +172,9 @@ pub struct NewOrganization {
 pub struct OrganizationPatch {
     pub name: Option<String>,
     pub slug: Option<String>,
-    pub description: Option<String>,
-    pub color: Option<String>,
-    pub icon: Option<String>,
+    pub description: Option<Option<String>>,
+    pub color: Option<Option<String>>,
+    pub icon: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,13 +198,13 @@ pub struct NewProject {
 pub struct ProjectPatch {
     pub name: Option<String>,
     pub slug: Option<String>,
-    pub description: Option<String>,
+    pub description: Option<Option<String>>,
     pub project_type: Option<ProjectType>,
     pub status: Option<ProjectStatus>,
     pub priority: Option<i32>,
-    pub deadline: Option<DateTime<Utc>>,
-    pub repo_url: Option<String>,
-    pub notes: Option<String>,
+    pub deadline: Option<Option<DateTime<Utc>>>,
+    pub repo_url: Option<Option<String>>,
+    pub notes: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,15 +229,15 @@ pub struct NewTask {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TaskPatch {
     pub title: Option<String>,
-    pub description: Option<String>,
+    pub description: Option<Option<String>>,
     pub status: Option<TaskStatus>,
     pub priority: Option<i32>,
-    pub due_at: Option<DateTime<Utc>>,
-    pub scheduled_at: Option<DateTime<Utc>>,
-    pub estimated_minutes: Option<i32>,
-    pub time_limit_minutes: Option<i32>,
+    pub due_at: Option<Option<DateTime<Utc>>>,
+    pub scheduled_at: Option<Option<DateTime<Utc>>>,
+    pub estimated_minutes: Option<Option<i32>>,
+    pub time_limit_minutes: Option<Option<i32>>,
     pub pinned: Option<bool>,
-    pub blocked_reason: Option<String>,
+    pub blocked_reason: Option<Option<String>>,
     pub tags: Option<Vec<String>>,
 }
 
