@@ -4,6 +4,7 @@ use crate::{
         BoardState, NewOrganization, NewProject, NewTask, Organization, OrganizationPatch, Project,
         ProjectPatch, ProjectStatus, ProjectType, Task, TaskContext, TaskPatch, TaskStatus,
     },
+    sync::{LOCAL_DEVICE_ID_KEY, SyncEntityType, SyncEvent, SyncOperation},
 };
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -110,7 +111,145 @@ impl Database {
             CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks(project_id);
             CREATE INDEX IF NOT EXISTS tasks_status_idx ON tasks(status);
             CREATE INDEX IF NOT EXISTS tasks_due_idx ON tasks(due_at);
+            CREATE TABLE IF NOT EXISTS sync_events (
+              event_id TEXT PRIMARY KEY NOT NULL,
+              device_id TEXT NOT NULL,
+              sequence INTEGER NOT NULL,
+              entity_type TEXT NOT NULL,
+              entity_id TEXT NOT NULL,
+              operation TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              synced_at TEXT,
+              UNIQUE(device_id, sequence)
+            );
+            CREATE INDEX IF NOT EXISTS sync_events_unsynced_idx ON sync_events(synced_at);
+            CREATE INDEX IF NOT EXISTS sync_events_entity_idx
+              ON sync_events(entity_type, entity_id);
+            CREATE TABLE IF NOT EXISTS sync_state (
+              key TEXT PRIMARY KEY NOT NULL,
+              value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sync_devices (
+              device_id TEXT PRIMARY KEY NOT NULL,
+              name TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              last_seen_at TEXT
+            );
             "#,
+        )?;
+        Ok(())
+    }
+
+    pub fn get_or_create_device_id(&self) -> Result<String> {
+        let connection = self.connection()?;
+        if let Some(device_id) = connection
+            .query_row(
+                "SELECT value FROM sync_state WHERE key=?1",
+                [LOCAL_DEVICE_ID_KEY],
+                |row| row.get(0),
+            )
+            .optional()?
+        {
+            return Ok(device_id);
+        }
+
+        let device_id = Uuid::new_v4().to_string();
+        connection.execute(
+            "INSERT INTO sync_state (key, value) VALUES (?1, ?2)",
+            params![LOCAL_DEVICE_ID_KEY, device_id],
+        )?;
+        Ok(device_id)
+    }
+
+    pub fn append_sync_event(
+        &self,
+        entity_type: SyncEntityType,
+        entity_id: &str,
+        operation: SyncOperation,
+        payload_json: serde_json::Value,
+    ) -> Result<SyncEvent> {
+        let device_id = self.get_or_create_device_id()?;
+        let connection = self.connection()?;
+        let sequence = connection.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM sync_events WHERE device_id=?1",
+            [&device_id],
+            |row| row.get(0),
+        )?;
+        let event = SyncEvent {
+            event_id: Uuid::new_v4().to_string(),
+            device_id,
+            sequence,
+            entity_type,
+            entity_id: entity_id.to_owned(),
+            operation,
+            payload_json,
+            created_at: Utc::now(),
+            synced_at: None,
+        };
+        connection.execute(
+            "INSERT INTO sync_events (
+                event_id,device_id,sequence,entity_type,entity_id,operation,payload_json,
+                created_at,synced_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                event.event_id,
+                event.device_id,
+                event.sequence,
+                event.entity_type.to_string(),
+                event.entity_id,
+                event.operation.to_string(),
+                event.payload_json.to_string(),
+                timestamp(event.created_at),
+                Option::<String>::None,
+            ],
+        )?;
+        Ok(event)
+    }
+
+    pub fn list_unsynced_events(&self) -> Result<Vec<SyncEvent>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT event_id,device_id,sequence,entity_type,entity_id,operation,payload_json,
+                    created_at,synced_at
+             FROM sync_events WHERE synced_at IS NULL ORDER BY device_id,sequence",
+        )?;
+        Ok(statement
+            .query_map([], map_sync_event)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn mark_sync_events_synced(&self, event_ids: &[String]) -> Result<()> {
+        if event_ids.is_empty() {
+            return Ok(());
+        }
+        let synced_at = timestamp(Utc::now());
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        for event_id in event_ids {
+            transaction.execute(
+                "UPDATE sync_events SET synced_at=?2 WHERE event_id=?1",
+                params![event_id, synced_at],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn get_sync_state(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .connection()?
+            .query_row("SELECT value FROM sync_state WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn set_sync_state(&self, key: &str, value: &str) -> Result<()> {
+        self.connection()?.execute(
+            "INSERT INTO sync_state (key,value) VALUES (?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
         )?;
         Ok(())
     }
@@ -127,6 +266,14 @@ impl Database {
     }
 
     pub fn create_organization(&self, input: NewOrganization) -> Result<Organization> {
+        self.create_organization_internal(input, true)
+    }
+
+    fn create_organization_internal(
+        &self,
+        input: NewOrganization,
+        log_sync: bool,
+    ) -> Result<Organization> {
         require_name(&input.name)?;
         let now = Utc::now();
         let organization = Organization {
@@ -154,6 +301,14 @@ impl Database {
                 Option::<String>::None
             ],
         )?;
+        if log_sync {
+            self.append_sync_event(
+                SyncEntityType::Organization,
+                &organization.id,
+                SyncOperation::Created,
+                serde_json::json!({ "entity": &organization }),
+            )?;
+        }
         Ok(organization)
     }
 
@@ -189,18 +344,31 @@ impl Database {
                 timestamp(current.updated_at)
             ],
         )?;
+        self.append_sync_event(
+            SyncEntityType::Organization,
+            &current.id,
+            SyncOperation::Updated,
+            serde_json::json!({ "entity": &current }),
+        )?;
         Ok(current)
     }
 
     pub fn archive_organization(&self, id: &str) -> Result<()> {
-        let now = timestamp(Utc::now());
+        let archived_at = Utc::now();
         changed(
             self.connection()?.execute(
                 "UPDATE organizations SET archived_at=?2,updated_at=?2 WHERE id=?1",
-                params![id, now],
+                params![id, timestamp(archived_at)],
             )?,
             "organization",
-        )
+        )?;
+        self.append_sync_event(
+            SyncEntityType::Organization,
+            id,
+            SyncOperation::Archived,
+            serde_json::json!({ "id": id, "archived_at": archived_at }),
+        )?;
+        Ok(())
     }
 
     fn get_organization(&self, id: &str) -> Result<Organization> {
@@ -242,6 +410,10 @@ impl Database {
     }
 
     pub fn create_project(&self, input: NewProject) -> Result<Project> {
+        self.create_project_internal(input, true)
+    }
+
+    fn create_project_internal(&self, input: NewProject, log_sync: bool) -> Result<Project> {
         require_name(&input.name)?;
         validate_priority(input.priority)?;
         self.get_organization(&input.organization_id)?;
@@ -281,6 +453,14 @@ impl Database {
                 Option::<String>::None
             ],
         )?;
+        if log_sync {
+            self.append_sync_event(
+                SyncEntityType::Project,
+                &project.id,
+                SyncOperation::Created,
+                serde_json::json!({ "entity": &project }),
+            )?;
+        }
         Ok(project)
     }
 
@@ -333,18 +513,31 @@ impl Database {
                 timestamp(project.updated_at)
             ],
         )?;
+        self.append_sync_event(
+            SyncEntityType::Project,
+            &project.id,
+            SyncOperation::Updated,
+            serde_json::json!({ "entity": &project }),
+        )?;
         Ok(project)
     }
 
     pub fn archive_project(&self, id: &str) -> Result<()> {
-        let now = timestamp(Utc::now());
+        let archived_at = Utc::now();
         changed(
             self.connection()?.execute(
                 "UPDATE projects SET status='archived',archived_at=?2,updated_at=?2 WHERE id=?1",
-                params![id, now],
+                params![id, timestamp(archived_at)],
             )?,
             "project",
-        )
+        )?;
+        self.append_sync_event(
+            SyncEntityType::Project,
+            id,
+            SyncOperation::Archived,
+            serde_json::json!({ "id": id, "archived_at": archived_at }),
+        )?;
+        Ok(())
     }
 
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
@@ -372,6 +565,10 @@ impl Database {
     }
 
     pub fn create_task(&self, input: NewTask) -> Result<Task> {
+        self.create_task_internal(input, true)
+    }
+
+    fn create_task_internal(&self, input: NewTask, log_sync: bool) -> Result<Task> {
         require_name(&input.title)?;
         validate_priority(input.priority)?;
         self.get_project(&input.project_id)?;
@@ -425,6 +622,14 @@ impl Database {
                 updated_at
             ],
         )?;
+        if log_sync {
+            self.append_sync_event(
+                SyncEntityType::Task,
+                &task.id,
+                SyncOperation::Created,
+                serde_json::json!({ "entity": &task }),
+            )?;
+        }
         Ok(task)
     }
 
@@ -474,6 +679,12 @@ impl Database {
         }
         task.updated_at = now;
         self.save_task(&task)?;
+        self.append_sync_event(
+            SyncEntityType::Task,
+            &task.id,
+            SyncOperation::Updated,
+            serde_json::json!({ "entity": &task }),
+        )?;
         Ok(task)
     }
 
@@ -482,6 +693,16 @@ impl Database {
         id: &str,
         status: TaskStatus,
         blocked_reason: Option<String>,
+    ) -> Result<Task> {
+        self.transition_task_internal(id, status, blocked_reason, true)
+    }
+
+    fn transition_task_internal(
+        &self,
+        id: &str,
+        status: TaskStatus,
+        blocked_reason: Option<String>,
+        log_sync: bool,
     ) -> Result<Task> {
         let mut task = self.get_task(id)?;
         let now = Utc::now();
@@ -495,6 +716,14 @@ impl Database {
             task.completed_at = Some(now);
         }
         self.save_task(&task)?;
+        if log_sync {
+            self.append_sync_event(
+                SyncEntityType::Task,
+                &task.id,
+                SyncOperation::Transitioned,
+                serde_json::json!({ "entity": &task }),
+            )?;
+        }
         Ok(task)
     }
 
@@ -568,13 +797,16 @@ impl Database {
                 |row| row.get(0),
             )?;
             if !exists {
-                self.create_organization(NewOrganization {
-                    name: name.into(),
-                    slug: Some(slug.into()),
-                    description: None,
-                    color: Some(color.into()),
-                    icon: Some(icon.into()),
-                })?;
+                self.create_organization_internal(
+                    NewOrganization {
+                        name: name.into(),
+                        slug: Some(slug.into()),
+                        description: None,
+                        color: Some(color.into()),
+                        icon: Some(icon.into()),
+                    },
+                    false,
+                )?;
             }
         }
         let personal = self
@@ -596,18 +828,21 @@ impl Database {
                 .optional()?
         };
         let project = existing_project.map(Ok).unwrap_or_else(|| {
-            self.create_project(NewProject {
-                organization_id: personal.id,
-                name: "OpenMgmt".into(),
-                slug: Some("openmgmt".into()),
-                description: Some("Local-first project and task operations console.".into()),
-                project_type: ProjectType::Software,
-                status: ProjectStatus::Active,
-                priority: 5,
-                deadline: None,
-                repo_url: Some("https://github.com/LaneBucher/openmgmt".into()),
-                notes: None,
-            })
+            self.create_project_internal(
+                NewProject {
+                    organization_id: personal.id,
+                    name: "OpenMgmt".into(),
+                    slug: Some("openmgmt".into()),
+                    description: Some("Local-first project and task operations console.".into()),
+                    project_type: ProjectType::Software,
+                    status: ProjectStatus::Active,
+                    priority: 5,
+                    deadline: None,
+                    repo_url: Some("https://github.com/LaneBucher/openmgmt".into()),
+                    notes: None,
+                },
+                false,
+            )
         })?;
 
         let now = Utc::now();
@@ -674,21 +909,29 @@ impl Database {
                 |row| row.get(0),
             )?;
             if !exists {
-                let task = self.create_task(NewTask {
-                    project_id: project.id.clone(),
-                    title: title.into(),
-                    description: None,
-                    status,
-                    priority,
-                    due_at,
-                    scheduled_at,
-                    estimated_minutes: Some(30),
-                    time_limit_minutes: Some(45),
-                    pinned,
-                    tags: vec!["seed".into()],
-                })?;
+                let task = self.create_task_internal(
+                    NewTask {
+                        project_id: project.id.clone(),
+                        title: title.into(),
+                        description: None,
+                        status,
+                        priority,
+                        due_at,
+                        scheduled_at,
+                        estimated_minutes: Some(30),
+                        time_limit_minutes: Some(45),
+                        pinned,
+                        tags: vec!["seed".into()],
+                    },
+                    false,
+                )?;
                 if let Some(reason) = blocked_reason {
-                    self.transition_task(&task.id, TaskStatus::Blocked, Some(reason.into()))?;
+                    self.transition_task_internal(
+                        &task.id,
+                        TaskStatus::Blocked,
+                        Some(reason.into()),
+                        false,
+                    )?;
                 }
             }
         }
@@ -753,6 +996,27 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         tags: serde_json::from_str(&tags).unwrap_or_default(),
         created_at: parse_time(row.get(15)?)?,
         updated_at: parse_time(row.get(16)?)?,
+    })
+}
+
+fn map_sync_event(row: &Row<'_>) -> rusqlite::Result<SyncEvent> {
+    let payload_json = row.get::<_, String>(6)?;
+    Ok(SyncEvent {
+        event_id: row.get(0)?,
+        device_id: row.get(1)?,
+        sequence: row.get(2)?,
+        entity_type: parse_enum(row.get::<_, String>(3)?)?,
+        entity_id: row.get(4)?,
+        operation: parse_enum(row.get::<_, String>(5)?)?,
+        payload_json: serde_json::from_str(&payload_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        created_at: parse_time(row.get(7)?)?,
+        synced_at: parse_optional_time(row.get(8)?)?,
     })
 }
 
@@ -831,6 +1095,7 @@ fn changed(rows: usize, entity: &'static str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::{SyncEntityType, SyncOperation};
 
     fn seeded_database() -> Database {
         let db = Database::in_memory().unwrap();
@@ -845,6 +1110,119 @@ mod tests {
         assert_eq!(db.list_organizations().unwrap().len(), 4);
         assert!(!db.list_projects().unwrap().is_empty());
         assert!(db.list_tasks().unwrap().len() >= 6);
+    }
+
+    #[test]
+    fn migration_creates_sync_tables() {
+        let db = Database::in_memory().unwrap();
+        let connection = db.connection().unwrap();
+        for table in ["sync_events", "sync_state", "sync_devices"] {
+            let exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1
+                    )",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing table {table}");
+        }
+    }
+
+    #[test]
+    fn device_id_is_stable() {
+        let db = Database::in_memory().unwrap();
+        let first = db.get_or_create_device_id().unwrap();
+        let second = db.get_or_create_device_id().unwrap();
+        assert_eq!(first, second);
+        assert!(Uuid::parse_str(&first).is_ok());
+    }
+
+    #[test]
+    fn task_mutations_append_and_sync_events() {
+        let db = Database::in_memory().unwrap();
+        let organization = db
+            .create_organization(NewOrganization {
+                name: "Test Organization".into(),
+                slug: None,
+                description: None,
+                color: None,
+                icon: None,
+            })
+            .unwrap();
+        let project = db
+            .create_project(NewProject {
+                organization_id: organization.id,
+                name: "Test Project".into(),
+                slug: None,
+                description: None,
+                project_type: ProjectType::Software,
+                status: ProjectStatus::Active,
+                priority: 3,
+                deadline: None,
+                repo_url: None,
+                notes: None,
+            })
+            .unwrap();
+        let setup_event_ids = db
+            .list_unsynced_events()
+            .unwrap()
+            .into_iter()
+            .map(|event| event.event_id)
+            .collect::<Vec<_>>();
+        db.mark_sync_events_synced(&setup_event_ids).unwrap();
+        let task = db
+            .create_task(NewTask {
+                project_id: project.id,
+                title: "Test Task".into(),
+                description: None,
+                status: TaskStatus::Inbox,
+                priority: 3,
+                due_at: None,
+                scheduled_at: None,
+                estimated_minutes: None,
+                time_limit_minutes: None,
+                pinned: false,
+                tags: Vec::new(),
+            })
+            .unwrap();
+
+        let events = db.list_unsynced_events().unwrap();
+        assert_eq!(events.len(), 1);
+        let created = events.first().unwrap();
+        assert_eq!(created.entity_type, SyncEntityType::Task);
+        assert_eq!(created.operation, SyncOperation::Created);
+        assert_eq!(created.entity_id, task.id);
+
+        db.update_task(
+            &task.id,
+            TaskPatch {
+                title: Some("Updated Task".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let events = db.list_unsynced_events().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events.last().unwrap().operation, SyncOperation::Updated);
+
+        let event_ids = events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<Vec<_>>();
+        db.mark_sync_events_synced(&event_ids).unwrap();
+        assert!(db.list_unsynced_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn seed_does_not_append_sync_events() {
+        let db = Database::in_memory().unwrap();
+        db.seed().unwrap();
+        assert!(db.list_unsynced_events().unwrap().is_empty());
+        db.seed().unwrap();
+        assert!(db.list_unsynced_events().unwrap().is_empty());
     }
 
     #[test]
