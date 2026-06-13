@@ -2,8 +2,7 @@
 /apps/desktop/src-tauri/gen/
 /data/*.sqlite
 /data/*.sqlite-*
-/apps/desktop/ui/dist/*
-!/apps/desktop/ui/dist/index.html
+/apps/desktop/ui/dist/
 /.trunk/
 *.log
 .DS_Store
