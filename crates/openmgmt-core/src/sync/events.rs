@@ -49,6 +49,9 @@ sync_string_enum!(SyncOperation {
 pub struct SyncEvent {
     pub event_id: String,
     pub device_id: String,
+    pub actor_user_id: Option<String>,
+    pub target_user_id: Option<String>,
+    pub workspace_id: Option<String>,
     pub sequence: i64,
     pub entity_type: SyncEntityType,
     pub entity_id: String,

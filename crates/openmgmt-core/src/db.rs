@@ -114,6 +114,9 @@ impl Database {
             CREATE TABLE IF NOT EXISTS sync_events (
               event_id TEXT PRIMARY KEY NOT NULL,
               device_id TEXT NOT NULL,
+              actor_user_id TEXT,
+              target_user_id TEXT,
+              workspace_id TEXT,
               sequence INTEGER NOT NULL,
               entity_type TEXT NOT NULL,
               entity_id TEXT NOT NULL,
@@ -138,6 +141,24 @@ impl Database {
             );
             "#,
         )?;
+        self.ensure_sync_event_ownership_columns()?;
+        Ok(())
+    }
+
+    fn ensure_sync_event_ownership_columns(&self) -> Result<()> {
+        let connection = self.connection()?;
+        let columns = connection
+            .prepare("PRAGMA table_info(sync_events)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for column in ["actor_user_id", "target_user_id", "workspace_id"] {
+            if !columns.iter().any(|existing| existing == column) {
+                connection.execute(
+                    &format!("ALTER TABLE sync_events ADD COLUMN {column} TEXT"),
+                    [],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -179,6 +200,9 @@ impl Database {
         let event = SyncEvent {
             event_id: Uuid::new_v4().to_string(),
             device_id,
+            actor_user_id: None,
+            target_user_id: None,
+            workspace_id: None,
             sequence,
             entity_type,
             entity_id: entity_id.to_owned(),
@@ -189,12 +213,15 @@ impl Database {
         };
         connection.execute(
             "INSERT INTO sync_events (
-                event_id,device_id,sequence,entity_type,entity_id,operation,payload_json,
-                created_at,synced_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                event_id,device_id,actor_user_id,target_user_id,workspace_id,sequence,entity_type,
+                entity_id,operation,payload_json,created_at,synced_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![
                 event.event_id,
                 event.device_id,
+                event.actor_user_id,
+                event.target_user_id,
+                event.workspace_id,
                 event.sequence,
                 event.entity_type.to_string(),
                 event.entity_id,
@@ -210,8 +237,8 @@ impl Database {
     pub fn list_unsynced_events(&self) -> Result<Vec<SyncEvent>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT event_id,device_id,sequence,entity_type,entity_id,operation,payload_json,
-                    created_at,synced_at
+            "SELECT event_id,device_id,actor_user_id,target_user_id,workspace_id,sequence,
+                    entity_type,entity_id,operation,payload_json,created_at,synced_at
              FROM sync_events WHERE synced_at IS NULL ORDER BY device_id,sequence",
         )?;
         Ok(statement
@@ -1000,23 +1027,26 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
 }
 
 fn map_sync_event(row: &Row<'_>) -> rusqlite::Result<SyncEvent> {
-    let payload_json = row.get::<_, String>(6)?;
+    let payload_json = row.get::<_, String>(9)?;
     Ok(SyncEvent {
         event_id: row.get(0)?,
         device_id: row.get(1)?,
-        sequence: row.get(2)?,
-        entity_type: parse_enum(row.get::<_, String>(3)?)?,
-        entity_id: row.get(4)?,
-        operation: parse_enum(row.get::<_, String>(5)?)?,
+        actor_user_id: row.get(2)?,
+        target_user_id: row.get(3)?,
+        workspace_id: row.get(4)?,
+        sequence: row.get(5)?,
+        entity_type: parse_enum(row.get::<_, String>(6)?)?,
+        entity_id: row.get(7)?,
+        operation: parse_enum(row.get::<_, String>(8)?)?,
         payload_json: serde_json::from_str(&payload_json).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                6,
+                9,
                 rusqlite::types::Type::Text,
                 Box::new(error),
             )
         })?,
-        created_at: parse_time(row.get(7)?)?,
-        synced_at: parse_optional_time(row.get(8)?)?,
+        created_at: parse_time(row.get(10)?)?,
+        synced_at: parse_optional_time(row.get(11)?)?,
     })
 }
 
@@ -1128,6 +1158,57 @@ mod tests {
                 .unwrap();
             assert!(exists, "missing table {table}");
         }
+        let sync_event_columns = connection
+            .prepare("PRAGMA table_info(sync_events)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for column in ["actor_user_id", "target_user_id", "workspace_id"] {
+            assert!(
+                sync_event_columns.iter().any(|name| name == column),
+                "missing column {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_upgrades_existing_sync_events_with_ownership_columns() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sync_events (
+                    event_id TEXT PRIMARY KEY NOT NULL,
+                    device_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    synced_at TEXT,
+                    UNIQUE(device_id, sequence)
+                );",
+            )
+            .unwrap();
+        let db = Database {
+            connection: Arc::new(Mutex::new(connection)),
+        };
+
+        db.migrate().unwrap();
+
+        let connection = db.connection().unwrap();
+        let columns = connection
+            .prepare("PRAGMA table_info(sync_events)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for column in ["actor_user_id", "target_user_id", "workspace_id"] {
+            assert!(columns.iter().any(|name| name == column));
+        }
     }
 
     #[test]
@@ -1194,6 +1275,9 @@ mod tests {
         assert_eq!(created.entity_type, SyncEntityType::Task);
         assert_eq!(created.operation, SyncOperation::Created);
         assert_eq!(created.entity_id, task.id);
+        assert_eq!(created.actor_user_id, None);
+        assert_eq!(created.target_user_id, None);
+        assert_eq!(created.workspace_id, None);
 
         db.update_task(
             &task.id,
