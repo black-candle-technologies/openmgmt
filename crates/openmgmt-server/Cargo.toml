@@ -1,0 +1,25 @@
+[package]
+name = "openmgmt-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum = "0.8"
+chrono.workspace = true
+openmgmt-core = { path = "../openmgmt-core" }
+openmgmt-protocol = { path = "../openmgmt-protocol" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"
+tower = "0.5"

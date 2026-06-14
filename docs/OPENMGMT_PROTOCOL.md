@@ -46,6 +46,31 @@ The local status model supports:
 
 `syncing` is reserved for a future sync runner and is not currently produced.
 
+## Initial Sync Server
+
+The optional `openmgmt-server` binary provides the first OMGP/1 event server.
+It runs locally by default:
+
+- bind address: `127.0.0.1:8787`
+- database: `data/openmgmt-server.sqlite`
+
+The server exposes:
+
+- `GET /health`
+- `POST /omgp/v1/hello`
+- `POST /omgp/v1/devices/register`
+- `POST /omgp/v1/sync/push`
+- `POST /omgp/v1/sync/pull`
+
+The server database stores registered devices and sync events only. It does not
+reuse the desktop database or directly mutate organizations, projects, or
+tasks. The desktop app remains fully local-first and does not require the
+server.
+
+Device tokens are placeholders for future authentication. Real authentication,
+the desktop sync client, background sync, and domain conflict resolution are
+not implemented yet.
+
 ## Multi-User Direction
 
 Sync events retain `actor_user_id`, `target_user_id`, and `workspace_id`.

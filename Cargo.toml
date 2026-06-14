@@ -3,6 +3,7 @@ members = [
   "crates/openmgmt-core",
   "crates/openmgmt-mcp",
   "crates/openmgmt-protocol",
+  "crates/openmgmt-server",
   "apps/desktop/src-tauri",
   "apps/desktop/ui",
 ]
