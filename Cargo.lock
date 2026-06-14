@@ -2704,6 +2704,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "openmgmt-protocol"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "openmgmt-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "openmgmt-ui"
 version = "0.1.0"
 dependencies = [
