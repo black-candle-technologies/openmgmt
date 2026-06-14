@@ -26,6 +26,26 @@ implemented.
 
 Server and client networking are not implemented in this step.
 
+## Local Sync Settings
+
+Sync is optional. OpenMGMT continues to operate in local-first mode when sync is
+disabled or no server is configured.
+
+The stored server URL may point to a local server, such as
+`http://127.0.0.1:8787`, or a cloud-hosted server. This step stores settings and
+reports local status only; it does not perform network requests or enforce
+authentication.
+
+The local status model supports:
+
+- `disabled`
+- `not_configured`
+- `ready`
+- `syncing`
+- `error`
+
+`syncing` is reserved for a future sync runner and is not currently produced.
+
 ## Multi-User Direction
 
 Sync events retain `actor_user_id`, `target_user_id`, and `workspace_id`.

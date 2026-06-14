@@ -4,7 +4,12 @@ use crate::{
         BoardState, NewOrganization, NewProject, NewTask, Organization, OrganizationPatch, Project,
         ProjectPatch, ProjectStatus, ProjectType, Task, TaskContext, TaskPatch, TaskStatus,
     },
-    sync::{LOCAL_DEVICE_ID_KEY, SyncEntityType, SyncEvent, SyncOperation},
+    sync::{
+        DEFAULT_DEVICE_NAME, LOCAL_DEVICE_ID_KEY, SYNC_ACCOUNT_ID_KEY, SYNC_DEVICE_NAME_KEY,
+        SYNC_DEVICE_TOKEN_KEY, SYNC_ENABLED_KEY, SYNC_LAST_ATTEMPTED_AT_KEY, SYNC_LAST_ERROR_KEY,
+        SYNC_LAST_SUCCESSFUL_AT_KEY, SYNC_SERVER_URL_KEY, SYNC_USER_ID_KEY, SyncConnectionState,
+        SyncEntityType, SyncEvent, SyncOperation, SyncSettings, SyncSettingsPatch, SyncStatus,
+    },
 };
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -249,6 +254,125 @@ impl Database {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    pub fn get_sync_settings(&self) -> Result<SyncSettings> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let (_, settings) = get_sync_settings_with_connection(&transaction)?;
+        transaction.commit()?;
+        Ok(settings)
+    }
+
+    pub fn update_sync_settings(&self, patch: SyncSettingsPatch) -> Result<SyncSettings> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let (device_id, mut settings) = get_sync_settings_with_connection(&transaction)?;
+
+        if let Some(enabled) = patch.enabled {
+            settings.enabled = enabled;
+        }
+        if let Some(server_url) = patch.server_url {
+            settings.server_url = normalize_optional(server_url);
+        }
+        if let Some(device_name) = patch.device_name {
+            let device_name = device_name.trim();
+            settings.device_name = if device_name.is_empty() {
+                DEFAULT_DEVICE_NAME.into()
+            } else {
+                device_name.into()
+            };
+        }
+        if let Some(account_id) = patch.account_id {
+            settings.account_id = normalize_optional(account_id);
+        }
+        if let Some(user_id) = patch.user_id {
+            settings.user_id = normalize_optional(user_id);
+        }
+        if let Some(device_token) = patch.device_token {
+            settings.device_token = normalize_optional(device_token);
+        }
+        validate_server_url(settings.server_url.as_deref())?;
+
+        set_sync_state_with_connection(
+            &transaction,
+            SYNC_ENABLED_KEY,
+            if settings.enabled { "true" } else { "false" },
+        )?;
+        set_optional_sync_state_with_connection(
+            &transaction,
+            SYNC_SERVER_URL_KEY,
+            settings.server_url.as_deref(),
+        )?;
+        set_sync_state_with_connection(&transaction, SYNC_DEVICE_NAME_KEY, &settings.device_name)?;
+        set_optional_sync_state_with_connection(
+            &transaction,
+            SYNC_ACCOUNT_ID_KEY,
+            settings.account_id.as_deref(),
+        )?;
+        set_optional_sync_state_with_connection(
+            &transaction,
+            SYNC_USER_ID_KEY,
+            settings.user_id.as_deref(),
+        )?;
+        set_optional_sync_state_with_connection(
+            &transaction,
+            SYNC_DEVICE_TOKEN_KEY,
+            settings.device_token.as_deref(),
+        )?;
+        transaction.execute(
+            "UPDATE sync_devices SET name=?2 WHERE device_id=?1",
+            params![device_id, settings.device_name],
+        )?;
+        transaction.commit()?;
+        Ok(settings)
+    }
+
+    pub fn get_sync_status(&self) -> Result<SyncStatus> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let status = get_sync_status_with_connection(&transaction)?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    pub fn record_sync_attempt_started(&self) -> Result<SyncStatus> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        set_sync_state_with_connection(
+            &transaction,
+            SYNC_LAST_ATTEMPTED_AT_KEY,
+            &timestamp(Utc::now()),
+        )?;
+        let status = get_sync_status_with_connection(&transaction)?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    pub fn record_sync_success(&self) -> Result<SyncStatus> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let now = timestamp(Utc::now());
+        set_sync_state_with_connection(&transaction, SYNC_LAST_SUCCESSFUL_AT_KEY, &now)?;
+        set_sync_state_with_connection(&transaction, SYNC_LAST_ATTEMPTED_AT_KEY, &now)?;
+        set_optional_sync_state_with_connection(&transaction, SYNC_LAST_ERROR_KEY, None)?;
+        let status = get_sync_status_with_connection(&transaction)?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    pub fn record_sync_error(&self, error: &str) -> Result<SyncStatus> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        set_sync_state_with_connection(
+            &transaction,
+            SYNC_LAST_ATTEMPTED_AT_KEY,
+            &timestamp(Utc::now()),
+        )?;
+        set_sync_state_with_connection(&transaction, SYNC_LAST_ERROR_KEY, error)?;
+        let status = get_sync_status_with_connection(&transaction)?;
+        transaction.commit()?;
+        Ok(status)
     }
 
     pub fn list_organizations(&self) -> Result<Vec<Organization>> {
@@ -973,6 +1097,134 @@ fn get_or_create_device_id_with_connection(connection: &Connection) -> Result<St
     Ok(device_id)
 }
 
+fn get_sync_state_with_connection(connection: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(connection
+        .query_row("SELECT value FROM sync_state WHERE key=?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()?)
+}
+
+fn set_sync_state_with_connection(connection: &Connection, key: &str, value: &str) -> Result<()> {
+    connection.execute(
+        "INSERT INTO sync_state (key,value) VALUES (?1,?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+fn set_optional_sync_state_with_connection(
+    connection: &Connection,
+    key: &str,
+    value: Option<&str>,
+) -> Result<()> {
+    if let Some(value) = value {
+        set_sync_state_with_connection(connection, key, value)
+    } else {
+        connection.execute("DELETE FROM sync_state WHERE key=?1", [key])?;
+        Ok(())
+    }
+}
+
+fn get_sync_settings_with_connection(connection: &Connection) -> Result<(String, SyncSettings)> {
+    let device_id = get_or_create_device_id_with_connection(connection)?;
+    let enabled = match get_sync_state_with_connection(connection, SYNC_ENABLED_KEY)?.as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(value) => {
+            return Err(CoreError::InvalidValue(format!(
+                "invalid {SYNC_ENABLED_KEY}: {value}"
+            )));
+        }
+    };
+    let settings = SyncSettings {
+        enabled,
+        server_url: get_sync_state_with_connection(connection, SYNC_SERVER_URL_KEY)?,
+        device_name: get_sync_state_with_connection(connection, SYNC_DEVICE_NAME_KEY)?
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_DEVICE_NAME.into()),
+        account_id: get_sync_state_with_connection(connection, SYNC_ACCOUNT_ID_KEY)?,
+        user_id: get_sync_state_with_connection(connection, SYNC_USER_ID_KEY)?,
+        device_token: get_sync_state_with_connection(connection, SYNC_DEVICE_TOKEN_KEY)?,
+        last_successful_sync_at: parse_sync_state_time(
+            SYNC_LAST_SUCCESSFUL_AT_KEY,
+            get_sync_state_with_connection(connection, SYNC_LAST_SUCCESSFUL_AT_KEY)?,
+        )?,
+        last_attempted_sync_at: parse_sync_state_time(
+            SYNC_LAST_ATTEMPTED_AT_KEY,
+            get_sync_state_with_connection(connection, SYNC_LAST_ATTEMPTED_AT_KEY)?,
+        )?,
+    };
+    validate_server_url(settings.server_url.as_deref())?;
+    connection.execute(
+        "UPDATE sync_devices SET name=?2 WHERE device_id=?1",
+        params![device_id, settings.device_name],
+    )?;
+    Ok((device_id, settings))
+}
+
+fn get_sync_status_with_connection(connection: &Connection) -> Result<SyncStatus> {
+    let (device_id, settings) = get_sync_settings_with_connection(connection)?;
+    let unsynced_event_count = connection.query_row(
+        "SELECT COUNT(*) FROM sync_events WHERE synced_at IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    let last_error = get_sync_state_with_connection(connection, SYNC_LAST_ERROR_KEY)?;
+    let configured = settings.server_url.is_some();
+    let state = if !settings.enabled {
+        SyncConnectionState::Disabled
+    } else if !configured {
+        SyncConnectionState::NotConfigured
+    } else if last_error.is_some() {
+        SyncConnectionState::Error
+    } else {
+        SyncConnectionState::Ready
+    };
+    Ok(SyncStatus {
+        state,
+        enabled: settings.enabled,
+        configured,
+        server_url: settings.server_url,
+        device_id,
+        device_name: settings.device_name,
+        unsynced_event_count,
+        last_successful_sync_at: settings.last_successful_sync_at,
+        last_attempted_sync_at: settings.last_attempted_sync_at,
+        last_error,
+    })
+}
+
+fn parse_sync_state_time(key: &str, value: Option<String>) -> Result<Option<DateTime<Utc>>> {
+    value
+        .map(|value| {
+            DateTime::parse_from_rfc3339(&value)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|error| CoreError::InvalidValue(format!("invalid {key}: {error}")))
+        })
+        .transpose()
+}
+
+fn normalize_optional(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+fn validate_server_url(server_url: Option<&str>) -> Result<()> {
+    if server_url
+        .is_some_and(|value| !value.starts_with("http://") && !value.starts_with("https://"))
+    {
+        Err(CoreError::Validation(
+            "sync server URL must start with http:// or https://".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn append_sync_event_with_connection(
     connection: &Connection,
     entity_type: SyncEntityType,
@@ -1248,7 +1500,7 @@ fn changed(rows: usize, entity: &'static str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::{SyncEntityType, SyncOperation};
+    use crate::sync::{SyncConnectionState, SyncEntityType, SyncOperation, SyncSettingsPatch};
 
     fn seeded_database() -> Database {
         let db = Database::in_memory().unwrap();
@@ -1587,6 +1839,145 @@ mod tests {
         assert!(db.list_unsynced_events().unwrap().is_empty());
         db.seed().unwrap();
         assert!(db.list_unsynced_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn default_sync_settings_and_status_are_disabled() {
+        let db = Database::in_memory().unwrap();
+
+        let settings = db.get_sync_settings().unwrap();
+        assert!(!settings.enabled);
+        assert_eq!(settings.server_url, None);
+        assert_eq!(settings.device_name, "Local device");
+        assert_eq!(settings.account_id, None);
+        assert_eq!(settings.user_id, None);
+        assert_eq!(settings.device_token, None);
+        assert_eq!(settings.last_successful_sync_at, None);
+        assert_eq!(settings.last_attempted_sync_at, None);
+
+        let status = db.get_sync_status().unwrap();
+        assert_eq!(status.state, SyncConnectionState::Disabled);
+        assert!(!status.enabled);
+        assert!(!status.configured);
+        assert_eq!(status.unsynced_event_count, 0);
+    }
+
+    #[test]
+    fn sync_status_moves_from_not_configured_to_ready() {
+        let db = Database::in_memory().unwrap();
+
+        db.update_sync_settings(SyncSettingsPatch {
+            enabled: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            db.get_sync_status().unwrap().state,
+            SyncConnectionState::NotConfigured
+        );
+
+        db.update_sync_settings(SyncSettingsPatch {
+            server_url: Some(Some("http://127.0.0.1:8787".into())),
+            ..Default::default()
+        })
+        .unwrap();
+        let status = db.get_sync_status().unwrap();
+        assert_eq!(status.state, SyncConnectionState::Ready);
+        assert!(status.configured);
+        assert_eq!(status.server_url.as_deref(), Some("http://127.0.0.1:8787"));
+    }
+
+    #[test]
+    fn sync_settings_validate_urls_and_normalize_empty_values() {
+        let db = Database::in_memory().unwrap();
+
+        let error = db
+            .update_sync_settings(SyncSettingsPatch {
+                server_url: Some(Some("ftp://example.com".into())),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(error, CoreError::Validation(_)));
+
+        let settings = db
+            .update_sync_settings(SyncSettingsPatch {
+                server_url: Some(Some("   ".into())),
+                account_id: Some(Some(" ".into())),
+                user_id: Some(Some("\t".into())),
+                device_token: Some(Some("\n".into())),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(settings.server_url, None);
+        assert_eq!(settings.account_id, None);
+        assert_eq!(settings.user_id, None);
+        assert_eq!(settings.device_token, None);
+    }
+
+    #[test]
+    fn sync_device_name_update_persists_to_device_metadata() {
+        let db = Database::in_memory().unwrap();
+
+        let settings = db
+            .update_sync_settings(SyncSettingsPatch {
+                device_name: Some("Office Desktop".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let device_id = db.get_or_create_device_id().unwrap();
+        let stored_name: String = db
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT name FROM sync_devices WHERE device_id=?1",
+                [&device_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(settings.device_name, "Office Desktop");
+        assert_eq!(
+            db.get_sync_settings().unwrap().device_name,
+            "Office Desktop"
+        );
+        assert_eq!(stored_name, "Office Desktop");
+    }
+
+    #[test]
+    fn sync_status_includes_unsynced_event_count() {
+        let db = Database::in_memory().unwrap();
+        db.append_sync_event(
+            SyncEntityType::Task,
+            "task-1",
+            SyncOperation::Created,
+            serde_json::json!({"entity": {"id": "task-1"}}),
+        )
+        .unwrap();
+
+        assert_eq!(db.get_sync_status().unwrap().unsynced_event_count, 1);
+    }
+
+    #[test]
+    fn sync_attempt_success_and_error_update_status() {
+        let db = Database::in_memory().unwrap();
+        db.update_sync_settings(SyncSettingsPatch {
+            enabled: Some(true),
+            server_url: Some(Some("https://sync.example.com".into())),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let attempted = db.record_sync_attempt_started().unwrap();
+        assert!(attempted.last_attempted_sync_at.is_some());
+
+        let failed = db.record_sync_error("connection refused").unwrap();
+        assert_eq!(failed.state, SyncConnectionState::Error);
+        assert_eq!(failed.last_error.as_deref(), Some("connection refused"));
+
+        let succeeded = db.record_sync_success().unwrap();
+        assert_eq!(succeeded.state, SyncConnectionState::Ready);
+        assert!(succeeded.last_successful_sync_at.is_some());
+        assert_eq!(succeeded.last_error, None);
     }
 
     #[test]

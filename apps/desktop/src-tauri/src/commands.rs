@@ -1,6 +1,6 @@
 use openmgmt_core::{
     AppService, BoardState, NewOrganization, NewProject, NewTask, Organization, OrganizationPatch,
-    Project, ProjectPatch, Task, TaskPatch,
+    Project, ProjectPatch, SyncSettings, SyncSettingsPatch, SyncStatus, Task, TaskPatch,
 };
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
@@ -130,6 +130,24 @@ pub fn get_board_state(service: State<'_, AppService>) -> CommandResult<BoardSta
 #[tauri::command]
 pub fn seed_database(service: State<'_, AppService>) -> CommandResult<()> {
     core(service.seed_database())
+}
+
+#[tauri::command]
+pub fn get_sync_settings(service: State<'_, AppService>) -> CommandResult<SyncSettings> {
+    core(service.get_sync_settings())
+}
+
+#[tauri::command]
+pub fn update_sync_settings(
+    service: State<'_, AppService>,
+    patch: SyncSettingsPatch,
+) -> CommandResult<SyncSettings> {
+    core(service.update_sync_settings(patch))
+}
+
+#[tauri::command]
+pub fn get_sync_status(service: State<'_, AppService>) -> CommandResult<SyncStatus> {
+    core(service.get_sync_status())
 }
 
 #[tauri::command]

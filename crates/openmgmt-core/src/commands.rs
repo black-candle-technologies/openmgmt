@@ -4,6 +4,7 @@ use crate::{
         BoardState, NewOrganization, NewProject, NewTask, Organization, OrganizationPatch, Project,
         ProjectPatch, Task, TaskPatch, TaskStatus,
     },
+    sync::{SyncSettings, SyncSettingsPatch, SyncStatus},
 };
 
 #[derive(Clone)]
@@ -78,5 +79,23 @@ impl AppService {
     }
     pub fn seed_database(&self) -> Result<()> {
         self.database.seed()
+    }
+    pub fn get_sync_settings(&self) -> Result<SyncSettings> {
+        self.database.get_sync_settings()
+    }
+    pub fn update_sync_settings(&self, patch: SyncSettingsPatch) -> Result<SyncSettings> {
+        self.database.update_sync_settings(patch)
+    }
+    pub fn get_sync_status(&self) -> Result<SyncStatus> {
+        self.database.get_sync_status()
+    }
+    pub fn record_sync_attempt_started(&self) -> Result<SyncStatus> {
+        self.database.record_sync_attempt_started()
+    }
+    pub fn record_sync_success(&self) -> Result<SyncStatus> {
+        self.database.record_sync_success()
+    }
+    pub fn record_sync_error(&self, error: &str) -> Result<SyncStatus> {
+        self.database.record_sync_error(error)
     }
 }

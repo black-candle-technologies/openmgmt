@@ -35,6 +35,9 @@ fn main() {
             commands::block_task,
             commands::unblock_task,
             commands::seed_database,
+            commands::get_sync_settings,
+            commands::update_sync_settings,
+            commands::get_sync_status,
             commands::open_tv_board_window,
         ])
         .run(tauri::generate_context!())
