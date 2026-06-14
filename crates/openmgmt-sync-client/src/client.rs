@@ -1,6 +1,6 @@
 use crate::{
-    SyncClientConfig, SyncClientError, SyncClientResult, SyncOnceResult, SyncPhase,
-    SyncPhaseResult, http::OmgpHttpClient,
+    SyncClientConfig, SyncClientError, SyncClientResult, SyncConnectionTestResult, SyncOnceResult,
+    SyncPhase, SyncPhaseResult, http::OmgpHttpClient,
 };
 use openmgmt_core::{Database, SyncSettingsPatch};
 use openmgmt_protocol::{
@@ -18,6 +18,37 @@ pub struct OpenMgmtSyncClient {
 impl OpenMgmtSyncClient {
     pub fn new(config: SyncClientConfig) -> Self {
         Self { config }
+    }
+
+    pub async fn test_connection(
+        &self,
+        database: &Database,
+    ) -> SyncClientResult<SyncConnectionTestResult> {
+        let settings = database.get_sync_settings()?;
+        if !settings.enabled {
+            return Err(SyncClientError::Disabled);
+        }
+        let server_url = settings
+            .server_url
+            .clone()
+            .ok_or(SyncClientError::NotConfigured)?;
+        let device_id = database.get_or_create_device_id()?;
+        let response = OmgpHttpClient::new(&server_url, self.config.timeout_seconds)?
+            .hello(SyncHelloRequest {
+                protocol_version: PROTOCOL_VERSION.into(),
+                client_name: "OpenMgmt Desktop".into(),
+                client_version: Some(env!("CARGO_PKG_VERSION").into()),
+                device_id: Some(device_id),
+            })
+            .await?;
+        Ok(SyncConnectionTestResult {
+            ok: true,
+            server_url: Some(server_url),
+            protocol_version: response.protocol_version,
+            server_name: Some(response.server_name),
+            server_version: response.server_version,
+            message: Some("Server protocol is compatible.".into()),
+        })
     }
 
     pub async fn sync_once(&self, database: &Database) -> SyncClientResult<SyncOnceResult> {
@@ -377,6 +408,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_test_requires_configured_server_url() {
+        let database = configured_database(None);
+        let error = OpenMgmtSyncClient::new(SyncClientConfig::default())
+            .test_connection(&database)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SyncClientError::NotConfigured));
+    }
+
+    #[tokio::test]
+    async fn connection_test_returns_compatible_server_identity() {
+        let (server_url, pushed) = test_server(Vec::new(), false).await;
+        let database = configured_database(Some(server_url.clone()));
+
+        let result = OpenMgmtSyncClient::new(SyncClientConfig::default())
+            .test_connection(&database)
+            .await
+            .unwrap();
+
+        assert!(result.ok);
+        assert_eq!(result.server_url.as_deref(), Some(server_url.as_str()));
+        assert_eq!(result.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(result.server_name.as_deref(), Some("Test Server"));
+        assert_eq!(result.server_version, None);
+        assert!(pushed.lock().unwrap().is_empty());
+        assert_eq!(database.get_sync_settings().unwrap().device_token, None);
+    }
+
+    #[tokio::test]
     async fn registration_push_and_empty_pull_complete_sync() {
         let (server_url, pushed) = test_server(Vec::new(), false).await;
         let database = configured_database(Some(server_url));
@@ -589,5 +650,11 @@ mod tests {
 pub async fn sync_once(database: &Database) -> SyncClientResult<SyncOnceResult> {
     OpenMgmtSyncClient::new(SyncClientConfig::default())
         .sync_once(database)
+        .await
+}
+
+pub async fn test_connection(database: &Database) -> SyncClientResult<SyncConnectionTestResult> {
+    OpenMgmtSyncClient::new(SyncClientConfig::default())
+        .test_connection(database)
         .await
 }

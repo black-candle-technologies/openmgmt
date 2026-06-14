@@ -2,8 +2,9 @@ use openmgmt_core::{
     AppService, BoardState, NewOrganization, NewProject, NewTask, Organization, OrganizationPatch,
     Project, ProjectPatch, SyncSettings, SyncSettingsPatch, SyncStatus, Task, TaskPatch,
 };
-use openmgmt_sync_client::SyncOnceResult;
+use openmgmt_sync_client::{SyncConnectionTestResult, SyncOnceResult};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tokio::sync::{Mutex, MutexGuard};
 
 type CommandResult<T> = Result<T, String>;
 
@@ -12,6 +13,19 @@ fn core<T>(result: openmgmt_core::db::Result<T>) -> CommandResult<T> {
         tracing::error!(%error, "Tauri command failed");
         error.to_string()
     })
+}
+
+#[derive(Default)]
+pub struct SyncRuntimeState {
+    syncing: Mutex<()>,
+}
+
+impl SyncRuntimeState {
+    fn try_start(&self) -> CommandResult<MutexGuard<'_, ()>> {
+        self.syncing
+            .try_lock()
+            .map_err(|_| "sync is already running".into())
+    }
 }
 
 #[tauri::command]
@@ -152,7 +166,11 @@ pub fn get_sync_status(service: State<'_, AppService>) -> CommandResult<SyncStat
 }
 
 #[tauri::command]
-pub async fn sync_now(service: State<'_, AppService>) -> CommandResult<SyncOnceResult> {
+pub async fn sync_now(
+    service: State<'_, AppService>,
+    runtime: State<'_, SyncRuntimeState>,
+) -> CommandResult<SyncOnceResult> {
+    let _guard = runtime.try_start()?;
     let database = service.database();
     openmgmt_sync_client::sync_once(&database)
         .await
@@ -160,6 +178,24 @@ pub async fn sync_now(service: State<'_, AppService>) -> CommandResult<SyncOnceR
             tracing::error!(%error, "manual sync failed");
             error.to_string()
         })
+}
+
+#[tauri::command]
+pub async fn test_sync_connection(
+    service: State<'_, AppService>,
+) -> CommandResult<SyncConnectionTestResult> {
+    let database = service.database();
+    openmgmt_sync_client::test_connection(&database)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "sync connection test failed");
+            error.to_string()
+        })
+}
+
+#[tauri::command]
+pub fn clear_sync_error(service: State<'_, AppService>) -> CommandResult<SyncStatus> {
+    core(service.clear_sync_error())
 }
 
 #[tauri::command]
@@ -176,4 +212,17 @@ pub fn open_tv_board_window(app: AppHandle) -> CommandResult<()> {
         .build()
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_runtime_rejects_overlapping_attempts() {
+        let runtime = SyncRuntimeState::default();
+        let _guard = runtime.try_start().expect("first sync should start");
+
+        assert_eq!(runtime.try_start().unwrap_err(), "sync is already running");
+    }
 }

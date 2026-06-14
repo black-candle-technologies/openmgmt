@@ -1,6 +1,16 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncConnectionTestResult {
+    pub ok: bool,
+    pub server_url: Option<String>,
+    pub protocol_version: String,
+    pub server_name: Option<String>,
+    pub server_version: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncPhase {
     Settings,

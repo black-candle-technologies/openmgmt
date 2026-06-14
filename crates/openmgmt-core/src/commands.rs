@@ -102,4 +102,7 @@ impl AppService {
     pub fn record_sync_error(&self, error: &str) -> Result<SyncStatus> {
         self.database.record_sync_error(error)
     }
+    pub fn clear_sync_error(&self) -> Result<SyncStatus> {
+        self.database.clear_sync_error()
+    }
 }

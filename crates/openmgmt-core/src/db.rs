@@ -463,6 +463,15 @@ impl Database {
         Ok(status)
     }
 
+    pub fn clear_sync_error(&self) -> Result<SyncStatus> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        set_optional_sync_state_with_connection(&transaction, SYNC_LAST_ERROR_KEY, None)?;
+        let status = get_sync_status_with_connection(&transaction)?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
     pub fn list_organizations(&self) -> Result<Vec<Organization>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
@@ -2547,6 +2556,25 @@ mod tests {
         assert_eq!(succeeded.state, SyncConnectionState::Ready);
         assert!(succeeded.last_successful_sync_at.is_some());
         assert_eq!(succeeded.last_error, None);
+    }
+
+    #[test]
+    fn clearing_sync_error_preserves_ready_configuration() {
+        let db = Database::in_memory().unwrap();
+        db.update_sync_settings(SyncSettingsPatch {
+            enabled: Some(true),
+            server_url: Some(Some("https://sync.example.com".into())),
+            ..Default::default()
+        })
+        .unwrap();
+        db.record_sync_error("temporary failure").unwrap();
+
+        let status = db.clear_sync_error().unwrap();
+
+        assert_eq!(status.state, SyncConnectionState::Ready);
+        assert_eq!(status.last_error, None);
+        assert!(status.enabled);
+        assert!(status.configured);
     }
 
     #[test]

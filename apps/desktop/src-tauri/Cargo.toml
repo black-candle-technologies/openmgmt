@@ -12,5 +12,6 @@ openmgmt-core = { path = "../../../crates/openmgmt-core" }
 openmgmt-sync-client = { path = "../../../crates/openmgmt-sync-client" }
 serde.workspace = true
 tauri = { version = "2.11.2", features = [] }
+tokio = { version = "1.48.0", features = ["sync"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
