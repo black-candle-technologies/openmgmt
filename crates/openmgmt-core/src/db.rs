@@ -39,6 +39,20 @@ pub struct Database {
     connection: Arc<Mutex<Connection>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationOrigin {
+    Local,
+    #[allow(dead_code)]
+    Remote,
+    Seed,
+}
+
+impl MutationOrigin {
+    fn logs_sync_event(self) -> bool {
+        matches!(self, Self::Local)
+    }
+}
+
 pub fn default_database_path() -> PathBuf {
     if let Some(path) = std::env::var_os("OPENMGMT_DATABASE_PATH") {
         return PathBuf::from(path);
@@ -163,23 +177,10 @@ impl Database {
     }
 
     pub fn get_or_create_device_id(&self) -> Result<String> {
-        let connection = self.connection()?;
-        if let Some(device_id) = connection
-            .query_row(
-                "SELECT value FROM sync_state WHERE key=?1",
-                [LOCAL_DEVICE_ID_KEY],
-                |row| row.get(0),
-            )
-            .optional()?
-        {
-            return Ok(device_id);
-        }
-
-        let device_id = Uuid::new_v4().to_string();
-        connection.execute(
-            "INSERT INTO sync_state (key, value) VALUES (?1, ?2)",
-            params![LOCAL_DEVICE_ID_KEY, device_id],
-        )?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let device_id = get_or_create_device_id_with_connection(&transaction)?;
+        transaction.commit()?;
         Ok(device_id)
     }
 
@@ -190,47 +191,16 @@ impl Database {
         operation: SyncOperation,
         payload_json: serde_json::Value,
     ) -> Result<SyncEvent> {
-        let device_id = self.get_or_create_device_id()?;
-        let connection = self.connection()?;
-        let sequence = connection.query_row(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM sync_events WHERE device_id=?1",
-            [&device_id],
-            |row| row.get(0),
-        )?;
-        let event = SyncEvent {
-            event_id: Uuid::new_v4().to_string(),
-            device_id,
-            actor_user_id: None,
-            target_user_id: None,
-            workspace_id: None,
-            sequence,
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let event = append_sync_event_with_connection(
+            &transaction,
             entity_type,
-            entity_id: entity_id.to_owned(),
+            entity_id,
             operation,
             payload_json,
-            created_at: Utc::now(),
-            synced_at: None,
-        };
-        connection.execute(
-            "INSERT INTO sync_events (
-                event_id,device_id,actor_user_id,target_user_id,workspace_id,sequence,entity_type,
-                entity_id,operation,payload_json,created_at,synced_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-            params![
-                event.event_id,
-                event.device_id,
-                event.actor_user_id,
-                event.target_user_id,
-                event.workspace_id,
-                event.sequence,
-                event.entity_type.to_string(),
-                event.entity_id,
-                event.operation.to_string(),
-                event.payload_json.to_string(),
-                timestamp(event.created_at),
-                Option::<String>::None,
-            ],
         )?;
+        transaction.commit()?;
         Ok(event)
     }
 
@@ -293,13 +263,13 @@ impl Database {
     }
 
     pub fn create_organization(&self, input: NewOrganization) -> Result<Organization> {
-        self.create_organization_internal(input, true)
+        self.create_organization_internal(input, MutationOrigin::Local)
     }
 
     fn create_organization_internal(
         &self,
         input: NewOrganization,
-        log_sync: bool,
+        origin: MutationOrigin,
     ) -> Result<Organization> {
         require_name(&input.name)?;
         let now = Utc::now();
@@ -314,7 +284,9 @@ impl Database {
             updated_at: now,
             archived_at: None,
         };
-        self.connection()?.execute(
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
             "INSERT INTO organizations VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 organization.id,
@@ -328,19 +300,23 @@ impl Database {
                 Option::<String>::None
             ],
         )?;
-        if log_sync {
-            self.append_sync_event(
+        if origin.logs_sync_event() {
+            append_sync_event_with_connection(
+                &transaction,
                 SyncEntityType::Organization,
                 &organization.id,
                 SyncOperation::Created,
                 serde_json::json!({ "entity": &organization }),
             )?;
         }
+        transaction.commit()?;
         Ok(organization)
     }
 
     pub fn update_organization(&self, id: &str, patch: OrganizationPatch) -> Result<Organization> {
-        let mut current = self.get_organization(id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut current = get_organization_with_connection(&transaction, id)?;
         if let Some(name) = patch.name {
             require_name(&name)?;
             current.name = name;
@@ -358,7 +334,7 @@ impl Database {
             current.icon = value;
         }
         current.updated_at = Utc::now();
-        self.connection()?.execute(
+        transaction.execute(
             "UPDATE organizations SET name=?2,slug=?3,description=?4,color=?5,icon=?6,updated_at=?7
              WHERE id=?1",
             params![
@@ -371,43 +347,43 @@ impl Database {
                 timestamp(current.updated_at)
             ],
         )?;
-        self.append_sync_event(
+        append_sync_event_with_connection(
+            &transaction,
             SyncEntityType::Organization,
             &current.id,
             SyncOperation::Updated,
             serde_json::json!({ "entity": &current }),
         )?;
+        transaction.commit()?;
         Ok(current)
     }
 
     pub fn archive_organization(&self, id: &str) -> Result<()> {
         let archived_at = Utc::now();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
         changed(
-            self.connection()?.execute(
+            transaction.execute(
                 "UPDATE organizations SET archived_at=?2,updated_at=?2 WHERE id=?1",
                 params![id, timestamp(archived_at)],
             )?,
             "organization",
         )?;
-        self.append_sync_event(
+        append_sync_event_with_connection(
+            &transaction,
             SyncEntityType::Organization,
             id,
             SyncOperation::Archived,
             serde_json::json!({ "id": id, "archived_at": archived_at }),
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
+    #[cfg(test)]
     fn get_organization(&self, id: &str) -> Result<Organization> {
-        self.connection()?
-            .query_row(
-                "SELECT id,name,slug,description,color,icon,created_at,updated_at,archived_at
-                 FROM organizations WHERE id=?1",
-                [id],
-                map_organization,
-            )
-            .optional()?
-            .ok_or(CoreError::NotFound("organization"))
+        let connection = self.connection()?;
+        get_organization_with_connection(&connection, id)
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
@@ -425,25 +401,21 @@ impl Database {
     }
 
     pub fn get_project(&self, id: &str) -> Result<Project> {
-        self.connection()?
-            .query_row(
-                "SELECT id,organization_id,name,slug,description,type,status,priority,deadline,repo_url,
-                        notes,created_at,updated_at,archived_at FROM projects WHERE id=?1",
-                [id],
-                map_project,
-            )
-            .optional()?
-            .ok_or(CoreError::NotFound("project"))
+        let connection = self.connection()?;
+        get_project_with_connection(&connection, id)
     }
 
     pub fn create_project(&self, input: NewProject) -> Result<Project> {
-        self.create_project_internal(input, true)
+        self.create_project_internal(input, MutationOrigin::Local)
     }
 
-    fn create_project_internal(&self, input: NewProject, log_sync: bool) -> Result<Project> {
+    fn create_project_internal(
+        &self,
+        input: NewProject,
+        origin: MutationOrigin,
+    ) -> Result<Project> {
         require_name(&input.name)?;
         validate_priority(input.priority)?;
-        self.get_organization(&input.organization_id)?;
         let now = Utc::now();
         let project = Project {
             id: Uuid::new_v4().to_string(),
@@ -461,7 +433,10 @@ impl Database {
             updated_at: now,
             archived_at: None,
         };
-        self.connection()?.execute(
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        get_organization_with_connection(&transaction, &project.organization_id)?;
+        transaction.execute(
             "INSERT INTO projects VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 project.id,
@@ -480,19 +455,23 @@ impl Database {
                 Option::<String>::None
             ],
         )?;
-        if log_sync {
-            self.append_sync_event(
+        if origin.logs_sync_event() {
+            append_sync_event_with_connection(
+                &transaction,
                 SyncEntityType::Project,
                 &project.id,
                 SyncOperation::Created,
                 serde_json::json!({ "entity": &project }),
             )?;
         }
+        transaction.commit()?;
         Ok(project)
     }
 
     pub fn update_project(&self, id: &str, patch: ProjectPatch) -> Result<Project> {
-        let mut project = self.get_project(id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut project = get_project_with_connection(&transaction, id)?;
         if let Some(value) = patch.name {
             require_name(&value)?;
             project.name = value;
@@ -523,7 +502,7 @@ impl Database {
             project.notes = value;
         }
         project.updated_at = Utc::now();
-        self.connection()?.execute(
+        transaction.execute(
             "UPDATE projects SET name=?2,slug=?3,description=?4,type=?5,status=?6,priority=?7,
              deadline=?8,repo_url=?9,notes=?10,updated_at=?11 WHERE id=?1",
             params![
@@ -540,30 +519,36 @@ impl Database {
                 timestamp(project.updated_at)
             ],
         )?;
-        self.append_sync_event(
+        append_sync_event_with_connection(
+            &transaction,
             SyncEntityType::Project,
             &project.id,
             SyncOperation::Updated,
             serde_json::json!({ "entity": &project }),
         )?;
+        transaction.commit()?;
         Ok(project)
     }
 
     pub fn archive_project(&self, id: &str) -> Result<()> {
         let archived_at = Utc::now();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
         changed(
-            self.connection()?.execute(
+            transaction.execute(
                 "UPDATE projects SET status='archived',archived_at=?2,updated_at=?2 WHERE id=?1",
                 params![id, timestamp(archived_at)],
             )?,
             "project",
         )?;
-        self.append_sync_event(
+        append_sync_event_with_connection(
+            &transaction,
             SyncEntityType::Project,
             id,
             SyncOperation::Archived,
             serde_json::json!({ "id": id, "archived_at": archived_at }),
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -585,20 +570,17 @@ impl Database {
     }
 
     pub fn get_task(&self, id: &str) -> Result<Task> {
-        self.connection()?
-            .query_row(&format!("{TASK_SELECT} WHERE id=?1"), [id], map_task)
-            .optional()?
-            .ok_or(CoreError::NotFound("task"))
+        let connection = self.connection()?;
+        get_task_with_connection(&connection, id)
     }
 
     pub fn create_task(&self, input: NewTask) -> Result<Task> {
-        self.create_task_internal(input, true)
+        self.create_task_internal(input, MutationOrigin::Local)
     }
 
-    fn create_task_internal(&self, input: NewTask, log_sync: bool) -> Result<Task> {
+    fn create_task_internal(&self, input: NewTask, origin: MutationOrigin) -> Result<Task> {
         require_name(&input.title)?;
         validate_priority(input.priority)?;
-        self.get_project(&input.project_id)?;
         let now = Utc::now();
         let task = Task {
             id: Uuid::new_v4().to_string(),
@@ -627,7 +609,10 @@ impl Database {
         let tags = serde_json::to_string(&task.tags).unwrap_or_else(|_| "[]".into());
         let created_at = timestamp(task.created_at);
         let updated_at = timestamp(task.updated_at);
-        self.connection()?.execute(
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        get_project_with_connection(&transaction, &task.project_id)?;
+        transaction.execute(
             "INSERT INTO tasks VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 task.id,
@@ -649,19 +634,23 @@ impl Database {
                 updated_at
             ],
         )?;
-        if log_sync {
-            self.append_sync_event(
+        if origin.logs_sync_event() {
+            append_sync_event_with_connection(
+                &transaction,
                 SyncEntityType::Task,
                 &task.id,
                 SyncOperation::Created,
                 serde_json::json!({ "entity": &task }),
             )?;
         }
+        transaction.commit()?;
         Ok(task)
     }
 
     pub fn update_task(&self, id: &str, patch: TaskPatch) -> Result<Task> {
-        let mut task = self.get_task(id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut task = get_task_with_connection(&transaction, id)?;
         let now = Utc::now();
         if let Some(value) = patch.title {
             require_name(&value)?;
@@ -705,13 +694,15 @@ impl Database {
             task.tags = value;
         }
         task.updated_at = now;
-        self.save_task(&task)?;
-        self.append_sync_event(
+        save_task_with_connection(&transaction, &task)?;
+        append_sync_event_with_connection(
+            &transaction,
             SyncEntityType::Task,
             &task.id,
             SyncOperation::Updated,
             serde_json::json!({ "entity": &task }),
         )?;
+        transaction.commit()?;
         Ok(task)
     }
 
@@ -721,7 +712,7 @@ impl Database {
         status: TaskStatus,
         blocked_reason: Option<String>,
     ) -> Result<Task> {
-        self.transition_task_internal(id, status, blocked_reason, true)
+        self.transition_task_internal(id, status, blocked_reason, MutationOrigin::Local)
     }
 
     fn transition_task_internal(
@@ -729,9 +720,11 @@ impl Database {
         id: &str,
         status: TaskStatus,
         blocked_reason: Option<String>,
-        log_sync: bool,
+        origin: MutationOrigin,
     ) -> Result<Task> {
-        let mut task = self.get_task(id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut task = get_task_with_connection(&transaction, id)?;
         let now = Utc::now();
         task.status = status;
         task.updated_at = now;
@@ -742,40 +735,18 @@ impl Database {
         if status == TaskStatus::Done {
             task.completed_at = Some(now);
         }
-        self.save_task(&task)?;
-        if log_sync {
-            self.append_sync_event(
+        save_task_with_connection(&transaction, &task)?;
+        if origin.logs_sync_event() {
+            append_sync_event_with_connection(
+                &transaction,
                 SyncEntityType::Task,
                 &task.id,
                 SyncOperation::Transitioned,
                 serde_json::json!({ "entity": &task }),
             )?;
         }
+        transaction.commit()?;
         Ok(task)
-    }
-
-    fn save_task(&self, task: &Task) -> Result<()> {
-        let status = task.status.to_string();
-        let due_at = task.due_at.map(timestamp);
-        let scheduled_at = task.scheduled_at.map(timestamp);
-        let started_at = task.started_at.map(timestamp);
-        let completed_at = task.completed_at.map(timestamp);
-        let tags = serde_json::to_string(&task.tags).unwrap_or_else(|_| "[]".into());
-        let created_at = timestamp(task.created_at);
-        let updated_at = timestamp(task.updated_at);
-        self.connection()?.execute(
-            "UPDATE tasks SET project_id=?2,title=?3,description=?4,status=?5,priority=?6,due_at=?7,
-             scheduled_at=?8,started_at=?9,completed_at=?10,estimated_minutes=?11,
-             time_limit_minutes=?12,pinned=?13,blocked_reason=?14,tags=?15,created_at=?16,
-             updated_at=?17 WHERE id=?1",
-            params![
-                task.id, task.project_id, task.title, task.description, status, task.priority,
-                due_at, scheduled_at, started_at, completed_at, task.estimated_minutes,
-                task.time_limit_minutes, task.pinned, task.blocked_reason, tags, created_at,
-                updated_at
-            ],
-        )?;
-        Ok(())
     }
 
     pub fn board_state(&self) -> Result<BoardState> {
@@ -832,7 +803,7 @@ impl Database {
                         color: Some(color.into()),
                         icon: Some(icon.into()),
                     },
-                    false,
+                    MutationOrigin::Seed,
                 )?;
             }
         }
@@ -868,7 +839,7 @@ impl Database {
                     repo_url: Some("https://github.com/LaneBucher/openmgmt".into()),
                     notes: None,
                 },
-                false,
+                MutationOrigin::Seed,
             )
         })?;
 
@@ -950,14 +921,14 @@ impl Database {
                         pinned,
                         tags: vec!["seed".into()],
                     },
-                    false,
+                    MutationOrigin::Seed,
                 )?;
                 if let Some(reason) = blocked_reason {
                     self.transition_task_internal(
                         &task.id,
                         TaskStatus::Blocked,
                         Some(reason.into()),
-                        false,
+                        MutationOrigin::Seed,
                     )?;
                 }
             }
@@ -969,6 +940,158 @@ impl Database {
 const TASK_SELECT: &str = "SELECT id,project_id,title,description,status,priority,due_at,
  scheduled_at,started_at,completed_at,estimated_minutes,time_limit_minutes,pinned,blocked_reason,
  tags,created_at,updated_at FROM tasks";
+
+fn get_or_create_device_id_with_connection(connection: &Connection) -> Result<String> {
+    let now = timestamp(Utc::now());
+    if let Some(device_id) = connection
+        .query_row(
+            "SELECT value FROM sync_state WHERE key=?1",
+            [LOCAL_DEVICE_ID_KEY],
+            |row| row.get(0),
+        )
+        .optional()?
+    {
+        connection.execute(
+            "INSERT INTO sync_devices (device_id,name,created_at,last_seen_at)
+             VALUES (?1,'Local device',?2,?2)
+             ON CONFLICT(device_id) DO UPDATE SET last_seen_at=excluded.last_seen_at",
+            params![device_id, now],
+        )?;
+        return Ok(device_id);
+    }
+
+    let device_id = Uuid::new_v4().to_string();
+    connection.execute(
+        "INSERT INTO sync_state (key,value) VALUES (?1,?2)",
+        params![LOCAL_DEVICE_ID_KEY, device_id],
+    )?;
+    connection.execute(
+        "INSERT INTO sync_devices (device_id,name,created_at,last_seen_at)
+         VALUES (?1,'Local device',?2,?2)",
+        params![device_id, now],
+    )?;
+    Ok(device_id)
+}
+
+fn append_sync_event_with_connection(
+    connection: &Connection,
+    entity_type: SyncEntityType,
+    entity_id: &str,
+    operation: SyncOperation,
+    payload_json: serde_json::Value,
+) -> Result<SyncEvent> {
+    let device_id = get_or_create_device_id_with_connection(connection)?;
+    let sequence = connection.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM sync_events WHERE device_id=?1",
+        [&device_id],
+        |row| row.get(0),
+    )?;
+    let event = SyncEvent {
+        event_id: Uuid::new_v4().to_string(),
+        device_id,
+        actor_user_id: None,
+        target_user_id: None,
+        workspace_id: None,
+        sequence,
+        entity_type,
+        entity_id: entity_id.to_owned(),
+        operation,
+        payload_json,
+        created_at: Utc::now(),
+        synced_at: None,
+    };
+    connection.execute(
+        "INSERT INTO sync_events (
+            event_id,device_id,actor_user_id,target_user_id,workspace_id,sequence,entity_type,
+            entity_id,operation,payload_json,created_at,synced_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![
+            event.event_id,
+            event.device_id,
+            event.actor_user_id,
+            event.target_user_id,
+            event.workspace_id,
+            event.sequence,
+            event.entity_type.to_string(),
+            event.entity_id,
+            event.operation.to_string(),
+            event.payload_json.to_string(),
+            timestamp(event.created_at),
+            Option::<String>::None,
+        ],
+    )?;
+    Ok(event)
+}
+
+fn get_organization_with_connection(connection: &Connection, id: &str) -> Result<Organization> {
+    connection
+        .query_row(
+            "SELECT id,name,slug,description,color,icon,created_at,updated_at,archived_at
+             FROM organizations WHERE id=?1",
+            [id],
+            map_organization,
+        )
+        .optional()?
+        .ok_or(CoreError::NotFound("organization"))
+}
+
+fn get_project_with_connection(connection: &Connection, id: &str) -> Result<Project> {
+    connection
+        .query_row(
+            "SELECT id,organization_id,name,slug,description,type,status,priority,deadline,repo_url,
+                    notes,created_at,updated_at,archived_at FROM projects WHERE id=?1",
+            [id],
+            map_project,
+        )
+        .optional()?
+        .ok_or(CoreError::NotFound("project"))
+}
+
+fn get_task_with_connection(connection: &Connection, id: &str) -> Result<Task> {
+    connection
+        .query_row(&format!("{TASK_SELECT} WHERE id=?1"), [id], map_task)
+        .optional()?
+        .ok_or(CoreError::NotFound("task"))
+}
+
+fn save_task_with_connection(connection: &Connection, task: &Task) -> Result<()> {
+    let status = task.status.to_string();
+    let due_at = task.due_at.map(timestamp);
+    let scheduled_at = task.scheduled_at.map(timestamp);
+    let started_at = task.started_at.map(timestamp);
+    let completed_at = task.completed_at.map(timestamp);
+    let tags = serde_json::to_string(&task.tags).unwrap_or_else(|_| "[]".into());
+    let created_at = timestamp(task.created_at);
+    let updated_at = timestamp(task.updated_at);
+    changed(
+        connection.execute(
+            "UPDATE tasks SET project_id=?2,title=?3,description=?4,status=?5,priority=?6,due_at=?7,
+             scheduled_at=?8,started_at=?9,completed_at=?10,estimated_minutes=?11,
+             time_limit_minutes=?12,pinned=?13,blocked_reason=?14,tags=?15,created_at=?16,
+             updated_at=?17 WHERE id=?1",
+            params![
+                task.id,
+                task.project_id,
+                task.title,
+                task.description,
+                status,
+                task.priority,
+                due_at,
+                scheduled_at,
+                started_at,
+                completed_at,
+                task.estimated_minutes,
+                task.time_limit_minutes,
+                task.pinned,
+                task.blocked_reason,
+                tags,
+                created_at,
+                updated_at
+            ],
+        )?,
+        "task",
+    )
+}
 
 fn map_organization(row: &Row<'_>) -> rusqlite::Result<Organization> {
     Ok(Organization {
@@ -1218,6 +1341,163 @@ mod tests {
         let second = db.get_or_create_device_id().unwrap();
         assert_eq!(first, second);
         assert!(Uuid::parse_str(&first).is_ok());
+    }
+
+    #[test]
+    fn device_id_registers_and_updates_local_device() {
+        let db = Database::in_memory().unwrap();
+        let device_id = db.get_or_create_device_id().unwrap();
+        {
+            let connection = db.connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE sync_devices SET last_seen_at='2000-01-01T00:00:00Z'
+                     WHERE device_id=?1",
+                    [&device_id],
+                )
+                .unwrap();
+        }
+        assert_eq!(db.get_or_create_device_id().unwrap(), device_id);
+
+        let connection = db.connection().unwrap();
+        let state_device_id: String = connection
+            .query_row(
+                "SELECT value FROM sync_state WHERE key=?1",
+                [LOCAL_DEVICE_ID_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (name, created_at, last_seen_at): (String, String, Option<String>) = connection
+            .query_row(
+                "SELECT name,created_at,last_seen_at FROM sync_devices WHERE device_id=?1",
+                [&device_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state_device_id, device_id);
+        assert_eq!(name, "Local device");
+        assert!(DateTime::parse_from_rfc3339(&created_at).is_ok());
+        assert_ne!(last_seen_at.as_deref(), Some("2000-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn sync_event_failure_rolls_back_domain_mutation() {
+        let db = Database::in_memory().unwrap();
+        db.connection()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_sync_events
+                 BEFORE INSERT ON sync_events
+                 BEGIN
+                   SELECT RAISE(FAIL, 'sync event rejected');
+                 END;",
+            )
+            .unwrap();
+
+        let result = db.create_organization(NewOrganization {
+            name: "Rolled Back".into(),
+            slug: Some("rolled-back".into()),
+            description: None,
+            color: None,
+            icon: None,
+        });
+
+        assert!(matches!(result, Err(CoreError::Database(_))));
+        let exists: bool = db
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM organizations WHERE slug='rolled-back')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!exists);
+    }
+
+    #[test]
+    fn every_local_public_mutation_appends_one_event() {
+        let db = Database::in_memory().unwrap();
+        let event_count = || db.list_unsynced_events().unwrap().len();
+
+        let organization = db
+            .create_organization(NewOrganization {
+                name: "Event Organization".into(),
+                slug: None,
+                description: None,
+                color: None,
+                icon: None,
+            })
+            .unwrap();
+        assert_eq!(event_count(), 1);
+        db.update_organization(
+            &organization.id,
+            OrganizationPatch {
+                description: Some(Some("Updated".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(event_count(), 2);
+
+        let project = db
+            .create_project(NewProject {
+                organization_id: organization.id.clone(),
+                name: "Event Project".into(),
+                slug: None,
+                description: None,
+                project_type: ProjectType::Software,
+                status: ProjectStatus::Active,
+                priority: 3,
+                deadline: None,
+                repo_url: None,
+                notes: None,
+            })
+            .unwrap();
+        assert_eq!(event_count(), 3);
+        db.update_project(
+            &project.id,
+            ProjectPatch {
+                notes: Some(Some("Updated".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(event_count(), 4);
+
+        let task = db
+            .create_task(NewTask {
+                project_id: project.id.clone(),
+                title: "Event Task".into(),
+                description: None,
+                status: TaskStatus::Inbox,
+                priority: 3,
+                due_at: None,
+                scheduled_at: None,
+                estimated_minutes: None,
+                time_limit_minutes: None,
+                pinned: false,
+                tags: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(event_count(), 5);
+        db.update_task(
+            &task.id,
+            TaskPatch {
+                priority: Some(4),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(event_count(), 6);
+        db.transition_task(&task.id, TaskStatus::Ready, None)
+            .unwrap();
+        assert_eq!(event_count(), 7);
+
+        db.archive_project(&project.id).unwrap();
+        assert_eq!(event_count(), 8);
+        db.archive_organization(&organization.id).unwrap();
+        assert_eq!(event_count(), 9);
     }
 
     #[test]
