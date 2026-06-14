@@ -5,8 +5,9 @@ use crate::{
         ProjectPatch, ProjectStatus, ProjectType, Task, TaskContext, TaskPatch, TaskStatus,
     },
     sync::{
-        DEFAULT_DEVICE_NAME, LOCAL_DEVICE_ID_KEY, SYNC_ACCOUNT_ID_KEY, SYNC_DEVICE_NAME_KEY,
-        SYNC_DEVICE_TOKEN_KEY, SYNC_ENABLED_KEY, SYNC_LAST_ATTEMPTED_AT_KEY, SYNC_LAST_ERROR_KEY,
+        DEFAULT_DEVICE_NAME, LOCAL_DEVICE_ID_KEY, RemoteApplyBatchResult, RemoteApplyResult,
+        RemoteApplyStatus, SYNC_ACCOUNT_ID_KEY, SYNC_DEVICE_NAME_KEY, SYNC_DEVICE_TOKEN_KEY,
+        SYNC_ENABLED_KEY, SYNC_LAST_ATTEMPTED_AT_KEY, SYNC_LAST_ERROR_KEY,
         SYNC_LAST_SUCCESSFUL_AT_KEY, SYNC_SERVER_URL_KEY, SYNC_USER_ID_KEY, SyncConnectionState,
         SyncEntityType, SyncEvent, SyncOperation, SyncSettings, SyncSettingsPatch, SyncStatus,
     },
@@ -158,6 +159,22 @@ impl Database {
               created_at TEXT NOT NULL,
               last_seen_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS applied_remote_events (
+              event_id TEXT PRIMARY KEY NOT NULL,
+              device_id TEXT NOT NULL,
+              actor_user_id TEXT,
+              target_user_id TEXT,
+              workspace_id TEXT,
+              sequence INTEGER NOT NULL,
+              entity_type TEXT NOT NULL,
+              entity_id TEXT NOT NULL,
+              operation TEXT NOT NULL,
+              applied_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS applied_remote_events_entity_idx
+              ON applied_remote_events(entity_type, entity_id);
+            CREATE INDEX IF NOT EXISTS applied_remote_events_device_sequence_idx
+              ON applied_remote_events(device_id, sequence);
             "#,
         )?;
         self.ensure_sync_event_ownership_columns()?;
@@ -236,6 +253,77 @@ impl Database {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn has_applied_remote_event(&self, event_id: &str) -> Result<bool> {
+        Ok(self.connection()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM applied_remote_events WHERE event_id=?1)",
+            [event_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn apply_remote_sync_event(&self, event: &SyncEvent) -> Result<RemoteApplyResult> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let local_device_id = get_or_create_device_id_with_connection(&transaction)?;
+        let status = if event.device_id == local_device_id {
+            RemoteApplyStatus::SkippedLocalEcho
+        } else if transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM applied_remote_events WHERE event_id=?1)",
+            [&event.event_id],
+            |row| row.get::<_, bool>(0),
+        )? {
+            RemoteApplyStatus::AlreadyApplied
+        } else {
+            apply_remote_domain_change(&transaction, event)?;
+            transaction.execute(
+                "INSERT INTO applied_remote_events (
+                    event_id,device_id,actor_user_id,target_user_id,workspace_id,sequence,
+                    entity_type,entity_id,operation,applied_at
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    event.event_id,
+                    event.device_id,
+                    event.actor_user_id,
+                    event.target_user_id,
+                    event.workspace_id,
+                    event.sequence,
+                    event.entity_type.to_string(),
+                    event.entity_id,
+                    event.operation.to_string(),
+                    timestamp(Utc::now()),
+                ],
+            )?;
+            RemoteApplyStatus::Applied
+        };
+        transaction.commit()?;
+        Ok(RemoteApplyResult {
+            event_id: event.event_id.clone(),
+            entity_type: event.entity_type,
+            entity_id: event.entity_id.clone(),
+            operation: event.operation,
+            status,
+        })
+    }
+
+    pub fn apply_remote_sync_events(&self, events: &[SyncEvent]) -> Result<RemoteApplyBatchResult> {
+        let mut result = RemoteApplyBatchResult {
+            applied_count: 0,
+            already_applied_count: 0,
+            skipped_local_echo_count: 0,
+            results: Vec::with_capacity(events.len()),
+        };
+        for event in events {
+            let applied = self.apply_remote_sync_event(event)?;
+            match applied.status {
+                RemoteApplyStatus::Applied => result.applied_count += 1,
+                RemoteApplyStatus::AlreadyApplied => result.already_applied_count += 1,
+                RemoteApplyStatus::SkippedLocalEcho => result.skipped_local_echo_count += 1,
+            }
+            result.results.push(applied);
+        }
+        Ok(result)
     }
 
     pub fn get_sync_state(&self, key: &str) -> Result<Option<String>> {
@@ -1275,6 +1363,224 @@ fn append_sync_event_with_connection(
     Ok(event)
 }
 
+#[derive(serde::Deserialize)]
+struct RemoteArchivePayload {
+    id: String,
+    archived_at: DateTime<Utc>,
+}
+
+fn apply_remote_domain_change(connection: &Connection, event: &SyncEvent) -> Result<()> {
+    match (event.entity_type, event.operation) {
+        (SyncEntityType::Organization, SyncOperation::Created | SyncOperation::Updated) => {
+            let organization: Organization = remote_entity(event)?;
+            ensure_event_entity_id(event, &organization.id)?;
+            upsert_organization_from_remote(connection, &organization)
+        }
+        (SyncEntityType::Organization, SyncOperation::Archived) => {
+            let archive = remote_archive(event)?;
+            changed(
+                connection.execute(
+                    "UPDATE organizations SET archived_at=?2,updated_at=?2 WHERE id=?1",
+                    params![archive.id, timestamp(archive.archived_at)],
+                )?,
+                "organization",
+            )
+        }
+        (SyncEntityType::Project, SyncOperation::Created | SyncOperation::Updated) => {
+            let project: Project = remote_entity(event)?;
+            ensure_event_entity_id(event, &project.id)?;
+            upsert_project_from_remote(connection, &project)
+        }
+        (SyncEntityType::Project, SyncOperation::Archived) => {
+            let archive = remote_archive(event)?;
+            changed(
+                connection.execute(
+                    "UPDATE projects SET status='archived',archived_at=?2,updated_at=?2 WHERE id=?1",
+                    params![archive.id, timestamp(archive.archived_at)],
+                )?,
+                "project",
+            )
+        }
+        (
+            SyncEntityType::Task,
+            SyncOperation::Created | SyncOperation::Updated | SyncOperation::Transitioned,
+        ) => {
+            let task: Task = remote_entity(event)?;
+            ensure_event_entity_id(event, &task.id)?;
+            upsert_task_from_remote(connection, &task)
+        }
+        (SyncEntityType::Task, SyncOperation::Archived) => {
+            let archive = remote_archive(event)?;
+            changed(
+                connection.execute(
+                    "UPDATE tasks SET status='canceled',updated_at=?2 WHERE id=?1",
+                    params![archive.id, timestamp(archive.archived_at)],
+                )?,
+                "task",
+            )
+        }
+        (_, operation) => Err(CoreError::Validation(format!(
+            "operation {operation} is not supported for remote {} events",
+            event.entity_type
+        ))),
+    }
+}
+
+fn remote_entity<T: serde::de::DeserializeOwned>(event: &SyncEvent) -> Result<T> {
+    let value = event.payload_json.get("entity").cloned().ok_or_else(|| {
+        CoreError::Validation(format!(
+            "remote {} event payload is missing entity",
+            event.entity_type
+        ))
+    })?;
+    serde_json::from_value(value).map_err(|error| {
+        CoreError::Validation(format!(
+            "invalid remote {} event entity: {error}",
+            event.entity_type
+        ))
+    })
+}
+
+fn remote_archive(event: &SyncEvent) -> Result<RemoteArchivePayload> {
+    let payload: RemoteArchivePayload = serde_json::from_value(event.payload_json.clone())
+        .map_err(|error| {
+            CoreError::Validation(format!(
+                "invalid remote {} archive payload: {error}",
+                event.entity_type
+            ))
+        })?;
+    ensure_event_entity_id(event, &payload.id)?;
+    Ok(payload)
+}
+
+fn ensure_event_entity_id(event: &SyncEvent, payload_id: &str) -> Result<()> {
+    if event.entity_id == payload_id {
+        Ok(())
+    } else {
+        Err(CoreError::Validation(format!(
+            "remote event entity ID {} does not match payload ID {payload_id}",
+            event.entity_id
+        )))
+    }
+}
+
+fn entity_exists(connection: &Connection, table: &str, id: &str) -> Result<bool> {
+    Ok(connection.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id=?1)"),
+        [id],
+        |row| row.get(0),
+    )?)
+}
+
+fn upsert_organization_from_remote(
+    connection: &Connection,
+    organization: &Organization,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO organizations (
+            id,name,slug,description,color,icon,created_at,updated_at,archived_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+         ON CONFLICT(id) DO UPDATE SET
+            name=excluded.name,slug=excluded.slug,description=excluded.description,
+            color=excluded.color,icon=excluded.icon,created_at=excluded.created_at,
+            updated_at=excluded.updated_at,archived_at=excluded.archived_at",
+        params![
+            organization.id,
+            organization.name,
+            organization.slug,
+            organization.description,
+            organization.color,
+            organization.icon,
+            timestamp(organization.created_at),
+            timestamp(organization.updated_at),
+            organization.archived_at.map(timestamp),
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_project_from_remote(connection: &Connection, project: &Project) -> Result<()> {
+    if !entity_exists(connection, "organizations", &project.organization_id)? {
+        return Err(CoreError::Validation(
+            "cannot apply remote project event because organization is missing".into(),
+        ));
+    }
+    connection.execute(
+        "INSERT INTO projects (
+            id,organization_id,name,slug,description,type,status,priority,deadline,repo_url,notes,
+            created_at,updated_at,archived_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+         ON CONFLICT(id) DO UPDATE SET
+            organization_id=excluded.organization_id,name=excluded.name,slug=excluded.slug,
+            description=excluded.description,type=excluded.type,status=excluded.status,
+            priority=excluded.priority,deadline=excluded.deadline,repo_url=excluded.repo_url,
+            notes=excluded.notes,created_at=excluded.created_at,updated_at=excluded.updated_at,
+            archived_at=excluded.archived_at",
+        params![
+            project.id,
+            project.organization_id,
+            project.name,
+            project.slug,
+            project.description,
+            project.project_type.to_string(),
+            project.status.to_string(),
+            project.priority,
+            project.deadline.map(timestamp),
+            project.repo_url,
+            project.notes,
+            timestamp(project.created_at),
+            timestamp(project.updated_at),
+            project.archived_at.map(timestamp),
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_task_from_remote(connection: &Connection, task: &Task) -> Result<()> {
+    if !entity_exists(connection, "projects", &task.project_id)? {
+        return Err(CoreError::Validation(
+            "cannot apply remote task event because project is missing".into(),
+        ));
+    }
+    let tags = serde_json::to_string(&task.tags)
+        .map_err(|error| CoreError::Validation(format!("invalid remote task tags: {error}")))?;
+    connection.execute(
+        "INSERT INTO tasks (
+            id,project_id,title,description,status,priority,due_at,scheduled_at,started_at,
+            completed_at,estimated_minutes,time_limit_minutes,pinned,blocked_reason,tags,
+            created_at,updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+         ON CONFLICT(id) DO UPDATE SET
+            project_id=excluded.project_id,title=excluded.title,description=excluded.description,
+            status=excluded.status,priority=excluded.priority,due_at=excluded.due_at,
+            scheduled_at=excluded.scheduled_at,started_at=excluded.started_at,
+            completed_at=excluded.completed_at,estimated_minutes=excluded.estimated_minutes,
+            time_limit_minutes=excluded.time_limit_minutes,pinned=excluded.pinned,
+            blocked_reason=excluded.blocked_reason,tags=excluded.tags,
+            created_at=excluded.created_at,updated_at=excluded.updated_at",
+        params![
+            task.id,
+            task.project_id,
+            task.title,
+            task.description,
+            task.status.to_string(),
+            task.priority,
+            task.due_at.map(timestamp),
+            task.scheduled_at.map(timestamp),
+            task.started_at.map(timestamp),
+            task.completed_at.map(timestamp),
+            task.estimated_minutes,
+            task.time_limit_minutes,
+            task.pinned,
+            task.blocked_reason,
+            tags,
+            timestamp(task.created_at),
+            timestamp(task.updated_at),
+        ],
+    )?;
+    Ok(())
+}
+
 fn get_organization_with_connection(connection: &Connection, id: &str) -> Result<Organization> {
     connection
         .query_row(
@@ -1500,12 +1806,95 @@ fn changed(rows: usize, entity: &'static str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::{SyncConnectionState, SyncEntityType, SyncOperation, SyncSettingsPatch};
+    use crate::sync::{
+        RemoteApplyStatus, SyncConnectionState, SyncEntityType, SyncOperation, SyncSettingsPatch,
+    };
 
     fn seeded_database() -> Database {
         let db = Database::in_memory().unwrap();
         db.seed().unwrap();
         db
+    }
+
+    fn remote_event(
+        event_id: &str,
+        entity_type: SyncEntityType,
+        entity_id: &str,
+        operation: SyncOperation,
+        payload_json: serde_json::Value,
+    ) -> SyncEvent {
+        SyncEvent {
+            event_id: event_id.into(),
+            device_id: "remote-device".into(),
+            actor_user_id: None,
+            target_user_id: None,
+            workspace_id: None,
+            sequence: 1,
+            entity_type,
+            entity_id: entity_id.into(),
+            operation,
+            payload_json,
+            created_at: Utc::now(),
+            synced_at: None,
+        }
+    }
+
+    fn remote_organization(id: &str) -> Organization {
+        let now = Utc::now();
+        Organization {
+            id: id.into(),
+            name: "Remote Organization".into(),
+            slug: format!("remote-{id}"),
+            description: None,
+            color: None,
+            icon: None,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+        }
+    }
+
+    fn remote_project(id: &str, organization_id: &str) -> Project {
+        let now = Utc::now();
+        Project {
+            id: id.into(),
+            organization_id: organization_id.into(),
+            name: "Remote Project".into(),
+            slug: format!("remote-{id}"),
+            description: None,
+            project_type: ProjectType::Software,
+            status: ProjectStatus::Active,
+            priority: 3,
+            deadline: None,
+            repo_url: None,
+            notes: None,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+        }
+    }
+
+    fn remote_task(id: &str, project_id: &str) -> Task {
+        let now = Utc::now();
+        Task {
+            id: id.into(),
+            project_id: project_id.into(),
+            title: "Remote Task".into(),
+            description: None,
+            status: TaskStatus::Inbox,
+            priority: 3,
+            due_at: None,
+            scheduled_at: None,
+            started_at: None,
+            completed_at: None,
+            estimated_minutes: None,
+            time_limit_minutes: None,
+            pinned: false,
+            blocked_reason: None,
+            tags: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        }
     }
 
     #[test]
@@ -1521,7 +1910,12 @@ mod tests {
     fn migration_creates_sync_tables() {
         let db = Database::in_memory().unwrap();
         let connection = db.connection().unwrap();
-        for table in ["sync_events", "sync_state", "sync_devices"] {
+        for table in [
+            "sync_events",
+            "sync_state",
+            "sync_devices",
+            "applied_remote_events",
+        ] {
             let exists: bool = connection
                 .query_row(
                     "SELECT EXISTS(
@@ -1546,6 +1940,181 @@ mod tests {
                 "missing column {column}"
             );
         }
+    }
+
+    #[test]
+    fn remote_organization_apply_is_atomic_and_deduplicated() {
+        let db = Database::in_memory().unwrap();
+        let organization = remote_organization("org-remote");
+        let event = remote_event(
+            "event-org",
+            SyncEntityType::Organization,
+            &organization.id,
+            SyncOperation::Created,
+            serde_json::json!({"entity": organization}),
+        );
+
+        assert_eq!(
+            db.apply_remote_sync_event(&event).unwrap().status,
+            RemoteApplyStatus::Applied
+        );
+        assert_eq!(
+            db.apply_remote_sync_event(&event).unwrap().status,
+            RemoteApplyStatus::AlreadyApplied
+        );
+        assert_eq!(db.list_organizations().unwrap().len(), 1);
+        assert!(db.has_applied_remote_event(&event.event_id).unwrap());
+        assert!(db.list_unsynced_events().unwrap().is_empty());
+
+        let malformed = remote_event(
+            "event-bad",
+            SyncEntityType::Organization,
+            "bad",
+            SyncOperation::Created,
+            serde_json::json!({}),
+        );
+        assert!(matches!(
+            db.apply_remote_sync_event(&malformed),
+            Err(CoreError::Validation(_))
+        ));
+        assert!(!db.has_applied_remote_event("event-bad").unwrap());
+    }
+
+    #[test]
+    fn remote_local_echo_is_skipped_without_mutation() {
+        let db = Database::in_memory().unwrap();
+        let mut event = remote_event(
+            "event-echo",
+            SyncEntityType::Organization,
+            "echo-org",
+            SyncOperation::Created,
+            serde_json::json!({"entity": remote_organization("echo-org")}),
+        );
+        event.device_id = db.get_or_create_device_id().unwrap();
+
+        assert_eq!(
+            db.apply_remote_sync_event(&event).unwrap().status,
+            RemoteApplyStatus::SkippedLocalEcho
+        );
+        assert!(db.list_organizations().unwrap().is_empty());
+        assert!(!db.has_applied_remote_event(&event.event_id).unwrap());
+    }
+
+    #[test]
+    fn remote_dependencies_are_required_and_ordered_batches_apply() {
+        let db = Database::in_memory().unwrap();
+        let organization = remote_organization("org-1");
+        let project = remote_project("project-1", &organization.id);
+        let task = remote_task("task-1", &project.id);
+        let organization_event = remote_event(
+            "event-1",
+            SyncEntityType::Organization,
+            &organization.id,
+            SyncOperation::Created,
+            serde_json::json!({"entity": organization}),
+        );
+        let project_event = remote_event(
+            "event-2",
+            SyncEntityType::Project,
+            &project.id,
+            SyncOperation::Created,
+            serde_json::json!({"entity": project}),
+        );
+        let task_event = remote_event(
+            "event-3",
+            SyncEntityType::Task,
+            &task.id,
+            SyncOperation::Created,
+            serde_json::json!({"entity": task}),
+        );
+
+        assert!(matches!(
+            db.apply_remote_sync_event(&project_event),
+            Err(CoreError::Validation(_))
+        ));
+        assert!(!db.has_applied_remote_event("event-2").unwrap());
+        assert!(matches!(
+            db.apply_remote_sync_event(&task_event),
+            Err(CoreError::Validation(_))
+        ));
+
+        let result = db
+            .apply_remote_sync_events(&[organization_event, project_event, task_event])
+            .unwrap();
+        assert_eq!(result.applied_count, 3);
+        assert_eq!(db.get_task("task-1").unwrap().title, "Remote Task");
+        assert!(db.list_unsynced_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remote_task_update_and_archives_do_not_log_local_events() {
+        let db = Database::in_memory().unwrap();
+        let organization = remote_organization("org-1");
+        let project = remote_project("project-1", &organization.id);
+        let task = remote_task("task-1", &project.id);
+        db.apply_remote_sync_events(&[
+            remote_event(
+                "event-1",
+                SyncEntityType::Organization,
+                &organization.id,
+                SyncOperation::Created,
+                serde_json::json!({"entity": organization}),
+            ),
+            remote_event(
+                "event-2",
+                SyncEntityType::Project,
+                &project.id,
+                SyncOperation::Created,
+                serde_json::json!({"entity": project}),
+            ),
+            remote_event(
+                "event-3",
+                SyncEntityType::Task,
+                &task.id,
+                SyncOperation::Created,
+                serde_json::json!({"entity": task}),
+            ),
+        ])
+        .unwrap();
+
+        let mut updated = db.get_task("task-1").unwrap();
+        updated.title = "Updated Remotely".into();
+        updated.status = TaskStatus::InProgress;
+        updated.updated_at = Utc::now();
+        db.apply_remote_sync_event(&remote_event(
+            "event-4",
+            SyncEntityType::Task,
+            &updated.id,
+            SyncOperation::Transitioned,
+            serde_json::json!({"entity": updated}),
+        ))
+        .unwrap();
+        assert_eq!(db.get_task("task-1").unwrap().title, "Updated Remotely");
+
+        let archived_at = Utc::now();
+        db.apply_remote_sync_events(&[
+            remote_event(
+                "event-5",
+                SyncEntityType::Project,
+                "project-1",
+                SyncOperation::Archived,
+                serde_json::json!({"id": "project-1", "archived_at": archived_at}),
+            ),
+            remote_event(
+                "event-6",
+                SyncEntityType::Organization,
+                "org-1",
+                SyncOperation::Archived,
+                serde_json::json!({"id": "org-1", "archived_at": archived_at}),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            db.get_project("project-1").unwrap().status,
+            ProjectStatus::Archived
+        );
+        assert!(db.get_organization("org-1").unwrap().archived_at.is_some());
+        assert!(db.list_unsynced_events().unwrap().is_empty());
     }
 
     #[test]

@@ -12,8 +12,6 @@ pub enum SyncClientError {
     Http(#[from] reqwest::Error),
     #[error("protocol error: {0}")]
     Protocol(String),
-    #[error("remote events were pulled but remote apply is not implemented")]
-    RemoteApplyUnavailable,
     #[error("unexpected sync error: {0}")]
     Other(String),
 }

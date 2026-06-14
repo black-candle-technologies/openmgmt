@@ -15,6 +15,6 @@ pub use db::{Database, default_database_path};
 pub use models::*;
 pub use scoring::{ScoringWeights, score_task};
 pub use sync::{
-    SyncConnectionState, SyncEntityType, SyncEvent, SyncOperation, SyncSettings, SyncSettingsPatch,
-    SyncStatus,
+    RemoteApplyBatchResult, RemoteApplyResult, RemoteApplyStatus, SyncConnectionState,
+    SyncEntityType, SyncEvent, SyncOperation, SyncSettings, SyncSettingsPatch, SyncStatus,
 };

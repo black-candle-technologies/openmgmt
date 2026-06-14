@@ -79,11 +79,21 @@ needed, pushes pending local events, and pulls server events.
 The client does not run in the background. The desktop Tauri shell exposes a
 `sync_now` command, but this step does not add a settings or sync UI.
 
-Remote domain application is not implemented yet. Events echoed from the same
-local device are safe to acknowledge because their domain changes already
-exist locally. Events from another device are not applied, and the client does
-not advance its pull checkpoint past them. This preserves them for a future
-remote-apply implementation.
+Pulled organization, project, and task events are replayed into the local
+SQLite database in server order. Applied remote events are deduplicated by
+`event_id`. Events from the local device are treated as echoes and do not
+mutate domain rows.
+
+Replay writes never create new local sync events. Each domain write and its
+`applied_remote_events` marker are committed in the same transaction. The
+client advances its server checkpoint only after the entire pulled batch is
+successfully replayed; a failed dependency or malformed payload leaves the
+checkpoint unchanged for retry.
+
+Conflict behavior is currently deterministic last-write-wins in server event
+order. Project events require their organization to exist, and task events
+require their project to exist. Advanced conflict resolution is not yet
+implemented.
 
 The desktop app remains fully local-first and continues to work when sync is
 disabled or no server is available.

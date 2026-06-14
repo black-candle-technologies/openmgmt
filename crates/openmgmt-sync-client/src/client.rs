@@ -158,30 +158,23 @@ impl OpenMgmtSyncClient {
             })
             .await?;
         let pulled_event_count = pull.events.len();
-        let remote_event_count = pull
-            .events
-            .iter()
-            .filter(|event| event.device_id != auth.device_id)
-            .count();
         phases.push(SyncPhaseResult::ok(
             SyncPhase::Pull,
             Some(format!("Pulled {pulled_event_count} server events.")),
         ));
 
-        if remote_event_count > 0 {
-            return Err(SyncClientError::RemoteApplyUnavailable);
-        }
-
+        let applied = database.apply_remote_sync_events(&pull.events)?;
         if !pull.server_checkpoint.is_empty() {
             database.set_sync_state(SERVER_CHECKPOINT_KEY, &pull.server_checkpoint)?;
         }
         phases.push(SyncPhaseResult::ok(
             SyncPhase::RemoteApply,
-            Some(if pulled_event_count == 0 {
-                "No remote events required application.".into()
-            } else {
-                format!("Ignored {pulled_event_count} local device event echoes.")
-            }),
+            Some(format!(
+                "Applied {}; already applied {}; skipped local echoes {}.",
+                applied.applied_count,
+                applied.already_applied_count,
+                applied.skipped_local_echo_count
+            )),
         ));
         database.record_sync_success()?;
         phases.push(SyncPhaseResult::ok(
@@ -194,7 +187,7 @@ impl OpenMgmtSyncClient {
             accepted_event_count,
             rejected_event_count,
             pulled_event_count,
-            applied_event_count: 0,
+            applied_event_count: applied.applied_count,
             server_checkpoint: (!pull.server_checkpoint.is_empty())
                 .then_some(pull.server_checkpoint),
             phases,
@@ -207,7 +200,10 @@ mod tests {
     use super::*;
     use crate::{SyncClientConfig, SyncClientError};
     use axum::{Json, Router, extract::State, routing::post};
-    use openmgmt_core::{Database, SyncEntityType, SyncOperation, SyncSettingsPatch};
+    use openmgmt_core::{
+        Database, Organization, Project, ProjectStatus, ProjectType, SyncEntityType, SyncOperation,
+        SyncSettingsPatch,
+    };
     use openmgmt_protocol::{
         DeviceRegistrationRequest, DeviceRegistrationResponse, PROTOCOL_VERSION, SyncEvent,
         SyncHelloRequest, SyncHelloResponse, SyncPullRequest, SyncPullResponse, SyncPushRequest,
@@ -317,6 +313,35 @@ mod tests {
         database
     }
 
+    fn remote_organization_event(event_id: &str) -> SyncEvent {
+        let now = chrono::Utc::now();
+        let organization = Organization {
+            id: "remote-org".into(),
+            name: "Remote Organization".into(),
+            slug: "remote-organization".into(),
+            description: None,
+            color: None,
+            icon: None,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+        };
+        SyncEvent {
+            event_id: event_id.into(),
+            device_id: "other-device".into(),
+            actor_user_id: None,
+            target_user_id: None,
+            workspace_id: None,
+            sequence: 1,
+            entity_type: SyncEntityType::Organization,
+            entity_id: organization.id.clone(),
+            operation: SyncOperation::Created,
+            payload_json: serde_json::json!({"entity": organization}),
+            created_at: now,
+            synced_at: None,
+        }
+    }
+
     #[tokio::test]
     async fn disabled_sync_returns_disabled() {
         let database = Database::in_memory().unwrap();
@@ -385,25 +410,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_events_do_not_advance_checkpoint_and_record_error() {
-        let (server_url, _) = test_server(
-            vec![SyncEvent {
-                event_id: "remote-event".into(),
-                device_id: "other-device".into(),
-                actor_user_id: None,
-                target_user_id: None,
-                workspace_id: None,
-                sequence: 1,
-                entity_type: SyncEntityType::Task,
-                entity_id: "task-2".into(),
-                operation: SyncOperation::Created,
-                payload_json: serde_json::json!({"entity": {"id": "task-2"}}),
-                created_at: chrono::Utc::now(),
-                synced_at: None,
-            }],
-            false,
-        )
-        .await;
+    async fn remote_events_apply_and_advance_checkpoint() {
+        let (server_url, _) =
+            test_server(vec![remote_organization_event("remote-event")], false).await;
+        let database = configured_database(Some(server_url));
+        database
+            .set_sync_state(CHECKPOINT_KEY, "checkpoint-0")
+            .unwrap();
+
+        let result = OpenMgmtSyncClient::new(SyncClientConfig::default())
+            .sync_once(&database)
+            .await
+            .unwrap();
+
+        assert_eq!(result.applied_event_count, 1);
+        assert_eq!(
+            database.get_sync_state(CHECKPOINT_KEY).unwrap().as_deref(),
+            Some("checkpoint-1")
+        );
+        assert_eq!(database.list_organizations().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replay_failure_does_not_advance_checkpoint_and_records_error() {
+        let now = chrono::Utc::now();
+        let project = Project {
+            id: "remote-project".into(),
+            organization_id: "missing-org".into(),
+            name: "Remote Project".into(),
+            slug: "remote-project".into(),
+            description: None,
+            project_type: ProjectType::Software,
+            status: ProjectStatus::Active,
+            priority: 3,
+            deadline: None,
+            repo_url: None,
+            notes: None,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+        };
+        let event = SyncEvent {
+            event_id: "remote-project-event".into(),
+            device_id: "other-device".into(),
+            actor_user_id: None,
+            target_user_id: None,
+            workspace_id: None,
+            sequence: 1,
+            entity_type: SyncEntityType::Project,
+            entity_id: project.id.clone(),
+            operation: SyncOperation::Created,
+            payload_json: serde_json::json!({"entity": project}),
+            created_at: now,
+            synced_at: None,
+        };
+        let (server_url, _) = test_server(vec![event], false).await;
         let database = configured_database(Some(server_url));
         database
             .set_sync_state(CHECKPOINT_KEY, "checkpoint-0")
@@ -414,15 +475,48 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(error, SyncClientError::RemoteApplyUnavailable));
+        assert!(matches!(error, SyncClientError::Core(_)));
         assert_eq!(
             database.get_sync_state(CHECKPOINT_KEY).unwrap().as_deref(),
             Some("checkpoint-0")
         );
         assert_eq!(
-            database.get_sync_status().unwrap().last_error.as_deref(),
-            Some("remote events were pulled but remote apply is not implemented")
+            database
+                .get_sync_status()
+                .unwrap()
+                .last_error
+                .as_deref()
+                .unwrap(),
+            "local database error: validation error: cannot apply remote project event because organization is missing"
         );
+    }
+
+    #[tokio::test]
+    async fn already_applied_remote_event_advances_checkpoint_without_reapplying() {
+        let event = remote_organization_event("already-applied");
+        let database = Database::in_memory().unwrap();
+        database.apply_remote_sync_event(&event).unwrap();
+        let (server_url, _) = test_server(vec![event], false).await;
+        database
+            .update_sync_settings(SyncSettingsPatch {
+                enabled: Some(true),
+                server_url: Some(Some(server_url)),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let result = OpenMgmtSyncClient::new(SyncClientConfig::default())
+            .sync_once(&database)
+            .await
+            .unwrap();
+
+        assert_eq!(result.pulled_event_count, 1);
+        assert_eq!(result.applied_event_count, 0);
+        assert_eq!(
+            database.get_sync_state(CHECKPOINT_KEY).unwrap().as_deref(),
+            Some("checkpoint-1")
+        );
+        assert_eq!(database.list_organizations().unwrap().len(), 1);
     }
 
     #[tokio::test]
