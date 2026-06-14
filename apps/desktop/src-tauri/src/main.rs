@@ -38,6 +38,7 @@ fn main() {
             commands::get_sync_settings,
             commands::update_sync_settings,
             commands::get_sync_status,
+            commands::sync_now,
             commands::open_tv_board_window,
         ])
         .run(tauri::generate_context!())

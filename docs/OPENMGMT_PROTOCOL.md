@@ -68,8 +68,25 @@ tasks. The desktop app remains fully local-first and does not require the
 server.
 
 Device tokens are placeholders for future authentication. Real authentication,
-the desktop sync client, background sync, and domain conflict resolution are
-not implemented yet.
+background sync, and domain conflict resolution are not implemented yet.
+
+## Manual Sync Client
+
+The `openmgmt-sync-client` crate provides a manual, one-shot `sync_once`
+operation. It reads local settings, negotiates OMGP/1, registers the device when
+needed, pushes pending local events, and pulls server events.
+
+The client does not run in the background. The desktop Tauri shell exposes a
+`sync_now` command, but this step does not add a settings or sync UI.
+
+Remote domain application is not implemented yet. Events echoed from the same
+local device are safe to acknowledge because their domain changes already
+exist locally. Events from another device are not applied, and the client does
+not advance its pull checkpoint past them. This preserves them for a future
+remote-apply implementation.
+
+The desktop app remains fully local-first and continues to work when sync is
+disabled or no server is available.
 
 ## Multi-User Direction
 

@@ -17,6 +17,10 @@ impl AppService {
         Self { database }
     }
 
+    pub fn database(&self) -> Database {
+        self.database.clone()
+    }
+
     pub fn list_organizations(&self) -> Result<Vec<Organization>> {
         self.database.list_organizations()
     }

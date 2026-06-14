@@ -2,6 +2,7 @@ use openmgmt_core::{
     AppService, BoardState, NewOrganization, NewProject, NewTask, Organization, OrganizationPatch,
     Project, ProjectPatch, SyncSettings, SyncSettingsPatch, SyncStatus, Task, TaskPatch,
 };
+use openmgmt_sync_client::SyncOnceResult;
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 type CommandResult<T> = Result<T, String>;
@@ -148,6 +149,17 @@ pub fn update_sync_settings(
 #[tauri::command]
 pub fn get_sync_status(service: State<'_, AppService>) -> CommandResult<SyncStatus> {
     core(service.get_sync_status())
+}
+
+#[tauri::command]
+pub async fn sync_now(service: State<'_, AppService>) -> CommandResult<SyncOnceResult> {
+    let database = service.database();
+    openmgmt_sync_client::sync_once(&database)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "manual sync failed");
+            error.to_string()
+        })
 }
 
 #[tauri::command]

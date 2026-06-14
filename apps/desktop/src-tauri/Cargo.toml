@@ -9,6 +9,7 @@ tauri-build = { version = "2.5.6", features = [] }
 
 [dependencies]
 openmgmt-core = { path = "../../../crates/openmgmt-core" }
+openmgmt-sync-client = { path = "../../../crates/openmgmt-sync-client" }
 serde.workspace = true
 tauri = { version = "2.11.2", features = [] }
 tracing.workspace = true
