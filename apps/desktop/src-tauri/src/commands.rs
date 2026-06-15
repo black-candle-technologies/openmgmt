@@ -204,13 +204,30 @@ pub fn open_tv_board_window(app: AppHandle) -> CommandResult<()> {
         window.set_focus().map_err(|error| error.to_string())?;
         return Ok(());
     }
-    WebviewWindowBuilder::new(&app, "tv-board", WebviewUrl::App("index.html".into()))
-        .initialization_script("window.__OPENMGMT_BOARD__ = true;")
-        .title("OpenMgmt TV Board")
-        .fullscreen(true)
-        .decorations(false)
-        .build()
-        .map_err(|error| error.to_string())?;
+    // The board renders in a normal, movable, resizable window by default. The
+    // `?board=1` query is the primary board-mode signal; the initialization
+    // script is a fallback for environments that strip the query string.
+    //
+    // TODO: add an optional kiosk/fullscreen mode (e.g. a `kiosk: bool` arg or a
+    // separate command) that sets `.fullscreen(true).decorations(false)` for
+    // wall-mounted TV displays.
+    let window = WebviewWindowBuilder::new(
+        &app,
+        "tv-board",
+        WebviewUrl::App("index.html?board=1".into()),
+    )
+    .initialization_script("window.__OPENMGMT_BOARD__ = true;")
+    .title("OpenMgmt Board")
+    .inner_size(1440.0, 900.0)
+    .min_inner_size(960.0, 600.0)
+    .resizable(true)
+    .decorations(true)
+    .fullscreen(false)
+    .center()
+    .build()
+    .map_err(|error| error.to_string())?;
+    // Make sure the freshly built window takes focus and paints immediately.
+    let _ = window.set_focus();
     Ok(())
 }
 
