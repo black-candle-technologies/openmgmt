@@ -14,8 +14,12 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 #[wasm_bindgen]
 extern "C" {
-    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], js_name = invoke)]
-    fn tauri_invoke(command: &str, args: JsValue) -> js_sys::Promise;
+    // `catch` so a missing bridge (`window.__TAURI__` undefined, e.g. when the
+    // bundle is opened outside the Tauri webview) surfaces as a recoverable
+    // `Err` instead of an uncaught JS exception that would strand the board on
+    // "Updating…" with no visible error.
+    #[wasm_bindgen(catch, js_namespace = ["window", "__TAURI__", "core"], js_name = invoke)]
+    fn tauri_invoke(command: &str, args: JsValue) -> Result<js_sys::Promise, JsValue>;
 }
 
 /// Top-level workspace sections shown in the sidebar.
@@ -82,6 +86,9 @@ pub struct AppState {
     pub notice: RwSignal<Option<String>>,
     pub loading: RwSignal<bool>,
     pub drawer: RwSignal<Option<Drawer>>,
+    /// Wall-clock time of the last successful data load. Used by the board to
+    /// show a "last refreshed" timestamp without blanking existing data.
+    pub synced_at: RwSignal<Option<DateTime<Utc>>>,
 }
 
 impl AppState {
@@ -92,6 +99,7 @@ impl AppState {
             notice: RwSignal::new(None),
             loading: RwSignal::new(true),
             drawer: RwSignal::new(None),
+            synced_at: RwSignal::new(None),
         }
     }
 
@@ -106,9 +114,45 @@ impl AppState {
         match load_snapshot().await {
             Ok(snapshot) => {
                 self.snapshot.set(snapshot);
+                self.synced_at.set(Some(Utc::now()));
                 self.error.set(None);
             }
             Err(error) => self.fail("Refresh failed", error),
+        }
+        self.loading.set(false);
+    }
+
+    /// Board-only refresh: loads *only* `get_board_state`, leaving the rest of
+    /// the snapshot untouched. The dedicated TV window uses this so it never
+    /// depends on `list_organizations`/`list_projects`/`list_tasks` succeeding,
+    /// and so an in-flight refresh never blanks the board that is already shown.
+    pub fn refresh_board(self) {
+        spawn_local(async move {
+            self.reload_board().await;
+        });
+    }
+
+    pub async fn reload_board(self) {
+        self.loading.set(true);
+        web_sys::console::log_1(&JsValue::from_str("[board] get_board_state: requesting"));
+        match invoke::<BoardState>("get_board_state", serde_json::json!({})).await {
+            Ok(board) => {
+                web_sys::console::log_1(&JsValue::from_str(&format!(
+                    "[board] get_board_state: ok ({} task(s))",
+                    board_total(&board)
+                )));
+                // Update only the board slice so a refresh never clears the
+                // board that is currently on screen.
+                self.snapshot.update(|snapshot| snapshot.board = board);
+                self.synced_at.set(Some(Utc::now()));
+                self.error.set(None);
+            }
+            Err(error) => {
+                web_sys::console::error_1(&JsValue::from_str(&format!(
+                    "[board] get_board_state: FAILED — {error}"
+                )));
+                self.fail("Board refresh failed", error);
+            }
         }
         self.loading.set(false);
     }
@@ -137,9 +181,9 @@ impl Default for AppState {
 
 pub async fn invoke<T: DeserializeOwned>(command: &str, args: impl Serialize) -> Result<T, String> {
     let args = serde_wasm_bindgen::to_value(&args).map_err(|error| error.to_string())?;
-    let value = JsFuture::from(tauri_invoke(command, args))
-        .await
-        .map_err(js_error_message)?;
+    let promise = tauri_invoke(command, args)
+        .map_err(|_| "Tauri bridge unavailable (window.__TAURI__ is missing)".to_string())?;
+    let value = JsFuture::from(promise).await.map_err(js_error_message)?;
     serde_wasm_bindgen::from_value(value).map_err(|error| error.to_string())
 }
 
@@ -185,9 +229,10 @@ fn js_error_message(value: JsValue) -> String {
 
 /// True when the current webview was opened as the dedicated TV board window.
 ///
-/// Detection is layered so it is robust: the query string (`?board=1`) is the
-/// primary signal, and the injected `window.__OPENMGMT_BOARD__` global is a
-/// fallback for environments where the query is stripped.
+/// Detection is layered so it is robust: the query string (`?board=1` or
+/// `?mode=board`) is the primary signal, and the injected
+/// `window.__OPENMGMT_BOARD__` global is a fallback for environments where the
+/// query is stripped.
 pub fn is_board_window() -> bool {
     let Some(window) = web_sys::window() else {
         return false;
@@ -196,13 +241,47 @@ pub fn is_board_window() -> bool {
         .location()
         .search()
         .ok()
-        .is_some_and(|query| query.contains("board=1"));
+        .is_some_and(|query| query.contains("board=1") || query.contains("mode=board"));
     let initialized_mode =
         js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("__OPENMGMT_BOARD__"))
             .ok()
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
     query_mode || initialized_mode
+}
+
+/// One-time console diagnostics for the board window, so a blank/failed board
+/// can be debugged straight from the webview console.
+pub fn log_board_diagnostics() {
+    let window = web_sys::window();
+    let search = window
+        .as_ref()
+        .and_then(|window| window.location().search().ok())
+        .unwrap_or_default();
+    let has_tauri = window
+        .as_ref()
+        .map(|window| {
+            js_sys::Reflect::has(window.as_ref(), &JsValue::from_str("__TAURI__")).unwrap_or(false)
+        })
+        .unwrap_or(false);
+    web_sys::console::log_1(&JsValue::from_str("[board] board mode detected"));
+    web_sys::console::log_1(&JsValue::from_str(&format!(
+        "[board] window.location.search = {search:?}"
+    )));
+    web_sys::console::log_1(&JsValue::from_str(&format!(
+        "[board] window.__TAURI__ present = {has_tauri}"
+    )));
+}
+
+/// Total tasks across every board column (used for diagnostics logging).
+fn board_total(board: &BoardState) -> usize {
+    board.now.len()
+        + board.next_up.len()
+        + board.due_soon.len()
+        + board.waiting_blocked.len()
+        + board.later_today.len()
+        + board.overdue.len()
+        + board.done_today.len()
 }
 
 // ---------------------------------------------------------------------------

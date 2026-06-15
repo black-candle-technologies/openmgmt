@@ -201,6 +201,11 @@ pub fn clear_sync_error(service: State<'_, AppService>) -> CommandResult<SyncSta
 #[tauri::command]
 pub fn open_tv_board_window(app: AppHandle) -> CommandResult<()> {
     if let Some(window) = app.get_webview_window("tv-board") {
+        // The window already exists — focus it. Defensively clear any stale
+        // kiosk/fullscreen/borderless state so a previously-fullscreened board
+        // always comes back as a normal, closable, decorated window.
+        let _ = window.set_fullscreen(false);
+        let _ = window.set_decorations(true);
         window.set_focus().map_err(|error| error.to_string())?;
         return Ok(());
     }
@@ -228,6 +233,16 @@ pub fn open_tv_board_window(app: AppHandle) -> CommandResult<()> {
     .map_err(|error| error.to_string())?;
     // Make sure the freshly built window takes focus and paints immediately.
     let _ = window.set_focus();
+    Ok(())
+}
+
+/// Closes the dedicated TV board window (the in-board "Close Board" button).
+/// Closing only ever targets the `tv-board` label, never the main window.
+#[tauri::command]
+pub fn close_tv_board_window(app: AppHandle) -> CommandResult<()> {
+    if let Some(window) = app.get_webview_window("tv-board") {
+        window.close().map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 

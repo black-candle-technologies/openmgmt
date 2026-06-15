@@ -26,10 +26,10 @@ pub fn Dashboard(state: AppState, page: RwSignal<Page>) -> impl IntoView {
             .filter(|task| !matches!(task.status, TaskStatus::Done | TaskStatus::Canceled))
             .count()
     });
-    let needs_attention = Signal::derive(move || {
-        let board = state.snapshot.get().board;
-        board.overdue.len() + board.waiting_blocked.len()
-    });
+    let in_progress = Signal::derive(move || state.snapshot.get().board.now.len());
+    let overdue = Signal::derive(move || state.snapshot.get().board.overdue.len());
+    let due_soon = Signal::derive(move || state.snapshot.get().board.due_soon.len());
+    let blocked = Signal::derive(move || state.snapshot.get().board.waiting_blocked.len());
 
     view! {
         <PageHeader
@@ -42,10 +42,13 @@ pub fn Dashboard(state: AppState, page: RwSignal<Page>) -> impl IntoView {
         </PageHeader>
 
         <section class="metric-grid">
-            <Metric label="Organizations" value=organizations />
-            <Metric label="Active projects" value=active_projects />
-            <Metric label="Open tasks" value=open_tasks />
-            <Metric label="Needs attention" value=needs_attention tone="warn" />
+            <Metric label="In progress" value=in_progress tone="info" />
+            <Metric label="Overdue" value=overdue tone="danger" />
+            <Metric label="Due soon" value=due_soon tone="caution" />
+            <Metric label="Waiting / blocked" value=blocked tone="warn" />
+            <Metric label="Open tasks" value=open_tasks tone="accent" />
+            <Metric label="Active projects" value=active_projects tone="neutral" />
+            <Metric label="Organizations" value=organizations tone="neutral" />
         </section>
 
         <Section title="Needs attention now">

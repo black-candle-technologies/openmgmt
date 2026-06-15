@@ -11,13 +11,24 @@
       // immediately and never flashes a white/blank screen. The query string is
       // the primary signal; the injected global is a fallback.
       (function () {
+        var search = window.location.search || "";
         var isBoard =
-          window.location.search.indexOf("board=1") !== -1 ||
+          search.indexOf("board=1") !== -1 ||
+          search.indexOf("mode=board") !== -1 ||
           window.__OPENMGMT_BOARD__ === true;
         if (isBoard) {
           window.__OPENMGMT_BOARD__ = true;
           document.documentElement.setAttribute("data-board", "1");
         }
+        // Early diagnostics so a blank board window can be debugged from the
+        // webview console even before the WASM bundle initialises.
+        try {
+          console.log(
+            "[OpenMgmt] board mode:", isBoard,
+            "| search:", JSON.stringify(search),
+            "| __TAURI__:", typeof window.__TAURI__ !== "undefined"
+          );
+        } catch (e) {}
       })();
     </script>
     <style>
@@ -34,7 +45,7 @@
         color: #6c756a;
       }
       html[data-board] #om-boot { color: #aeb7ab; }
-      .om-boot-inner { display: flex; align-items: center; gap: 10px; opacity: 0.75; }
+      .om-boot-inner { display: flex; align-items: center; gap: 10px; opacity: 0.78; }
       .om-boot-mark {
         background: #c9ef6a;
         color: #182017;
@@ -42,17 +53,26 @@
         padding: 6px 8px;
         border-radius: 4px;
       }
+      /* The board variant of the loading label is shown only in board mode. */
+      .om-boot-text-board { display: none; }
+      html[data-board] .om-boot-text { display: none; }
+      html[data-board] .om-boot-text-board { display: inline; }
     </style>
   </head>
   <body>
-    <!-- Shown until the WASM app mounts; removed in main.rs. Guarantees the
-         window is never a blank white surface, even if the bundle is slow or
-         fails to mount. -->
+    <!-- Shown until the WASM app has actually mounted (removed in main.rs only
+         after a successful mount). Guarantees the window is never a blank white
+         surface — or, in board mode, a blank dark surface — even if the bundle
+         is slow or panics while mounting. -->
     <div id="om-boot">
       <div class="om-boot-inner">
         <span class="om-boot-mark">OM</span>
         <span class="om-boot-text">Loading OpenMgmt…</span>
+        <span class="om-boot-text-board">Loading OpenMgmt Board…</span>
       </div>
     </div>
+    <!-- Dedicated mount root. Leptos mounts here (never directly into <body>) so
+         the boot fallback above can persist until mounting succeeds. -->
+    <div id="app"></div>
   </body>
 </html>

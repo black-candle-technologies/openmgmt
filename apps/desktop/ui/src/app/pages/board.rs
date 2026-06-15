@@ -3,7 +3,7 @@ use leptos::prelude::*;
 use serde_json::json;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::app::board::{BoardColumns, board_task_count};
+use crate::app::board::{ErBoard, board_task_count};
 use crate::app::components::*;
 use crate::app::state::*;
 
@@ -35,7 +35,7 @@ pub fn BoardPage(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoView
                     <p>"Create an active task or seed the database to populate the board."</p>
                 </div>
             })}
-            <BoardColumns board now />
+            <ErBoard board now />
         </div>
     }
 }

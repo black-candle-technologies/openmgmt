@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use leptos::prelude::*;
 use openmgmt_core::ScoredTask;
 
@@ -8,6 +10,38 @@ use crate::app::state::*;
 #[component]
 pub fn TodayPage(state: AppState) -> impl IntoView {
     let board = Signal::derive(move || state.snapshot.get().board);
+    let tag_filter = RwSignal::new(String::new());
+
+    // Distinct tags across every board bucket, for the tag filter.
+    let all_tags = Signal::derive(move || {
+        let board = board.get();
+        [
+            &board.now,
+            &board.overdue,
+            &board.due_soon,
+            &board.later_today,
+            &board.waiting_blocked,
+            &board.done_today,
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|item| item.context.task.tags.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+    });
+
+    // Filter a bucket by the active tag (empty = show all).
+    let bucket = move |pick: fn(&openmgmt_core::BoardState) -> Vec<ScoredTask>| {
+        Signal::derive(move || {
+            let tag = tag_filter.get();
+            pick(&board.get())
+                .into_iter()
+                .filter(|item| tag.is_empty() || item.context.task.tags.iter().any(|t| t == &tag))
+                .collect::<Vec<_>>()
+        })
+    };
+
     view! {
         <PageHeader
             eyebrow="DAILY PLAN"
@@ -18,13 +52,26 @@ pub fn TodayPage(state: AppState) -> impl IntoView {
             <Button variant="primary" on_click=Callback::new(move |_| state.open_drawer(Drawer::CreateTask { project_id: None }))>"New task"</Button>
         </PageHeader>
 
+        <div class="filter-bar">
+            <label class="filter-control">
+                <span>"Tag"</span>
+                <select on:change=move |event| tag_filter.set(event_target_value(&event))>
+                    <option value="">"All tags"</option>
+                    {move || all_tags.get().into_iter().map(|tag| {
+                        let value = tag.clone();
+                        view! { <option value=value>{tag}</option> }
+                    }).collect_view()}
+                </select>
+            </label>
+        </div>
+
         <div class="today-grid">
-            <TodayGroup state title="Now" tone="active" tasks=Signal::derive(move || board.get().now) />
-            <TodayGroup state title="Overdue" tone="warn" tasks=Signal::derive(move || board.get().overdue) />
-            <TodayGroup state title="Due soon" tone="ready" tasks=Signal::derive(move || board.get().due_soon) />
-            <TodayGroup state title="Later today" tone="neutral" tasks=Signal::derive(move || board.get().later_today) />
-            <TodayGroup state title="Waiting / blocked" tone="blocked" tasks=Signal::derive(move || board.get().waiting_blocked) />
-            <TodayGroup state title="Done today" tone="done" tasks=Signal::derive(move || board.get().done_today) />
+            <TodayGroup state title="Now" tone="active" tasks=bucket(|b| b.now.clone()) />
+            <TodayGroup state title="Overdue" tone="warn" tasks=bucket(|b| b.overdue.clone()) />
+            <TodayGroup state title="Due soon" tone="ready" tasks=bucket(|b| b.due_soon.clone()) />
+            <TodayGroup state title="Later today" tone="neutral" tasks=bucket(|b| b.later_today.clone()) />
+            <TodayGroup state title="Waiting / blocked" tone="blocked" tasks=bucket(|b| b.waiting_blocked.clone()) />
+            <TodayGroup state title="Done today" tone="done" tasks=bucket(|b| b.done_today.clone()) />
         </div>
     }
 }

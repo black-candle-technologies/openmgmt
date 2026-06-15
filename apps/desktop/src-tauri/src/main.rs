@@ -43,6 +43,7 @@ fn main() {
             commands::test_sync_connection,
             commands::clear_sync_error,
             commands::open_tv_board_window,
+            commands::close_tv_board_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running OpenMgmt");

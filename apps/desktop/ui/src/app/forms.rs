@@ -76,7 +76,10 @@ fn OrganizationForm(
     let icon = NodeRef::<leptos::html::Input>::new();
 
     let editing_id = existing.as_ref().map(|item| item.id.clone());
-    let init_name = existing.as_ref().map(|item| item.name.clone()).unwrap_or_default();
+    let init_name = existing
+        .as_ref()
+        .map(|item| item.name.clone())
+        .unwrap_or_default();
     let init_desc = existing
         .as_ref()
         .and_then(|item| item.description.clone())
@@ -89,7 +92,9 @@ fn OrganizationForm(
         .as_ref()
         .and_then(|item| item.icon.clone())
         .unwrap_or_default();
-    let archive = existing.as_ref().map(|item| (item.id.clone(), item.name.clone()));
+    let archive = existing
+        .as_ref()
+        .map(|item| (item.id.clone(), item.name.clone()));
     let submit_label = if editing_id.is_some() {
         "Save changes"
     } else {
@@ -183,16 +188,40 @@ fn ProjectForm(
         .as_ref()
         .map(|item| item.organization_id.clone())
         .unwrap_or(preset_org);
-    let init_name = existing.as_ref().map(|item| item.name.clone()).unwrap_or_default();
-    let init_desc = existing.as_ref().and_then(|item| item.description.clone()).unwrap_or_default();
-    let init_type = existing.as_ref().map(|item| item.project_type).unwrap_or(ProjectType::Software);
-    let init_status = existing.as_ref().map(|item| item.status).unwrap_or(ProjectStatus::Active);
+    let init_name = existing
+        .as_ref()
+        .map(|item| item.name.clone())
+        .unwrap_or_default();
+    let init_desc = existing
+        .as_ref()
+        .and_then(|item| item.description.clone())
+        .unwrap_or_default();
+    let init_type = existing
+        .as_ref()
+        .map(|item| item.project_type)
+        .unwrap_or(ProjectType::Software);
+    let init_status = existing
+        .as_ref()
+        .map(|item| item.status)
+        .unwrap_or(ProjectStatus::Active);
     let init_priority = existing.as_ref().map(|item| item.priority).unwrap_or(3);
     let init_deadline = datetime_local_value(existing.as_ref().and_then(|item| item.deadline));
-    let init_repo = existing.as_ref().and_then(|item| item.repo_url.clone()).unwrap_or_default();
-    let init_notes = existing.as_ref().and_then(|item| item.notes.clone()).unwrap_or_default();
-    let archive = existing.as_ref().map(|item| (item.id.clone(), item.name.clone()));
-    let submit_label = if editing_id.is_some() { "Save changes" } else { "Create project" };
+    let init_repo = existing
+        .as_ref()
+        .and_then(|item| item.repo_url.clone())
+        .unwrap_or_default();
+    let init_notes = existing
+        .as_ref()
+        .and_then(|item| item.notes.clone())
+        .unwrap_or_default();
+    let archive = existing
+        .as_ref()
+        .map(|item| (item.id.clone(), item.name.clone()));
+    let submit_label = if editing_id.is_some() {
+        "Save changes"
+    } else {
+        "Create project"
+    };
 
     view! {
         <form class="drawer-form" on:submit=move |event| {
@@ -336,18 +365,45 @@ fn TaskForm(
         .as_ref()
         .map(|item| item.project_id.clone())
         .unwrap_or(preset_project);
-    let init_title = existing.as_ref().map(|item| item.title.clone()).unwrap_or_default();
-    let init_desc = existing.as_ref().and_then(|item| item.description.clone()).unwrap_or_default();
-    let init_status = existing.as_ref().map(|item| item.status).unwrap_or(TaskStatus::Inbox);
+    let init_title = existing
+        .as_ref()
+        .map(|item| item.title.clone())
+        .unwrap_or_default();
+    let init_desc = existing
+        .as_ref()
+        .and_then(|item| item.description.clone())
+        .unwrap_or_default();
+    let init_status = existing
+        .as_ref()
+        .map(|item| item.status)
+        .unwrap_or(TaskStatus::Inbox);
     let init_priority = existing.as_ref().map(|item| item.priority).unwrap_or(3);
     let init_due = datetime_local_value(existing.as_ref().and_then(|item| item.due_at));
     let init_scheduled = datetime_local_value(existing.as_ref().and_then(|item| item.scheduled_at));
-    let init_estimated = existing.as_ref().and_then(|item| item.estimated_minutes).map(|value| value.to_string()).unwrap_or_default();
-    let init_limit = existing.as_ref().and_then(|item| item.time_limit_minutes).map(|value| value.to_string()).unwrap_or_default();
+    let init_estimated = existing
+        .as_ref()
+        .and_then(|item| item.estimated_minutes)
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let init_limit = existing
+        .as_ref()
+        .and_then(|item| item.time_limit_minutes)
+        .map(|value| value.to_string())
+        .unwrap_or_default();
     let init_pinned = existing.as_ref().map(|item| item.pinned).unwrap_or(false);
-    let init_blocked = existing.as_ref().and_then(|item| item.blocked_reason.clone()).unwrap_or_default();
-    let init_tags = existing.as_ref().map(|item| item.tags.join(", ")).unwrap_or_default();
-    let submit_label = if editing { "Save changes" } else { "Create task" };
+    let init_blocked = existing
+        .as_ref()
+        .and_then(|item| item.blocked_reason.clone())
+        .unwrap_or_default();
+    let init_tags = existing
+        .as_ref()
+        .map(|item| item.tags.join(", "))
+        .unwrap_or_default();
+    let submit_label = if editing {
+        "Save changes"
+    } else {
+        "Create task"
+    };
 
     view! {
         <form class="drawer-form" on:submit=move |event| {

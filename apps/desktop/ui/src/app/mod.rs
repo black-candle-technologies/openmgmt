@@ -7,6 +7,7 @@ pub mod forms;
 pub mod pages;
 pub mod records;
 pub mod state;
+pub mod tags;
 
 use chrono::Utc;
 use gloo_timers::callback::Interval;
@@ -24,15 +25,20 @@ pub fn App() -> impl IntoView {
     let board_only = is_board_window();
     let state = AppState::new();
     let now = RwSignal::new(Utc::now());
-    state.refresh();
 
-    // Shared 10s data refresh (board + snapshot) and a 1s wall clock.
-    let board_refresh = Interval::new(10_000, move || state.refresh());
-    board_refresh.forget();
+    // 1s wall clock, shared by every surface.
     let clock_refresh = Interval::new(1_000, move || now.set(Utc::now()));
     clock_refresh.forget();
 
     if board_only {
+        // Dedicated TV board: load and auto-refresh *only* the board state.
+        // It must not depend on the full snapshot (organizations/projects/tasks)
+        // so a single failing list query can never blank the board window.
+        log_board_diagnostics();
+        state.refresh_board();
+        let board_refresh = Interval::new(10_000, move || state.refresh_board());
+        board_refresh.forget();
+
         return view! {
             <BoardView
                 board=Signal::derive(move || state.snapshot.get().board)
@@ -44,6 +50,11 @@ pub fn App() -> impl IntoView {
         }
         .into_any();
     }
+
+    // Main app: load the full snapshot and refresh it every 10s.
+    state.refresh();
+    let snapshot_refresh = Interval::new(10_000, move || state.refresh());
+    snapshot_refresh.forget();
 
     let page = RwSignal::new(Page::Dashboard);
     view! {
@@ -101,7 +112,10 @@ fn NavButton(label: &'static str, target: Page, page: RwSignal<Page>) -> impl In
     let is_active = move || {
         let current = page.get();
         current == active_target
-            || matches!((&current, &active_target), (Page::Project(_), Page::Projects))
+            || matches!(
+                (&current, &active_target),
+                (Page::Project(_), Page::Projects)
+            )
     };
     view! {
         <button

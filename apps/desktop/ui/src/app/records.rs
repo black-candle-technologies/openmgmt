@@ -10,6 +10,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use super::components::{Badge, EmptyState, LoadingState, PriorityBadge, StatusBadge};
 use super::state::*;
+use super::tags::TagChip;
 
 /// Lightweight, table-like list of tasks. `project_label` toggles the project
 /// column (hidden on project-detail pages where it is redundant).
@@ -51,12 +52,7 @@ pub fn TaskTable(
 }
 
 #[component]
-fn TaskRow(
-    state: AppState,
-    task: Task,
-    project_name: String,
-    show_project: bool,
-) -> impl IntoView {
+fn TaskRow(state: AppState, task: Task, project_name: String, show_project: bool) -> impl IntoView {
     let edit_task = task.clone();
     let title = task.title.clone();
     let status = task.status.to_string();
@@ -67,7 +63,9 @@ fn TaskRow(
         .map(|at| at.format("%b %-d, %-I:%M %p").to_string())
         .unwrap_or_else(|| "—".into());
     let limit = task.time_limit_minutes;
-    let elapsed = task.started_at.map(|at| (Utc::now() - at).num_minutes().max(0));
+    let elapsed = task
+        .started_at
+        .map(|at| (Utc::now() - at).num_minutes().max(0));
     let tags = task.tags.clone();
 
     view! {
@@ -81,7 +79,7 @@ fn TaskRow(
                     {pinned.then(|| view! { <Badge label="pinned" tone="ready" /> })}
                     {elapsed.map(|minutes| view! { <span class="task-row-timer">{format!("{minutes}m active")}</span> })}
                     {limit.map(|minutes| view! { <Badge label=format!("limit {minutes}m") tone="muted" /> })}
-                    {tags.into_iter().map(|tag| view! { <span class="tag-chip">{tag}</span> }).collect_view()}
+                    {tags.into_iter().map(|tag| view! { <TagChip tag /> }).collect_view()}
                 </div>
             </div>
             <span class="task-row-status"><StatusBadge status /></span>
@@ -103,10 +101,13 @@ pub fn TaskCard(
     let title = task.title.clone();
     let status = task.status.to_string();
     let priority = task.priority;
-    let elapsed = task.started_at.map(|at| (Utc::now() - at).num_minutes().max(0));
+    let elapsed = task
+        .started_at
+        .map(|at| (Utc::now() - at).num_minutes().max(0));
     let limit = task.time_limit_minutes;
     let due_label = task.due_at.map(|at| at.format("%-I:%M %p").to_string());
     let has_project = !project_name.is_empty();
+    let tags = task.tags.clone();
 
     view! {
         <article class="task-card">
@@ -121,6 +122,7 @@ pub fn TaskCard(
                     {due_label.map(|due| view! { <span class="task-card-chip">{due}</span> })}
                     {elapsed.map(|minutes| view! { <span class="task-row-timer">{format!("{minutes}m")}</span> })}
                     {limit.map(|minutes| view! { <span class="task-card-chip">{format!("limit {minutes}m")}</span> })}
+                    {tags.into_iter().take(4).map(|tag| view! { <TagChip tag /> }).collect_view()}
                 </div>
             </div>
             <TaskActions state task />
@@ -235,7 +237,11 @@ pub fn ProjectCard(state: AppState, project: Project, page: RwSignal<Page>) -> i
 
 /// Organization card used in the organizations grid.
 #[component]
-pub fn OrganizationCard(state: AppState, organization: Organization, page: RwSignal<Page>) -> impl IntoView {
+pub fn OrganizationCard(
+    state: AppState,
+    organization: Organization,
+    page: RwSignal<Page>,
+) -> impl IntoView {
     let edit_org = organization.clone();
     let accent = organization
         .color
@@ -252,14 +258,37 @@ pub fn OrganizationCard(state: AppState, organization: Organization, page: RwSig
         .unwrap_or_else(|| "No description yet.".into());
     let slug = organization.slug.clone();
 
+    // Live project/task counts for this organization, derived from the snapshot.
+    let org_id = organization.id.clone();
+    let counts = Signal::derive(move || {
+        let snapshot = state.snapshot.get();
+        let project_ids: Vec<String> = snapshot
+            .projects
+            .iter()
+            .filter(|project| project.organization_id == org_id)
+            .map(|project| project.id.clone())
+            .collect();
+        let task_count = snapshot
+            .tasks
+            .iter()
+            .filter(|task| project_ids.contains(&task.project_id))
+            .count();
+        (project_ids.len(), task_count)
+    });
+
     view! {
         <article class="record-card org-card" style=format!("--accent:{accent}")>
+            <span class="org-accent-bar"></span>
             <div class="org-card-head">
-                <span class="org-icon">{icon}</span>
+                <span class="org-icon" style=format!("background:{accent}")>{icon}</span>
                 <button class="btn btn-subtle" on:click=move |_| state.open_drawer(Drawer::EditOrganization(edit_org.clone()))>"Edit"</button>
             </div>
             <h3 class="record-card-title">{name}</h3>
             <p class="record-card-desc">{description}</p>
+            <div class="org-counts">
+                <span class="org-count"><b>{move || counts.get().0}</b>" projects"</span>
+                <span class="org-count"><b>{move || counts.get().1}</b>" tasks"</span>
+            </div>
             <div class="record-card-foot">
                 <small class="org-slug">{format!("/{slug}")}</small>
                 <button class="btn btn-ghost" on:click=move |_| page.set(Page::Projects)>"View projects"</button>

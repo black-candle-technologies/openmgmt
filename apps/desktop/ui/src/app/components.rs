@@ -44,10 +44,7 @@ pub fn IconButton(
 
 /// Neutral status pill. `tone` maps to `.badge-{tone}`.
 #[component]
-pub fn Badge(
-    #[prop(into)] label: String,
-    #[prop(into, optional)] tone: String,
-) -> impl IntoView {
+pub fn Badge(#[prop(into)] label: String, #[prop(into, optional)] tone: String) -> impl IntoView {
     let tone = if tone.is_empty() {
         "neutral".to_string()
     } else {
@@ -106,10 +103,7 @@ pub fn PageHeader(
 
 /// Generic surface container.
 #[component]
-pub fn Panel(
-    #[prop(into, optional)] class: String,
-    children: Children,
-) -> impl IntoView {
+pub fn Panel(#[prop(into, optional)] class: String, children: Children) -> impl IntoView {
     view! { <section class=format!("panel {class}")>{children()}</section> }
 }
 
