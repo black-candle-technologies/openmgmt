@@ -2,15 +2,16 @@
 //! cards. These bridge presentation (components.rs) and behaviour (state +
 //! drawers + task transitions).
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use leptos::prelude::*;
-use openmgmt_core::{Organization, Project, Task, TaskStatus};
+use openmgmt_core::{Organization, Project, Task, TaskStatus, TaskWithContext};
 use serde_json::json;
 use wasm_bindgen_futures::spawn_local;
 
 use super::components::{Badge, EmptyState, LoadingState, PriorityBadge, StatusBadge};
 use super::state::*;
 use super::tags::TagChip;
+use super::timer::TimerControls;
 
 /// Lightweight, table-like list of tasks. `project_label` toggles the project
 /// column (hidden on project-detail pages where it is redundant).
@@ -86,6 +87,125 @@ fn TaskRow(state: AppState, task: Task, project_name: String, show_project: bool
             {show_project.then(|| view! { <span class="task-row-project">{project_name.clone()}</span> })}
             <span class="task-row-due">{due_label}</span>
             <span class="task-row-actions"><TaskActions state task /></span>
+        </div>
+    }
+}
+
+/// Rich, query-backed task table used on the Tasks page. Unlike `TaskTable`
+/// (which renders plain snapshot tasks), each row here carries organization,
+/// urgency score, and live timer state from `query_tasks`.
+#[component]
+pub fn QueryTaskTable(
+    state: AppState,
+    rows: Signal<Vec<TaskWithContext>>,
+    now: Signal<DateTime<Utc>>,
+    queried_at: Signal<DateTime<Utc>>,
+    loading: Signal<bool>,
+) -> impl IntoView {
+    view! {
+        <div class="qtask-table">
+            <div class="qtask-row qtask-row-head">
+                <span>"PRI"</span>
+                <span>"TASK"</span>
+                <span>"STATUS"</span>
+                <span>"ORG"</span>
+                <span>"PROJECT"</span>
+                <span>"DUE"</span>
+                <span class="qtask-urg-col">"URG"</span>
+                <span class="qtask-timer-col">"TIMER"</span>
+            </div>
+            {move || {
+                let rows = rows.get();
+                if rows.is_empty() {
+                    if loading.get() {
+                        view! { <LoadingState label="Loading tasks…" /> }.into_any()
+                    } else {
+                        view! { <EmptyState title="No matching tasks" hint="Adjust the filters or choose another saved view." /> }.into_any()
+                    }
+                } else {
+                    rows.into_iter()
+                        .map(|row| view! { <QueryTaskRow state row now queried_at /> })
+                        .collect_view()
+                        .into_any()
+                }
+            }}
+        </div>
+    }
+}
+
+#[component]
+fn QueryTaskRow(
+    state: AppState,
+    row: TaskWithContext,
+    now: Signal<DateTime<Utc>>,
+    queried_at: Signal<DateTime<Utc>>,
+) -> impl IntoView {
+    let task = row.task.clone();
+    let edit_task = task.clone();
+    let title = task.title.clone();
+    let status = task.status;
+    let status_str = task.status.to_string();
+    let priority = task.priority;
+    let pinned = task.pinned;
+    let tags = task.tags.clone();
+    let task_id = task.id.clone();
+    let time_limit = task.time_limit_minutes;
+    let cancel_id = task.id.clone();
+    let cancel_title = task.title.clone();
+    let active = row.active_timer.clone();
+    let due_label = task
+        .due_at
+        .map(|at| at.format("%b %-d, %-I:%M %p").to_string())
+        .unwrap_or_else(|| "—".into());
+    let org_name = row.organization_name.clone();
+    let org_color = row
+        .organization_color
+        .clone()
+        .unwrap_or_else(|| "#7c867c".into());
+    let project_name = row.project_name.clone();
+    let urgency = row.urgency_score;
+    let can_cancel = !matches!(status, TaskStatus::Canceled);
+
+    view! {
+        <div class="qtask-row">
+            <span class="qtask-pri"><PriorityBadge value=priority /></span>
+            <div class="qtask-main">
+                <button class="task-row-title" on:click=move |_| state.open_drawer(Drawer::EditTask(edit_task.clone()))>
+                    {pinned.then(|| view! { <span class="qtask-pin" title="Pinned">"★ "</span> })}
+                    {title}
+                </button>
+                {(!tags.is_empty()).then(|| view! {
+                    <div class="qtask-tags">
+                        {tags.into_iter().take(5).map(|tag| view! { <TagChip tag /> }).collect_view()}
+                    </div>
+                })}
+            </div>
+            <span class="qtask-status"><StatusBadge status=status_str /></span>
+            <span class="qtask-org">
+                <span class="er-org-dot" style=format!("background:{org_color}")></span>
+                <span class="qtask-org-name">{org_name}</span>
+            </span>
+            <span class="qtask-project">{project_name}</span>
+            <span class="qtask-due">{due_label}</span>
+            <span class="qtask-urgency qtask-urg-col" title="Urgency score">{urgency}</span>
+            <span class="qtask-timer qtask-timer-col">
+                <TimerControls
+                    state now queried_at
+                    task_id=task_id
+                    status=status
+                    time_limit_minutes=time_limit
+                    active=active
+                />
+                {can_cancel.then(|| view! {
+                    <button class="btn-link-danger qtask-cancel" title="Cancel task" on:click=move |_| {
+                        if !confirmed(&format!("Cancel task {cancel_title}?")) { return; }
+                        let id = cancel_id.clone();
+                        spawn_local(async move {
+                            finish_action(state, invoke::<Task>("cancel_task", json!({"id":id})).await, "Task canceled.", "Cancel task failed").await;
+                        });
+                    }>"✕"</button>
+                })}
+            </span>
         </div>
     }
 }

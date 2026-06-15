@@ -3,6 +3,7 @@
 //! Keeping every mutation form in a drawer means the underlying pages never
 //! show large always-open forms — they stay calm and scannable.
 
+use chrono::{DateTime, Utc};
 use leptos::prelude::*;
 use openmgmt_core::{
     NewOrganization, NewProject, NewTask, Organization, OrganizationPatch, Project, ProjectPatch,
@@ -13,10 +14,12 @@ use wasm_bindgen_futures::spawn_local;
 
 use super::components::{FormField, IconButton};
 use super::state::*;
+use super::timer::TaskTimerPanel;
 
 /// Renders the active drawer (if any) as an overlay panel.
 #[component]
-pub fn DrawerHost(state: AppState) -> impl IntoView {
+pub fn DrawerHost(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoView {
+    let now_sig: Signal<DateTime<Utc>> = now.into();
     move || {
         state.drawer.get().map(|drawer| {
             let (title, body) = match drawer {
@@ -40,10 +43,18 @@ pub fn DrawerHost(state: AppState) -> impl IntoView {
                     "New task".to_string(),
                     view! { <TaskForm state preset_project=project_id.unwrap_or_default() /> }.into_any(),
                 ),
-                Drawer::EditTask(task) => (
-                    "Edit task".to_string(),
-                    view! { <TaskForm state existing=task /> }.into_any(),
-                ),
+                Drawer::EditTask(task) => {
+                    let panel_id = task.id.clone();
+                    let panel_status = task.status;
+                    let panel_limit = task.time_limit_minutes;
+                    (
+                        "Edit task".to_string(),
+                        view! {
+                            <TaskTimerPanel state now=now_sig task_id=panel_id status=panel_status time_limit_minutes=panel_limit />
+                            <TaskForm state existing=task />
+                        }.into_any(),
+                    )
+                }
             };
             view! {
                 <div class="drawer-layer">

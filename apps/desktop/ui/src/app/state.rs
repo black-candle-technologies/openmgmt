@@ -26,24 +26,28 @@ extern "C" {
 #[derive(Clone, PartialEq)]
 pub enum Page {
     Dashboard,
+    DailyOps,
     Organizations,
     Projects,
     Project(String),
     Tasks,
     Today,
     Board,
+    Settings,
 }
 
 impl Page {
     pub fn title(&self) -> &'static str {
         match self {
             Page::Dashboard => "Dashboard",
+            Page::DailyOps => "Daily Operations",
             Page::Organizations => "Organizations",
             Page::Projects => "Projects",
             Page::Project(_) => "Project",
             Page::Tasks => "Tasks",
             Page::Today => "Today",
             Page::Board => "Board",
+            Page::Settings => "Settings",
         }
     }
 }
@@ -353,6 +357,47 @@ pub fn confirmed(message: &str) -> bool {
     web_sys::window()
         .and_then(|window| window.confirm_with_message(message).ok())
         .unwrap_or(false)
+}
+
+/// Native prompt with a default value. Returns `None` if the user cancels.
+pub fn prompt_with_default(message: &str, default: &str) -> Option<String> {
+    web_sys::window()
+        .and_then(|window| {
+            window
+                .prompt_with_message_and_default(message, default)
+                .ok()
+                .flatten()
+        })
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Triggers a client-side file download of in-memory text by building a Blob,
+/// an object URL, and a momentary `<a download>` click. Used by the data export
+/// commands which return their payload as a string for the UI to persist.
+pub fn download_text(filename: &str, content: &str) -> Result<(), String> {
+    let parts = js_sys::Array::new();
+    parts.push(&JsValue::from_str(content));
+    let blob = web_sys::Blob::new_with_str_sequence(parts.as_ref())
+        .map_err(|_| "Could not create file".to_string())?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|_| "Could not create download URL".to_string())?;
+    let result = (|| {
+        let document = web_sys::window()
+            .and_then(|window| window.document())
+            .ok_or("No document")?;
+        let anchor = document
+            .create_element("a")
+            .map_err(|_| "Could not create link")?
+            .dyn_into::<web_sys::HtmlAnchorElement>()
+            .map_err(|_| "Could not create link")?;
+        anchor.set_href(&url);
+        anchor.set_download(filename);
+        anchor.click();
+        Ok::<(), String>(())
+    })();
+    let _ = web_sys::Url::revoke_object_url(&url);
+    result
 }
 
 // ---------------------------------------------------------------------------
