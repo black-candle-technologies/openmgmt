@@ -5,11 +5,11 @@
   "identifier": "com.openmgmt.desktop",
   "build": {
     "beforeDevCommand": {
-      "script": "trunk serve",
+      "script": "trunk serve --address 127.0.0.1 --port 1420",
       "cwd": "../ui",
       "wait": false
     },
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://127.0.0.1:1420",
     "beforeBuildCommand": {
       "script": "trunk build --release",
       "cwd": "../ui"

@@ -254,6 +254,10 @@ pub fn is_board_window() -> bool {
 /// can be debugged straight from the webview console.
 pub fn log_board_diagnostics() {
     let window = web_sys::window();
+    let href = window
+        .as_ref()
+        .and_then(|window| window.location().href().ok())
+        .unwrap_or_default();
     let search = window
         .as_ref()
         .and_then(|window| window.location().search().ok())
@@ -265,6 +269,9 @@ pub fn log_board_diagnostics() {
         })
         .unwrap_or(false);
     web_sys::console::log_1(&JsValue::from_str("[board] board mode detected"));
+    web_sys::console::log_1(&JsValue::from_str(&format!(
+        "[board] window.location.href = {href:?}"
+    )));
     web_sys::console::log_1(&JsValue::from_str(&format!(
         "[board] window.location.search = {search:?}"
     )));

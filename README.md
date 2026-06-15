@@ -60,10 +60,11 @@ cargo tauri dev
 
 The app migrates and seeds the database on startup. Select **Open TV Board** in
 the top bar to open the board in a separate, normal Tauri window (decorated,
-movable, and resizable; centered at 1440x900). The board window loads
-`index.html?board=1`, renders a dark operations layout, and never shows a blank
-white screen. The main app and TV board use the same repository-local
-`data/openmgmt.sqlite` file.
+movable, and resizable; centered at 1440x900). The board window renders a dark
+operations layout and never shows a blank white screen. In development it loads
+the Trunk dev server with the board query string (`http://127.0.0.1:1420/?board=1`);
+in a packaged build it loads the bundled asset (`tauri://localhost/index.html?board=1`).
+The main app and TV board use the same repository-local `data/openmgmt.sqlite` file.
 
 The left sidebar navigates Dashboard, Organizations, Projects, Tasks, Today, and
 an embedded Board. The top bar exposes the current page title, a status
@@ -141,6 +142,40 @@ After `cargo tauri dev` opens the app:
    resizable window (not fullscreen) with all seven columns and readable cards,
    and no blank white screen.
 7. Select **Seed database** twice and confirm it succeeds without duplicates.
+
+## Troubleshooting (Windows)
+
+If `cargo tauri dev` fails to start with:
+
+```text
+Only one usage of each socket address (protocol/network address/port) is
+normally permitted. (os error 10048)
+The "beforeDevCommand" terminated with a non-zero status code.
+```
+
+port `1420` is already in use — almost always by a stale `trunk` (or a previous
+`openmgmt`/`cargo tauri dev`) process that survived a crash or a hard stop,
+because the dev server is started with `wait: false` and is not always cleaned
+up on exit. Find and stop whatever is holding the port, then re-run:
+
+```powershell
+# Show the process (PID) listening on 1420
+Get-NetTCPConnection -LocalPort 1420 -State Listen |
+  Select-Object LocalAddress, LocalPort, OwningProcess
+# (fallback) netstat -ano | Select-String ":1420"
+
+# Stop that specific process by PID
+Stop-Process -Id <PID> -Force
+
+# Or stop any stale dev processes by name
+Get-Process trunk, openmgmt, openmgmt-ui -ErrorAction SilentlyContinue |
+  Stop-Process -Force
+```
+
+The dev server now binds a single loopback interface (`127.0.0.1:1420`, set in
+`apps/desktop/ui/Trunk.toml`) and `devUrl` matches it, which avoids the
+dual-stack IPv4/IPv6 self-conflict that can also produce `os error 10048` on
+Windows even when no other process holds the port.
 
 ## Known MVP limitations
 
