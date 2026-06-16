@@ -1,6 +1,8 @@
 use openmgmt_core::{
-    AppService, BoardState, NewOrganization, NewProject, NewTask, Organization, OrganizationPatch,
-    Project, ProjectPatch, SyncSettings, SyncSettingsPatch, SyncStatus, Task, TaskPatch,
+    AppService, BoardState, NewOrganization, NewProject, NewSavedTaskView, NewTask, Organization,
+    OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch, ScoringSettings,
+    ScoringSettingsPatch, SyncSettings, SyncSettingsPatch, SyncStatus, Task, TaskPatch,
+    TaskQueryFilter, TaskSort, TaskTimerSession, TaskWithContext,
 };
 use openmgmt_sync_client::{SyncConnectionTestResult, SyncOnceResult};
 use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindowBuilder};
@@ -124,6 +126,62 @@ pub fn complete_task(service: State<'_, AppService>, id: String) -> CommandResul
 }
 
 #[tauri::command]
+pub fn start_task_timer(
+    service: State<'_, AppService>,
+    task_id: String,
+) -> CommandResult<TaskTimerSession> {
+    core(service.start_task_timer(&task_id))
+}
+
+#[tauri::command]
+pub fn pause_task_timer(
+    service: State<'_, AppService>,
+    task_id: String,
+) -> CommandResult<TaskTimerSession> {
+    core(service.pause_task_timer(&task_id))
+}
+
+#[tauri::command]
+pub fn resume_task_timer(
+    service: State<'_, AppService>,
+    task_id: String,
+) -> CommandResult<TaskTimerSession> {
+    core(service.resume_task_timer(&task_id))
+}
+
+#[tauri::command]
+pub fn stop_task_timer(
+    service: State<'_, AppService>,
+    task_id: String,
+) -> CommandResult<TaskTimerSession> {
+    core(service.stop_task_timer(&task_id))
+}
+
+#[tauri::command]
+pub fn complete_task_with_timer(
+    service: State<'_, AppService>,
+    task_id: String,
+) -> CommandResult<Task> {
+    core(service.complete_task_with_timer(&task_id))
+}
+
+#[tauri::command]
+pub fn list_task_timer_sessions(
+    service: State<'_, AppService>,
+    task_id: String,
+) -> CommandResult<Vec<TaskTimerSession>> {
+    core(service.list_task_timer_sessions(&task_id))
+}
+
+#[tauri::command]
+pub fn get_active_timer_session(
+    service: State<'_, AppService>,
+    task_id: String,
+) -> CommandResult<Option<TaskTimerSession>> {
+    core(service.get_active_timer_session(&task_id))
+}
+
+#[tauri::command]
 pub fn block_task(
     service: State<'_, AppService>,
     id: String,
@@ -140,6 +198,91 @@ pub fn unblock_task(service: State<'_, AppService>, id: String) -> CommandResult
 #[tauri::command]
 pub fn get_board_state(service: State<'_, AppService>) -> CommandResult<BoardState> {
     core(service.get_board_state())
+}
+
+#[tauri::command]
+pub fn list_saved_task_views(service: State<'_, AppService>) -> CommandResult<Vec<SavedTaskView>> {
+    core(service.list_saved_task_views())
+}
+
+#[tauri::command]
+pub fn get_saved_task_view(
+    service: State<'_, AppService>,
+    id: String,
+) -> CommandResult<SavedTaskView> {
+    core(service.get_saved_task_view(&id))
+}
+
+#[tauri::command]
+pub fn create_saved_task_view(
+    service: State<'_, AppService>,
+    input: NewSavedTaskView,
+) -> CommandResult<SavedTaskView> {
+    core(service.create_saved_task_view(input))
+}
+
+#[tauri::command]
+pub fn update_saved_task_view(
+    service: State<'_, AppService>,
+    id: String,
+    patch: SavedTaskViewPatch,
+) -> CommandResult<SavedTaskView> {
+    core(service.update_saved_task_view(&id, patch))
+}
+
+#[tauri::command]
+pub fn archive_saved_task_view(service: State<'_, AppService>, id: String) -> CommandResult<()> {
+    core(service.archive_saved_task_view(&id))
+}
+
+#[tauri::command]
+pub fn query_tasks(
+    service: State<'_, AppService>,
+    filter: TaskQueryFilter,
+    sort: Option<TaskSort>,
+) -> CommandResult<Vec<TaskWithContext>> {
+    core(service.query_tasks(filter, sort))
+}
+
+#[tauri::command]
+pub fn get_scoring_settings(service: State<'_, AppService>) -> CommandResult<ScoringSettings> {
+    core(service.get_scoring_settings())
+}
+
+#[tauri::command]
+pub fn update_scoring_settings(
+    service: State<'_, AppService>,
+    patch: ScoringSettingsPatch,
+) -> CommandResult<ScoringSettings> {
+    core(service.update_scoring_settings(patch))
+}
+
+#[tauri::command]
+pub fn reset_scoring_settings(service: State<'_, AppService>) -> CommandResult<ScoringSettings> {
+    core(service.reset_scoring_settings())
+}
+
+#[tauri::command]
+pub fn export_tasks_json(service: State<'_, AppService>) -> CommandResult<String> {
+    core(service.export_tasks_json())
+}
+
+#[tauri::command]
+pub fn export_tasks_csv(service: State<'_, AppService>) -> CommandResult<String> {
+    core(service.export_tasks_csv())
+}
+
+#[tauri::command]
+pub fn export_all_json(service: State<'_, AppService>) -> CommandResult<String> {
+    core(service.export_all_json())
+}
+
+#[tauri::command]
+pub fn backup_sqlite_database(
+    service: State<'_, AppService>,
+    target_path: String,
+) -> CommandResult<()> {
+    core(service.backup_sqlite_database(&target_path))
 }
 
 #[tauri::command]

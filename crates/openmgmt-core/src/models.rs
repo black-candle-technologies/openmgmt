@@ -58,6 +58,18 @@ string_enum!(TaskStatus {
     Canceled => "canceled",
 });
 
+string_enum!(TaskSortField {
+    Urgency => "urgency",
+    Priority => "priority",
+    DueAt => "due_at",
+    Status => "status",
+    Project => "project",
+    Organization => "organization",
+    CreatedAt => "created_at",
+    UpdatedAt => "updated_at",
+    Tag => "tag",
+});
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Organization {
     pub id: String,
@@ -127,6 +139,141 @@ pub struct ScoredTask {
     #[serde(flatten)]
     pub context: TaskContext,
     pub urgency_score: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskTimerSession {
+    pub id: String,
+    pub task_id: String,
+    pub started_at: DateTime<Utc>,
+    pub paused_at: Option<DateTime<Utc>>,
+    pub resumed_at: Option<DateTime<Utc>>,
+    pub stopped_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub duration_seconds: Option<i64>,
+    pub note: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveTimerInfo {
+    pub session_id: String,
+    pub started_at: DateTime<Utc>,
+    pub paused_at: Option<DateTime<Utc>>,
+    pub resumed_at: Option<DateTime<Utc>>,
+    pub elapsed_seconds: i64,
+    pub is_running: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskWithContext {
+    pub task: Task,
+    pub project_id: String,
+    pub project_name: String,
+    pub project_type: ProjectType,
+    pub organization_id: String,
+    pub organization_name: String,
+    pub organization_color: Option<String>,
+    pub organization_icon: Option<String>,
+    pub urgency_score: i32,
+    pub active_timer: Option<ActiveTimerInfo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskQueryFilter {
+    pub organization_id: Option<String>,
+    pub project_id: Option<String>,
+    pub status: Option<Vec<TaskStatus>>,
+    pub priority: Option<Vec<i32>>,
+    pub due_from: Option<DateTime<Utc>>,
+    pub due_to: Option<DateTime<Utc>>,
+    pub scheduled_from: Option<DateTime<Utc>>,
+    pub scheduled_to: Option<DateTime<Utc>>,
+    pub pinned: Option<bool>,
+    pub tags: Option<Vec<String>>,
+    pub text: Option<String>,
+    pub include_done: Option<bool>,
+    pub include_canceled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSort {
+    pub field: TaskSortField,
+    #[serde(default = "default_sort_descending")]
+    pub descending: bool,
+}
+
+impl Default for TaskSort {
+    fn default() -> Self {
+        Self {
+            field: TaskSortField::Urgency,
+            descending: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedTaskView {
+    pub id: String,
+    pub name: String,
+    pub slug: String,
+    pub description: Option<String>,
+    pub filter_json: serde_json::Value,
+    pub sort_json: serde_json::Value,
+    pub is_system: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub archived_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewSavedTaskView {
+    pub name: String,
+    pub slug: Option<String>,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub filter_json: serde_json::Value,
+    #[serde(default)]
+    pub sort_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SavedTaskViewPatch {
+    pub name: Option<String>,
+    pub slug: Option<String>,
+    pub description: Option<Option<String>>,
+    pub filter_json: Option<serde_json::Value>,
+    pub sort_json: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoringSettings {
+    pub id: String,
+    pub priority_weight: i32,
+    pub pinned_boost: i32,
+    pub overdue_boost: i32,
+    pub due_soon_boost: i32,
+    pub in_progress_boost: i32,
+    pub blocked_penalty: i32,
+    pub waiting_penalty: i32,
+    pub paused_project_penalty: i32,
+    pub due_soon_window_hours: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ScoringSettingsPatch {
+    pub priority_weight: Option<i32>,
+    pub pinned_boost: Option<i32>,
+    pub overdue_boost: Option<i32>,
+    pub due_soon_boost: Option<i32>,
+    pub in_progress_boost: Option<i32>,
+    pub blocked_penalty: Option<i32>,
+    pub waiting_penalty: Option<i32>,
+    pub paused_project_penalty: Option<i32>,
+    pub due_soon_window_hours: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -243,4 +390,8 @@ pub struct TaskPatch {
 
 fn default_priority() -> i32 {
     3
+}
+
+fn default_sort_descending() -> bool {
+    true
 }

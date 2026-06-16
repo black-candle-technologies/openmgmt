@@ -1,9 +1,13 @@
 use crate::{
     board::build_board,
     models::{
-        BoardState, NewOrganization, NewProject, NewTask, Organization, OrganizationPatch, Project,
-        ProjectPatch, ProjectStatus, ProjectType, Task, TaskContext, TaskPatch, TaskStatus,
+        ActiveTimerInfo, BoardState, NewOrganization, NewProject, NewSavedTaskView, NewTask,
+        Organization, OrganizationPatch, Project, ProjectPatch, ProjectStatus, ProjectType,
+        SavedTaskView, SavedTaskViewPatch, ScoringSettings, ScoringSettingsPatch, Task,
+        TaskContext, TaskPatch, TaskQueryFilter, TaskSort, TaskSortField, TaskStatus,
+        TaskTimerSession, TaskWithContext,
     },
+    scoring::{ScoringWeights, score_task},
     sync::{
         DEFAULT_DEVICE_NAME, LOCAL_DEVICE_ID_KEY, RemoteApplyBatchResult, RemoteApplyResult,
         RemoteApplyStatus, SYNC_ACCOUNT_ID_KEY, SYNC_DEVICE_NAME_KEY, SYNC_DEVICE_TOKEN_KEY,
@@ -15,6 +19,8 @@ use crate::{
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::{
+    cmp::Ordering,
+    collections::HashMap,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex, MutexGuard},
@@ -131,6 +137,49 @@ impl Database {
             CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks(project_id);
             CREATE INDEX IF NOT EXISTS tasks_status_idx ON tasks(status);
             CREATE INDEX IF NOT EXISTS tasks_due_idx ON tasks(due_at);
+            CREATE TABLE IF NOT EXISTS task_timer_sessions (
+              id TEXT PRIMARY KEY NOT NULL,
+              task_id TEXT NOT NULL REFERENCES tasks(id),
+              started_at TEXT NOT NULL,
+              paused_at TEXT,
+              resumed_at TEXT,
+              stopped_at TEXT,
+              completed_at TEXT,
+              duration_seconds INTEGER,
+              note TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS task_timer_sessions_task_idx
+              ON task_timer_sessions(task_id, started_at);
+            CREATE INDEX IF NOT EXISTS task_timer_sessions_active_idx
+              ON task_timer_sessions(task_id, stopped_at, completed_at);
+            CREATE TABLE IF NOT EXISTS saved_task_views (
+              id TEXT PRIMARY KEY NOT NULL,
+              name TEXT NOT NULL,
+              slug TEXT NOT NULL UNIQUE,
+              description TEXT,
+              filter_json TEXT NOT NULL,
+              sort_json TEXT NOT NULL,
+              is_system INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              archived_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS scoring_settings (
+              id TEXT PRIMARY KEY NOT NULL,
+              priority_weight INTEGER NOT NULL,
+              pinned_boost INTEGER NOT NULL,
+              overdue_boost INTEGER NOT NULL,
+              due_soon_boost INTEGER NOT NULL,
+              in_progress_boost INTEGER NOT NULL,
+              blocked_penalty INTEGER NOT NULL,
+              waiting_penalty INTEGER NOT NULL,
+              paused_project_penalty INTEGER NOT NULL,
+              due_soon_window_hours INTEGER NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS sync_events (
               event_id TEXT PRIMARY KEY NOT NULL,
               device_id TEXT NOT NULL,
@@ -178,6 +227,8 @@ impl Database {
             "#,
         )?;
         self.ensure_sync_event_ownership_columns()?;
+        self.seed_system_saved_task_views()?;
+        self.ensure_default_scoring_settings()?;
         Ok(())
     }
 
@@ -196,6 +247,145 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    fn seed_system_saved_task_views(&self) -> Result<()> {
+        let now = Utc::now();
+        let views = [
+            (
+                "All Tasks",
+                "all-tasks",
+                serde_json::json!({"include_done": true}),
+            ),
+            ("Today", "today", serde_json::json!({"due": "today"})),
+            ("MVP", "mvp", serde_json::json!({"tags": ["mvp"]})),
+            ("Launch", "launch", serde_json::json!({"tags": ["launch"]})),
+            ("Bugs", "bugs", serde_json::json!({"tags": ["bug"]})),
+            (
+                "Blocked",
+                "blocked",
+                serde_json::json!({"status": ["blocked"]}),
+            ),
+            ("Due Soon", "due-soon", serde_json::json!({"due": "soon"})),
+            (
+                "In Progress",
+                "in-progress",
+                serde_json::json!({"status": ["in_progress"]}),
+            ),
+            ("Pinned", "pinned", serde_json::json!({"pinned": true})),
+        ];
+        let connection = self.connection()?;
+        for (name, slug, filter_json) in views {
+            let id = format!("system-{slug}");
+            connection.execute(
+                "INSERT INTO saved_task_views (
+                    id,name,slug,description,filter_json,sort_json,is_system,created_at,updated_at,archived_at
+                 ) VALUES (?1,?2,?3,NULL,?4,?5,1,?6,?6,NULL)
+                 ON CONFLICT(slug) DO UPDATE SET
+                    name=excluded.name,
+                    filter_json=excluded.filter_json,
+                    sort_json=excluded.sort_json,
+                    is_system=1,
+                    archived_at=NULL,
+                    updated_at=excluded.updated_at",
+                params![
+                    id,
+                    name,
+                    slug,
+                    filter_json.to_string(),
+                    serde_json::json!({"field": "urgency", "descending": true}).to_string(),
+                    timestamp(now),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_default_scoring_settings(&self) -> Result<()> {
+        let exists: bool = self.connection()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scoring_settings WHERE id='default')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            let connection = self.connection()?;
+            save_scoring_settings_with_connection(
+                &connection,
+                &default_scoring_settings(Utc::now()),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn scoring_weights(&self) -> Result<ScoringWeights> {
+        Ok(scoring_settings_to_weights(&self.get_scoring_settings()?))
+    }
+
+    fn task_context_rows(&self) -> Result<Vec<(TaskContext, String, String, Option<String>)>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT t.id,t.project_id,t.title,t.description,t.status,t.priority,t.due_at,
+              t.scheduled_at,t.started_at,t.completed_at,t.estimated_minutes,t.time_limit_minutes,
+              t.pinned,t.blocked_reason,t.tags,t.created_at,t.updated_at,
+              p.id,p.name,p.type,p.status,p.priority,o.id,o.name,o.color,o.icon
+             FROM tasks t JOIN projects p ON p.id=t.project_id
+             JOIN organizations o ON o.id=p.organization_id
+             WHERE p.archived_at IS NULL AND p.status != 'archived' AND o.archived_at IS NULL",
+        )?;
+        Ok(statement
+            .query_map([], |row| {
+                let task = map_task(row)?;
+                let project_id: String = row.get(17)?;
+                let project_name: String = row.get(18)?;
+                let project_type = parse_enum(row.get::<_, String>(19)?)?;
+                let project_status = parse_enum(row.get::<_, String>(20)?)?;
+                let project_priority = row.get(21)?;
+                let organization_id: String = row.get(22)?;
+                let organization_name: String = row.get(23)?;
+                let organization_color = row.get(24)?;
+                let organization_icon = row.get(25)?;
+                Ok((
+                    TaskContext {
+                        task,
+                        project_name,
+                        project_type,
+                        project_status,
+                        project_priority,
+                        organization_name,
+                        organization_color,
+                    },
+                    project_id,
+                    organization_id,
+                    organization_icon,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn active_timer_map(&self, now: DateTime<Utc>) -> Result<HashMap<String, ActiveTimerInfo>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,task_id,started_at,paused_at,resumed_at,stopped_at,completed_at,
+                    duration_seconds,note,created_at,updated_at
+             FROM task_timer_sessions
+             WHERE stopped_at IS NULL AND completed_at IS NULL",
+        )?;
+        let mut map = HashMap::new();
+        for session in statement.query_map([], map_timer_session)? {
+            let session = session?;
+            map.insert(
+                session.task_id.clone(),
+                ActiveTimerInfo {
+                    session_id: session.id.clone(),
+                    started_at: session.started_at,
+                    paused_at: session.paused_at,
+                    resumed_at: session.resumed_at,
+                    elapsed_seconds: timer_elapsed_seconds(&session, now),
+                    is_running: session.paused_at.is_none(),
+                },
+            );
+        }
+        Ok(map)
     }
 
     pub fn get_or_create_device_id(&self) -> Result<String> {
@@ -972,30 +1162,415 @@ impl Database {
         Ok(task)
     }
 
-    pub fn board_state(&self) -> Result<BoardState> {
+    pub fn start_task_timer(&self, task_id: &str) -> Result<TaskTimerSession> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut task = get_task_with_connection(&transaction, task_id)?;
+        if matches!(task.status, TaskStatus::Done | TaskStatus::Canceled) {
+            return Err(CoreError::Validation(
+                "cannot start a timer on a done or canceled task".into(),
+            ));
+        }
+        if get_active_timer_session_with_connection(&transaction, task_id)?.is_some() {
+            return Err(CoreError::Validation(
+                "task already has an active timer session".into(),
+            ));
+        }
+        let now = Utc::now();
+        if task.status != TaskStatus::InProgress {
+            task.status = TaskStatus::InProgress;
+            task.updated_at = now;
+            if task.started_at.is_none() {
+                task.started_at = Some(now);
+            }
+            save_task_with_connection(&transaction, &task)?;
+            append_sync_event_with_connection(
+                &transaction,
+                SyncEntityType::Task,
+                &task.id,
+                SyncOperation::Transitioned,
+                serde_json::json!({ "entity": &task }),
+            )?;
+        }
+        let session = TaskTimerSession {
+            id: Uuid::new_v4().to_string(),
+            task_id: task_id.to_owned(),
+            started_at: now,
+            paused_at: None,
+            resumed_at: None,
+            stopped_at: None,
+            completed_at: None,
+            duration_seconds: Some(0),
+            note: None,
+            created_at: now,
+            updated_at: now,
+        };
+        insert_timer_session_with_connection(&transaction, &session)?;
+        transaction.commit()?;
+        Ok(session)
+    }
+
+    pub fn pause_task_timer(&self, task_id: &str) -> Result<TaskTimerSession> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut session = get_active_timer_session_with_connection(&transaction, task_id)?
+            .ok_or(CoreError::NotFound("active timer session"))?;
+        if session.paused_at.is_some() {
+            return Ok(session);
+        }
+        let now = Utc::now();
+        session.duration_seconds = Some(timer_elapsed_seconds(&session, now));
+        session.paused_at = Some(now);
+        session.updated_at = now;
+        save_timer_session_with_connection(&transaction, &session)?;
+        transaction.commit()?;
+        Ok(session)
+    }
+
+    pub fn resume_task_timer(&self, task_id: &str) -> Result<TaskTimerSession> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut session = get_active_timer_session_with_connection(&transaction, task_id)?
+            .ok_or(CoreError::NotFound("active timer session"))?;
+        if session.paused_at.is_none() {
+            return Ok(session);
+        }
+        let now = Utc::now();
+        session.paused_at = None;
+        session.resumed_at = Some(now);
+        session.updated_at = now;
+        save_timer_session_with_connection(&transaction, &session)?;
+        transaction.commit()?;
+        Ok(session)
+    }
+
+    pub fn stop_task_timer(&self, task_id: &str) -> Result<TaskTimerSession> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut session = get_active_timer_session_with_connection(&transaction, task_id)?
+            .ok_or(CoreError::NotFound("active timer session"))?;
+        let now = Utc::now();
+        session.duration_seconds = Some(timer_elapsed_seconds(&session, now));
+        session.stopped_at = Some(now);
+        session.updated_at = now;
+        save_timer_session_with_connection(&transaction, &session)?;
+        transaction.commit()?;
+        Ok(session)
+    }
+
+    pub fn complete_task_with_timer(&self, task_id: &str) -> Result<Task> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        if let Some(mut session) = get_active_timer_session_with_connection(&transaction, task_id)?
+        {
+            let now = Utc::now();
+            session.duration_seconds = Some(timer_elapsed_seconds(&session, now));
+            session.completed_at = Some(now);
+            session.updated_at = now;
+            save_timer_session_with_connection(&transaction, &session)?;
+        }
+        let mut task = get_task_with_connection(&transaction, task_id)?;
+        let now = Utc::now();
+        task.status = TaskStatus::Done;
+        task.completed_at = Some(now);
+        task.updated_at = now;
+        task.blocked_reason = None;
+        save_task_with_connection(&transaction, &task)?;
+        append_sync_event_with_connection(
+            &transaction,
+            SyncEntityType::Task,
+            &task.id,
+            SyncOperation::Transitioned,
+            serde_json::json!({ "entity": &task }),
+        )?;
+        transaction.commit()?;
+        Ok(task)
+    }
+
+    pub fn list_task_timer_sessions(&self, task_id: &str) -> Result<Vec<TaskTimerSession>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT t.id,t.project_id,t.title,t.description,t.status,t.priority,t.due_at,
-              t.scheduled_at,t.started_at,t.completed_at,t.estimated_minutes,t.time_limit_minutes,
-              t.pinned,t.blocked_reason,t.tags,t.created_at,t.updated_at,
-              p.name,p.type,p.status,p.priority,o.name,o.color
-             FROM tasks t JOIN projects p ON p.id=t.project_id
-             JOIN organizations o ON o.id=p.organization_id
-             WHERE p.archived_at IS NULL AND p.status != 'archived' AND o.archived_at IS NULL",
+            "SELECT id,task_id,started_at,paused_at,resumed_at,stopped_at,completed_at,
+                    duration_seconds,note,created_at,updated_at
+             FROM task_timer_sessions WHERE task_id=?1 ORDER BY started_at DESC",
         )?;
-        let contexts = statement
-            .query_map([], |row| {
-                Ok(TaskContext {
-                    task: map_task(row)?,
-                    project_name: row.get(17)?,
-                    project_type: parse_enum(row.get::<_, String>(18)?)?,
-                    project_status: parse_enum(row.get::<_, String>(19)?)?,
-                    project_priority: row.get(20)?,
-                    organization_name: row.get(21)?,
-                    organization_color: row.get(22)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(statement
+            .query_map([task_id], map_timer_session)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn get_active_timer_session(&self, task_id: &str) -> Result<Option<TaskTimerSession>> {
+        let connection = self.connection()?;
+        get_active_timer_session_with_connection(&connection, task_id)
+    }
+
+    pub fn list_saved_task_views(&self) -> Result<Vec<SavedTaskView>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,name,slug,description,filter_json,sort_json,is_system,created_at,updated_at,archived_at
+             FROM saved_task_views ORDER BY is_system DESC, name COLLATE NOCASE",
+        )?;
+        Ok(statement
+            .query_map([], map_saved_task_view)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn get_saved_task_view(&self, id: &str) -> Result<SavedTaskView> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT id,name,slug,description,filter_json,sort_json,is_system,created_at,updated_at,archived_at
+                 FROM saved_task_views WHERE id=?1",
+                [id],
+                map_saved_task_view,
+            )
+            .optional()?
+            .ok_or(CoreError::NotFound("saved task view"))
+    }
+
+    pub fn create_saved_task_view(&self, input: NewSavedTaskView) -> Result<SavedTaskView> {
+        require_name(&input.name)?;
+        let now = Utc::now();
+        let view = SavedTaskView {
+            id: Uuid::new_v4().to_string(),
+            slug: input.slug.unwrap_or_else(|| slugify(&input.name)),
+            name: input.name,
+            description: input.description,
+            filter_json: input.filter_json,
+            sort_json: input.sort_json,
+            is_system: false,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+        };
+        let connection = self.connection()?;
+        insert_saved_task_view_with_connection(&connection, &view)?;
+        Ok(view)
+    }
+
+    pub fn update_saved_task_view(
+        &self,
+        id: &str,
+        patch: SavedTaskViewPatch,
+    ) -> Result<SavedTaskView> {
+        let connection = self.connection()?;
+        let mut view = self.get_saved_task_view(id)?;
+        if view.is_system {
+            return Err(CoreError::Validation(
+                "system saved task views cannot be edited".into(),
+            ));
+        }
+        if let Some(name) = patch.name {
+            require_name(&name)?;
+            view.name = name;
+        }
+        if let Some(slug) = patch.slug {
+            require_name(&slug)?;
+            view.slug = slugify(&slug);
+        }
+        if let Some(description) = patch.description {
+            view.description = description;
+        }
+        if let Some(filter_json) = patch.filter_json {
+            view.filter_json = filter_json;
+        }
+        if let Some(sort_json) = patch.sort_json {
+            view.sort_json = sort_json;
+        }
+        view.updated_at = Utc::now();
+        changed(
+            connection.execute(
+                "UPDATE saved_task_views SET name=?2,slug=?3,description=?4,filter_json=?5,
+                 sort_json=?6,updated_at=?7 WHERE id=?1",
+                params![
+                    view.id,
+                    view.name,
+                    view.slug,
+                    view.description,
+                    view.filter_json.to_string(),
+                    view.sort_json.to_string(),
+                    timestamp(view.updated_at),
+                ],
+            )?,
+            "saved task view",
+        )?;
+        Ok(view)
+    }
+
+    pub fn archive_saved_task_view(&self, id: &str) -> Result<()> {
+        let view = self.get_saved_task_view(id)?;
+        if view.is_system {
+            return Err(CoreError::Validation(
+                "system saved task views cannot be archived".into(),
+            ));
+        }
+        let now = Utc::now();
+        changed(
+            self.connection()?.execute(
+                "UPDATE saved_task_views SET archived_at=?2,updated_at=?2 WHERE id=?1",
+                params![id, timestamp(now)],
+            )?,
+            "saved task view",
+        )
+    }
+
+    pub fn query_tasks(
+        &self,
+        filter: TaskQueryFilter,
+        sort: Option<TaskSort>,
+    ) -> Result<Vec<TaskWithContext>> {
+        let now = Utc::now();
+        let weights = self.scoring_weights()?;
+        let active_timers = self.active_timer_map(now)?;
+        let mut rows = self.task_context_rows()?;
+        rows.retain(|row| task_matches_filter(row, &filter, now));
+        let mut rows = rows
+            .into_iter()
+            .map(
+                |(task_context, project_id, organization_id, organization_icon)| {
+                    let urgency_score = score_task(&task_context, now, weights);
+                    let active_timer = active_timers.get(&task_context.task.id).cloned();
+                    TaskWithContext {
+                        project_id,
+                        project_name: task_context.project_name.clone(),
+                        project_type: task_context.project_type,
+                        organization_id,
+                        organization_name: task_context.organization_name.clone(),
+                        organization_color: task_context.organization_color.clone(),
+                        organization_icon,
+                        task: task_context.task,
+                        urgency_score,
+                        active_timer,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        sort_task_rows(&mut rows, sort.unwrap_or_default());
+        Ok(rows)
+    }
+
+    pub fn get_scoring_settings(&self) -> Result<ScoringSettings> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT id,priority_weight,pinned_boost,overdue_boost,due_soon_boost,
+                        in_progress_boost,blocked_penalty,waiting_penalty,paused_project_penalty,
+                        due_soon_window_hours,created_at,updated_at
+                 FROM scoring_settings WHERE id='default'",
+                [],
+                map_scoring_settings,
+            )
+            .optional()?
+            .ok_or(CoreError::NotFound("scoring settings"))
+    }
+
+    pub fn update_scoring_settings(&self, patch: ScoringSettingsPatch) -> Result<ScoringSettings> {
+        let mut settings = self.get_scoring_settings()?;
+        if let Some(value) = patch.priority_weight {
+            settings.priority_weight = value;
+        }
+        if let Some(value) = patch.pinned_boost {
+            settings.pinned_boost = value;
+        }
+        if let Some(value) = patch.overdue_boost {
+            settings.overdue_boost = value;
+        }
+        if let Some(value) = patch.due_soon_boost {
+            settings.due_soon_boost = value;
+        }
+        if let Some(value) = patch.in_progress_boost {
+            settings.in_progress_boost = value;
+        }
+        if let Some(value) = patch.blocked_penalty {
+            settings.blocked_penalty = value;
+        }
+        if let Some(value) = patch.waiting_penalty {
+            settings.waiting_penalty = value;
+        }
+        if let Some(value) = patch.paused_project_penalty {
+            settings.paused_project_penalty = value;
+        }
+        if let Some(value) = patch.due_soon_window_hours {
+            settings.due_soon_window_hours = value.max(1);
+        }
+        settings.updated_at = Utc::now();
+        let connection = self.connection()?;
+        save_scoring_settings_with_connection(&connection, &settings)?;
+        Ok(settings)
+    }
+
+    pub fn reset_scoring_settings(&self) -> Result<ScoringSettings> {
+        let settings = default_scoring_settings(Utc::now());
+        let connection = self.connection()?;
+        save_scoring_settings_with_connection(&connection, &settings)?;
+        Ok(settings)
+    }
+
+    pub fn export_tasks_json(&self) -> Result<String> {
+        serde_json::to_string_pretty(&self.query_tasks(TaskQueryFilter::default(), None)?)
+            .map_err(|error| CoreError::Validation(format!("could not export tasks: {error}")))
+    }
+
+    pub fn export_tasks_csv(&self) -> Result<String> {
+        let rows = self.query_tasks(TaskQueryFilter::default(), None)?;
+        let mut csv = String::from(
+            "id,title,status,priority,project,organization,due_at,scheduled_at,completed_at,tags,urgency_score\n",
+        );
+        for row in rows {
+            let tags = row.task.tags.join(";");
+            csv.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{},{},{}\n",
+                csv_cell(&row.task.id),
+                csv_cell(&row.task.title),
+                csv_cell(&row.task.status.to_string()),
+                row.task.priority,
+                csv_cell(&row.project_name),
+                csv_cell(&row.organization_name),
+                csv_cell(&row.task.due_at.map(timestamp).unwrap_or_default()),
+                csv_cell(&row.task.scheduled_at.map(timestamp).unwrap_or_default()),
+                csv_cell(&row.task.completed_at.map(timestamp).unwrap_or_default()),
+                csv_cell(&tags),
+                row.urgency_score,
+            ));
+        }
+        Ok(csv)
+    }
+
+    pub fn export_all_json(&self) -> Result<String> {
+        let value = serde_json::json!({
+            "organizations": self.list_organizations()?,
+            "projects": self.list_projects()?,
+            "tasks": self.query_tasks(TaskQueryFilter {
+                include_done: Some(true),
+                include_canceled: Some(true),
+                ..Default::default()
+            }, None)?,
+            "saved_task_views": self.list_saved_task_views()?,
+            "scoring_settings": self.get_scoring_settings()?,
+        });
+        serde_json::to_string_pretty(&value)
+            .map_err(|error| CoreError::Validation(format!("could not export data: {error}")))
+    }
+
+    pub fn backup_sqlite_database(&self, target_path: impl AsRef<Path>) -> Result<()> {
+        let target = target_path.as_ref();
+        if let Some(parent) = target
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        self.connection()?
+            .execute("VACUUM INTO ?1", [target.to_string_lossy().as_ref()])?;
+        Ok(())
+    }
+
+    pub fn board_state(&self) -> Result<BoardState> {
+        let contexts = self
+            .task_context_rows()?
+            .into_iter()
+            .map(|(context, _, _, _)| context)
+            .collect::<Vec<_>>();
         Ok(build_board(contexts, Utc::now()))
     }
 
@@ -1634,6 +2209,84 @@ fn get_task_with_connection(connection: &Connection, id: &str) -> Result<Task> {
         .ok_or(CoreError::NotFound("task"))
 }
 
+fn get_active_timer_session_with_connection(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Option<TaskTimerSession>> {
+    connection
+        .query_row(
+            "SELECT id,task_id,started_at,paused_at,resumed_at,stopped_at,completed_at,
+                    duration_seconds,note,created_at,updated_at
+             FROM task_timer_sessions
+             WHERE task_id=?1 AND stopped_at IS NULL AND completed_at IS NULL
+             ORDER BY started_at DESC LIMIT 1",
+            [task_id],
+            map_timer_session,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn insert_timer_session_with_connection(
+    connection: &Connection,
+    session: &TaskTimerSession,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO task_timer_sessions (
+            id,task_id,started_at,paused_at,resumed_at,stopped_at,completed_at,
+            duration_seconds,note,created_at,updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![
+            session.id,
+            session.task_id,
+            timestamp(session.started_at),
+            session.paused_at.map(timestamp),
+            session.resumed_at.map(timestamp),
+            session.stopped_at.map(timestamp),
+            session.completed_at.map(timestamp),
+            session.duration_seconds,
+            session.note,
+            timestamp(session.created_at),
+            timestamp(session.updated_at),
+        ],
+    )?;
+    Ok(())
+}
+
+fn save_timer_session_with_connection(
+    connection: &Connection,
+    session: &TaskTimerSession,
+) -> Result<()> {
+    changed(
+        connection.execute(
+            "UPDATE task_timer_sessions SET paused_at=?3,resumed_at=?4,stopped_at=?5,
+             completed_at=?6,duration_seconds=?7,note=?8,updated_at=?9 WHERE id=?1 AND task_id=?2",
+            params![
+                session.id,
+                session.task_id,
+                session.paused_at.map(timestamp),
+                session.resumed_at.map(timestamp),
+                session.stopped_at.map(timestamp),
+                session.completed_at.map(timestamp),
+                session.duration_seconds,
+                session.note,
+                timestamp(session.updated_at),
+            ],
+        )?,
+        "timer session",
+    )
+}
+
+fn timer_elapsed_seconds(session: &TaskTimerSession, now: DateTime<Utc>) -> i64 {
+    let stored = session.duration_seconds.unwrap_or(0).max(0);
+    if session.paused_at.is_some() || session.stopped_at.is_some() || session.completed_at.is_some()
+    {
+        return stored;
+    }
+    let run_started = session.resumed_at.unwrap_or(session.started_at);
+    stored + (now - run_started).num_seconds().max(0)
+}
+
 fn save_task_with_connection(connection: &Connection, task: &Task) -> Result<()> {
     let status = task.status.to_string();
     let due_at = task.due_at.map(timestamp);
@@ -1727,6 +2380,287 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         created_at: parse_time(row.get(15)?)?,
         updated_at: parse_time(row.get(16)?)?,
     })
+}
+
+fn map_timer_session(row: &Row<'_>) -> rusqlite::Result<TaskTimerSession> {
+    Ok(TaskTimerSession {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        started_at: parse_time(row.get(2)?)?,
+        paused_at: parse_optional_time(row.get(3)?)?,
+        resumed_at: parse_optional_time(row.get(4)?)?,
+        stopped_at: parse_optional_time(row.get(5)?)?,
+        completed_at: parse_optional_time(row.get(6)?)?,
+        duration_seconds: row.get(7)?,
+        note: row.get(8)?,
+        created_at: parse_time(row.get(9)?)?,
+        updated_at: parse_time(row.get(10)?)?,
+    })
+}
+
+fn map_saved_task_view(row: &Row<'_>) -> rusqlite::Result<SavedTaskView> {
+    let filter_json = row.get::<_, String>(4)?;
+    let sort_json = row.get::<_, String>(5)?;
+    Ok(SavedTaskView {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        slug: row.get(2)?,
+        description: row.get(3)?,
+        filter_json: serde_json::from_str(&filter_json).unwrap_or(serde_json::Value::Null),
+        sort_json: serde_json::from_str(&sort_json).unwrap_or(serde_json::Value::Null),
+        is_system: row.get(6)?,
+        created_at: parse_time(row.get(7)?)?,
+        updated_at: parse_time(row.get(8)?)?,
+        archived_at: parse_optional_time(row.get(9)?)?,
+    })
+}
+
+fn insert_saved_task_view_with_connection(
+    connection: &Connection,
+    view: &SavedTaskView,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO saved_task_views (
+            id,name,slug,description,filter_json,sort_json,is_system,created_at,updated_at,archived_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![
+            view.id,
+            view.name,
+            view.slug,
+            view.description,
+            view.filter_json.to_string(),
+            view.sort_json.to_string(),
+            view.is_system,
+            timestamp(view.created_at),
+            timestamp(view.updated_at),
+            view.archived_at.map(timestamp),
+        ],
+    )?;
+    Ok(())
+}
+
+fn map_scoring_settings(row: &Row<'_>) -> rusqlite::Result<ScoringSettings> {
+    Ok(ScoringSettings {
+        id: row.get(0)?,
+        priority_weight: row.get(1)?,
+        pinned_boost: row.get(2)?,
+        overdue_boost: row.get(3)?,
+        due_soon_boost: row.get(4)?,
+        in_progress_boost: row.get(5)?,
+        blocked_penalty: row.get(6)?,
+        waiting_penalty: row.get(7)?,
+        paused_project_penalty: row.get(8)?,
+        due_soon_window_hours: row.get(9)?,
+        created_at: parse_time(row.get(10)?)?,
+        updated_at: parse_time(row.get(11)?)?,
+    })
+}
+
+fn save_scoring_settings_with_connection(
+    connection: &Connection,
+    settings: &ScoringSettings,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO scoring_settings (
+            id,priority_weight,pinned_boost,overdue_boost,due_soon_boost,in_progress_boost,
+            blocked_penalty,waiting_penalty,paused_project_penalty,due_soon_window_hours,
+            created_at,updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+         ON CONFLICT(id) DO UPDATE SET
+            priority_weight=excluded.priority_weight,
+            pinned_boost=excluded.pinned_boost,
+            overdue_boost=excluded.overdue_boost,
+            due_soon_boost=excluded.due_soon_boost,
+            in_progress_boost=excluded.in_progress_boost,
+            blocked_penalty=excluded.blocked_penalty,
+            waiting_penalty=excluded.waiting_penalty,
+            paused_project_penalty=excluded.paused_project_penalty,
+            due_soon_window_hours=excluded.due_soon_window_hours,
+            updated_at=excluded.updated_at",
+        params![
+            settings.id,
+            settings.priority_weight,
+            settings.pinned_boost,
+            settings.overdue_boost,
+            settings.due_soon_boost,
+            settings.in_progress_boost,
+            settings.blocked_penalty,
+            settings.waiting_penalty,
+            settings.paused_project_penalty,
+            settings.due_soon_window_hours,
+            timestamp(settings.created_at),
+            timestamp(settings.updated_at),
+        ],
+    )?;
+    Ok(())
+}
+
+fn default_scoring_settings(now: DateTime<Utc>) -> ScoringSettings {
+    let weights = ScoringWeights::default();
+    ScoringSettings {
+        id: "default".into(),
+        priority_weight: weights.priority_step,
+        pinned_boost: weights.pinned,
+        overdue_boost: weights.overdue_base,
+        due_soon_boost: weights.due_today,
+        in_progress_boost: weights.in_progress,
+        blocked_penalty: weights.blocked,
+        waiting_penalty: weights.waiting,
+        paused_project_penalty: weights.paused_project,
+        due_soon_window_hours: 24,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn scoring_settings_to_weights(settings: &ScoringSettings) -> ScoringWeights {
+    ScoringWeights {
+        priority_step: settings.priority_weight,
+        project_priority_step: ScoringWeights::default().project_priority_step,
+        pinned: settings.pinned_boost,
+        overdue_base: settings.overdue_boost,
+        overdue_per_day: ScoringWeights::default().overdue_per_day,
+        due_within_hour: settings.due_soon_boost + 20,
+        due_today: settings.due_soon_boost,
+        due_tomorrow: settings.due_soon_boost / 2,
+        in_progress: settings.in_progress_boost,
+        ready: ScoringWeights::default().ready,
+        blocked: settings.blocked_penalty,
+        waiting: settings.waiting_penalty,
+        paused_project: settings.paused_project_penalty,
+    }
+}
+
+fn task_matches_filter(
+    row: &(TaskContext, String, String, Option<String>),
+    filter: &TaskQueryFilter,
+    now: DateTime<Utc>,
+) -> bool {
+    let (context, project_id, organization_id, _) = row;
+    let task = &context.task;
+    if !filter.include_canceled.unwrap_or(false) && task.status == TaskStatus::Canceled {
+        return false;
+    }
+    if !filter.include_done.unwrap_or(false)
+        && matches!(task.status, TaskStatus::Done | TaskStatus::Canceled)
+    {
+        return false;
+    }
+    if let Some(value) = &filter.organization_id
+        && organization_id != value
+    {
+        return false;
+    }
+    if let Some(value) = &filter.project_id
+        && project_id != value
+    {
+        return false;
+    }
+    if let Some(statuses) = &filter.status
+        && !statuses.contains(&task.status)
+    {
+        return false;
+    }
+    if let Some(priorities) = &filter.priority
+        && !priorities.contains(&task.priority)
+    {
+        return false;
+    }
+    if let Some(from) = filter.due_from
+        && !task.due_at.is_some_and(|value| value >= from)
+    {
+        return false;
+    }
+    if let Some(to) = filter.due_to
+        && !task.due_at.is_some_and(|value| value <= to)
+    {
+        return false;
+    }
+    if let Some(from) = filter.scheduled_from
+        && !task.scheduled_at.is_some_and(|value| value >= from)
+    {
+        return false;
+    }
+    if let Some(to) = filter.scheduled_to
+        && !task.scheduled_at.is_some_and(|value| value <= to)
+    {
+        return false;
+    }
+    if let Some(pinned) = filter.pinned
+        && task.pinned != pinned
+    {
+        return false;
+    }
+    if let Some(tags) = &filter.tags
+        && !tags
+            .iter()
+            .all(|tag| task.tags.iter().any(|item| item.eq_ignore_ascii_case(tag)))
+    {
+        return false;
+    }
+    if let Some(text) = &filter.text {
+        let text = text.to_lowercase();
+        let haystack = format!(
+            "{} {} {} {} {}",
+            task.title,
+            task.description.clone().unwrap_or_default(),
+            context.project_name,
+            context.organization_name,
+            task.tags.join(" ")
+        )
+        .to_lowercase();
+        if !haystack.contains(&text) {
+            return false;
+        }
+    }
+    if task.status == TaskStatus::Done {
+        return task
+            .completed_at
+            .is_some_and(|completed| completed.date_naive() == now.date_naive())
+            || filter.include_done.unwrap_or(false);
+    }
+    true
+}
+
+fn sort_task_rows(rows: &mut [TaskWithContext], sort: TaskSort) {
+    rows.sort_by(|a, b| {
+        let ordering = match sort.field {
+            TaskSortField::Urgency => a.urgency_score.cmp(&b.urgency_score),
+            TaskSortField::Priority => b.task.priority.cmp(&a.task.priority),
+            TaskSortField::DueAt => cmp_option_time(a.task.due_at, b.task.due_at),
+            TaskSortField::Status => a.task.status.to_string().cmp(&b.task.status.to_string()),
+            TaskSortField::Project => a.project_name.cmp(&b.project_name),
+            TaskSortField::Organization => a.organization_name.cmp(&b.organization_name),
+            TaskSortField::CreatedAt => a.task.created_at.cmp(&b.task.created_at),
+            TaskSortField::UpdatedAt => a.task.updated_at.cmp(&b.task.updated_at),
+            TaskSortField::Tag => a.task.tags.first().cmp(&b.task.tags.first()),
+        };
+        let ordering = if sort.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        ordering
+            .then_with(|| a.task.priority.cmp(&b.task.priority))
+            .then_with(|| a.task.created_at.cmp(&b.task.created_at))
+    });
+}
+
+fn cmp_option_time(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn csv_cell(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
 }
 
 fn map_sync_event(row: &Row<'_>) -> rusqlite::Result<SyncEvent> {
