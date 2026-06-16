@@ -1,9 +1,14 @@
+use crate::{
+    api,
+    sync::{SyncOnceResult, server_url_hint, status_label, sync_result_summary},
+};
 use chrono::{DateTime, Utc};
 use gloo_timers::callback::Interval;
 use leptos::prelude::*;
 use openmgmt_core::{
     BoardState, NewOrganization, NewProject, NewTask, Organization, OrganizationPatch, Project,
-    ProjectPatch, ProjectStatus, ProjectType, ScoredTask, Task, TaskPatch, TaskStatus,
+    ProjectPatch, ProjectStatus, ProjectType, ScoredTask, SyncConnectionState, SyncSettings,
+    SyncSettingsPatch, SyncStatus, Task, TaskPatch, TaskStatus,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use wasm_bindgen::prelude::*;
@@ -23,6 +28,7 @@ enum Page {
     Project(String),
     Tasks,
     Today,
+    Sync,
 }
 
 #[derive(Clone, Default)]
@@ -257,6 +263,7 @@ pub fn App() -> impl IntoView {
                     <NavButton label="Projects" target=Page::Projects page />
                     <NavButton label="Tasks" target=Page::Tasks page />
                     <NavButton label="Today" target=Page::Today page />
+                    <NavButton label="Sync" target=Page::Sync page />
                 </nav>
                 <div class="sidebar-actions">
                     <button class="ghost dark" on:click=move |_| state.refresh()>"Refresh data"</button>
@@ -292,6 +299,7 @@ pub fn App() -> impl IntoView {
                     Page::Today => view! {
                         <TodayView board=Signal::derive(move || state.snapshot.get().board) state />
                     }.into_any(),
+                    Page::Sync => view! { <SyncView /> }.into_any(),
                 }}
             </main>
         </div>
@@ -324,6 +332,310 @@ fn NavButton(label: &'static str, target: Page, page: RwSignal<Page>) -> impl In
 fn Header(eyebrow: &'static str, title: &'static str, description: &'static str) -> impl IntoView {
     view! {
         <header class="page-header"><div><p class="eyebrow">{eyebrow}</p><h1>{title}</h1><p>{description}</p></div></header>
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SyncViewState {
+    settings: RwSignal<Option<SyncSettings>>,
+    status: RwSignal<Option<SyncStatus>>,
+    enabled: RwSignal<bool>,
+    server_url: RwSignal<String>,
+    device_name: RwSignal<String>,
+    loading: RwSignal<bool>,
+    action: RwSignal<Option<&'static str>>,
+    error: RwSignal<Option<String>>,
+    notice: RwSignal<Option<String>>,
+    result: RwSignal<Option<SyncOnceResult>>,
+}
+
+impl SyncViewState {
+    fn load(self) {
+        spawn_local(async move {
+            self.reload().await;
+        });
+    }
+
+    async fn reload(self) {
+        self.loading.set(true);
+        let settings = api::get_sync_settings().await;
+        let status = api::get_sync_status().await;
+        match settings {
+            Ok(settings) => {
+                self.enabled.set(settings.enabled);
+                self.server_url
+                    .set(settings.server_url.clone().unwrap_or_default());
+                self.device_name.set(settings.device_name.clone());
+                self.settings.set(Some(settings));
+            }
+            Err(error) => self
+                .error
+                .set(Some(format!("Could not load sync settings: {error}"))),
+        }
+        match status {
+            Ok(status) => self.status.set(Some(status)),
+            Err(error) => self
+                .error
+                .set(Some(format!("Could not load sync status: {error}"))),
+        }
+        self.loading.set(false);
+    }
+
+    async fn reload_status(self) {
+        match api::get_sync_status().await {
+            Ok(status) => self.status.set(Some(status)),
+            Err(error) => self
+                .error
+                .set(Some(format!("Could not reload sync status: {error}"))),
+        }
+    }
+
+    fn start_action(self, action: &'static str) {
+        self.action.set(Some(action));
+        self.error.set(None);
+        self.notice.set(None);
+    }
+
+    fn finish_action(self) {
+        self.action.set(None);
+    }
+}
+
+fn format_sync_time(value: Option<DateTime<Utc>>) -> String {
+    let Some(value) = value else {
+        return "Never".into();
+    };
+    let date = js_sys::Date::new(&JsValue::from_f64(value.timestamp_millis() as f64));
+    date.to_locale_string("en-US", &JsValue::UNDEFINED).into()
+}
+
+#[component]
+fn SyncView() -> impl IntoView {
+    let state = SyncViewState {
+        settings: RwSignal::new(None),
+        status: RwSignal::new(None),
+        enabled: RwSignal::new(false),
+        server_url: RwSignal::new(String::new()),
+        device_name: RwSignal::new(String::new()),
+        loading: RwSignal::new(true),
+        action: RwSignal::new(None),
+        error: RwSignal::new(None),
+        notice: RwSignal::new(None),
+        result: RwSignal::new(None),
+    };
+    state.load();
+
+    view! {
+        <Header
+            eyebrow="OPTIONAL SYNC"
+            title="Sync"
+            description="Connect this local workspace to an OpenMgmt server when you choose."
+        />
+        <section class="panel sync-intro">
+            <p>"OpenMgmt is local-first. Sync is optional. You can run an OpenMgmt server locally or in the cloud. Manual sync pushes local changes and pulls remote changes."</p>
+        </section>
+
+        {move || state.loading.get().then(|| view! {
+            <div class="loading-bar">"Loading sync settings..."</div>
+        })}
+        {move || state.error.get().map(|message| view! {
+            <div class="feedback error">
+                <span>{message}</span>
+                <button on:click=move |_| state.error.set(None)>"Dismiss"</button>
+            </div>
+        })}
+        {move || state.notice.get().map(|message| view! {
+            <div class="feedback notice">
+                <span>{message}</span>
+                <button on:click=move |_| state.notice.set(None)>"Dismiss"</button>
+            </div>
+        })}
+
+        <section class="sync-grid">
+            <form class="panel sync-form" on:submit=move |event| {
+                event.prevent_default();
+                state.start_action("save");
+                let patch = SyncSettingsPatch {
+                    enabled: Some(state.enabled.get()),
+                    server_url: Some(optional_text(state.server_url.get())),
+                    device_name: Some(state.device_name.get()),
+                    ..SyncSettingsPatch::default()
+                };
+                spawn_local(async move {
+                    match api::update_sync_settings(patch).await {
+                        Ok(settings) => {
+                            state.settings.set(Some(settings));
+                            state.notice.set(Some("Sync settings saved.".into()));
+                        }
+                        Err(error) => state.error.set(Some(format!("Could not save sync settings: {error}"))),
+                    }
+                    state.reload_status().await;
+                    state.finish_action();
+                });
+            }>
+                <div class="section-title">
+                    <div><p class="eyebrow">CONFIGURATION</p><h2>"Device settings"</h2></div>
+                </div>
+                <label class="sync-toggle">
+                    <input
+                        type="checkbox"
+                        prop:checked=move || state.enabled.get()
+                        on:change=move |event| state.enabled.set(event_target_checked(&event))
+                    />
+                    <span><strong>"Enable sync"</strong><small>"Local data remains available when sync is off."</small></span>
+                </label>
+                <label class="field">
+                    <span>"Server URL"</span>
+                    <input
+                        type="url"
+                        placeholder="http://127.0.0.1:8787"
+                        prop:value=move || state.server_url.get()
+                        on:input=move |event| state.server_url.set(event_target_value(&event))
+                    />
+                    {move || server_url_hint(&state.server_url.get()).map(|hint| view! {
+                        <small class="field-hint warning">{hint}</small>
+                    })}
+                    {move || (state.enabled.get() && state.server_url.get().trim().is_empty()).then(|| view! {
+                        <small class="field-hint">"Sync will be saved as enabled but Not configured."</small>
+                    })}
+                </label>
+                <label class="field">
+                    <span>"Device name"</span>
+                    <input
+                        type="text"
+                        placeholder="Local device"
+                        prop:value=move || state.device_name.get()
+                        on:input=move |event| state.device_name.set(event_target_value(&event))
+                    />
+                </label>
+                <button class="primary" disabled=move || state.action.get().is_some()>
+                    {move || if state.action.get() == Some("save") { "Saving..." } else { "Save settings" }}
+                </button>
+            </form>
+
+            <section class="panel sync-status-panel">
+                <div class="section-title">
+                    <div><p class="eyebrow">CONNECTION</p><h2>"Sync status"</h2></div>
+                    {move || {
+                        let syncing = state.action.get() == Some("sync");
+                        let status = state.status.get();
+                        let connection_state = if syncing {
+                            SyncConnectionState::Syncing
+                        } else {
+                            status.as_ref().map(|status| status.state).unwrap_or(SyncConnectionState::Disabled)
+                        };
+                        view! {
+                            <span class=format!("sync-badge {}", status_class(connection_state))>
+                                {status_label(connection_state)}
+                            </span>
+                        }
+                    }}
+                </div>
+                {move || state.status.get().map(|status| view! {
+                    <dl class="sync-details">
+                        <div><dt>"Device name"</dt><dd>{status.device_name}</dd></div>
+                        <div><dt>"Unsynced events"</dt><dd class="sync-count">{status.unsynced_event_count}</dd></div>
+                        <div><dt>"Server"</dt><dd>{status.server_url.unwrap_or_else(|| "Not configured".into())}</dd></div>
+                        <div><dt>"Last attempted"</dt><dd>{format_sync_time(status.last_attempted_sync_at)}</dd></div>
+                        <div><dt>"Last successful"</dt><dd>{format_sync_time(status.last_successful_sync_at)}</dd></div>
+                    </dl>
+                    <details class="device-id">
+                        <summary>"Device ID"</summary>
+                        <code>{status.device_id}</code>
+                    </details>
+                })}
+                {move || state.status.get().and_then(|status| status.last_error).map(|error| view! {
+                    <div class="sync-error-box">
+                        <strong>"Last sync error"</strong>
+                        <p>{error}</p>
+                        <button
+                            class="ghost"
+                            disabled=move || state.action.get().is_some()
+                            on:click=move |_| {
+                                state.start_action("clear");
+                                spawn_local(async move {
+                                    match api::clear_sync_error().await {
+                                        Ok(status) => {
+                                            state.status.set(Some(status));
+                                            state.notice.set(Some("Sync error cleared.".into()));
+                                        }
+                                        Err(error) => state.error.set(Some(format!("Could not clear sync error: {error}"))),
+                                    }
+                                    state.finish_action();
+                                });
+                            }
+                        >{move || if state.action.get() == Some("clear") { "Clearing..." } else { "Clear error" }}</button>
+                    </div>
+                })}
+                <div class="sync-actions">
+                    <button
+                        class="ghost"
+                        disabled=move || state.action.get().is_some()
+                        on:click=move |_| {
+                            state.start_action("test");
+                            spawn_local(async move {
+                                match api::test_sync_connection().await {
+                                    Ok(result) => {
+                                        let server = result.server_name.unwrap_or_else(|| "OpenMgmt server".into());
+                                        state.notice.set(Some(format!(
+                                            "Connection successful: {server}, protocol {}.",
+                                            result.protocol_version
+                                        )));
+                                    }
+                                    Err(error) => state.error.set(Some(format!("Connection test failed: {error}"))),
+                                }
+                                state.reload_status().await;
+                                state.finish_action();
+                            });
+                        }
+                    >{move || if state.action.get() == Some("test") { "Testing..." } else { "Test connection" }}</button>
+                    <button
+                        class="primary"
+                        disabled=move || state.action.get().is_some()
+                        on:click=move |_| {
+                            state.start_action("sync");
+                            spawn_local(async move {
+                                match api::sync_now().await {
+                                    Ok(result) => {
+                                        state.notice.set(Some(sync_result_summary(&result)));
+                                        state.result.set(Some(result));
+                                    }
+                                    Err(error) => state.error.set(Some(format!("Sync failed: {error}"))),
+                                }
+                                state.reload_status().await;
+                                state.finish_action();
+                            });
+                        }
+                    >{move || if state.action.get() == Some("sync") { "Syncing..." } else { "Sync now" }}</button>
+                </div>
+            </section>
+        </section>
+
+        {move || state.result.get().map(|result| view! {
+            <section class="panel">
+                <div class="section-title"><div><p class="eyebrow">LATEST RUN</p><h2>"Sync result"</h2></div></div>
+                <div class="sync-result">
+                    <div><span>"Pushed"</span><strong>{result.pushed_event_count}</strong></div>
+                    <div><span>"Accepted"</span><strong>{result.accepted_event_count}</strong></div>
+                    <div><span>"Rejected"</span><strong>{result.rejected_event_count}</strong></div>
+                    <div><span>"Pulled"</span><strong>{result.pulled_event_count}</strong></div>
+                    <div><span>"Applied"</span><strong>{result.applied_event_count}</strong></div>
+                </div>
+                {result.server_checkpoint.map(|checkpoint| view! {
+                    <p class="checkpoint"><span>"Checkpoint"</span><code>{checkpoint}</code></p>
+                })}
+            </section>
+        })}
+    }
+}
+
+fn status_class(state: SyncConnectionState) -> &'static str {
+    match state {
+        SyncConnectionState::Disabled => "disabled",
+        SyncConnectionState::NotConfigured => "not-configured",
+        SyncConnectionState::Ready => "ready",
+        SyncConnectionState::Syncing => "syncing",
+        SyncConnectionState::Error => "error",
     }
 }
 

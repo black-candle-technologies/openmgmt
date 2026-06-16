@@ -1,0 +1,13 @@
+services:
+  server:
+    build: .
+    ports:
+      - "8787:8787"
+    environment:
+      OPENMGMT_SERVER_BIND_ADDR: "0.0.0.0:8787"
+      OPENMGMT_SERVER_DATABASE_PATH: /data/openmgmt-server.sqlite
+    volumes:
+      - server-data:/data
+
+volumes:
+  server-data:
