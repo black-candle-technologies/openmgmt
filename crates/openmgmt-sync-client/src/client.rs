@@ -233,7 +233,7 @@ mod tests {
     use axum::{Json, Router, extract::State, routing::post};
     use openmgmt_core::{
         Database, Organization, Project, ProjectStatus, ProjectType, SyncEntityType, SyncOperation,
-        SyncSettingsPatch,
+        SyncSettingsPatch, Task, TaskStatus,
     };
     use openmgmt_protocol::{
         DeviceRegistrationRequest, DeviceRegistrationResponse, PROTOCOL_VERSION, SyncEvent,
@@ -590,7 +590,10 @@ mod tests {
             database.get_sync_state(CHECKPOINT_KEY).unwrap().as_deref(),
             Some("checkpoint-1")
         );
-        assert_eq!(database.get_task("remote-task").unwrap().title, "Remote Task");
+        assert_eq!(
+            database.get_task("remote-task").unwrap().title,
+            "Remote Task"
+        );
     }
 
     #[tokio::test]

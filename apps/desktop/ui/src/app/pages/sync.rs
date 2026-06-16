@@ -286,7 +286,7 @@ fn format_sync_time(value: Option<DateTime<Utc>>) -> String {
         return "Never".into();
     };
     let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
-        value.timestamp_millis() as f64,
+        value.timestamp_millis() as f64
     ));
     date.to_locale_string("en-US", &wasm_bindgen::JsValue::UNDEFINED)
         .into()
