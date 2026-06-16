@@ -11,7 +11,7 @@ use openmgmt_core::{
 use serde_json::json;
 use wasm_bindgen_futures::spawn_local;
 
-use super::components::{FormField, IconButton};
+use super::components::{FormField, IconButton, priority_label};
 use super::state::*;
 
 /// Renders the active drawer (if any) as an overlay panel.
@@ -305,7 +305,7 @@ fn ProjectForm(
             <div class="form-row">
                 <FormField label="Priority">
                     <select node_ref=priority>
-                        {(1..=5).map(|value| view! { <option value=value selected=value==init_priority>{format!("P{value}")}</option> }).collect_view()}
+                        {(1..=5).map(|value| view! { <option value=value selected=value==init_priority>{format!("P{value} · {}", priority_label(value))}</option> }).collect_view()}
                     </select>
                 </FormField>
                 <FormField label="Deadline">
@@ -484,7 +484,7 @@ fn TaskForm(
                 </FormField>
                 <FormField label="Priority">
                     <select node_ref=priority>
-                        {(1..=5).map(|value| view! { <option value=value selected=value==init_priority>{format!("P{value}")}</option> }).collect_view()}
+                        {(1..=5).map(|value| view! { <option value=value selected=value==init_priority>{format!("P{value} · {}", priority_label(value))}</option> }).collect_view()}
                     </select>
                 </FormField>
             </div>

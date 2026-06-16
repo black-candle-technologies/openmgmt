@@ -38,9 +38,24 @@ impl Default for ScoringWeights {
     }
 }
 
+/// Highest (most urgent) selectable priority. Priorities run P1..P5 where a
+/// **lower number is more urgent**, so P1 is the highest priority and P5 the
+/// lowest/backlog.
+pub const HIGHEST_PRIORITY: i32 = 1;
+/// Lowest (least urgent) selectable priority.
+pub const LOWEST_PRIORITY: i32 = 5;
+
+/// Convert a 1–5 priority (P1 highest) into an urgency rank where a higher
+/// number means more urgent: P1 → 5, P3 → 3, P5 → 1. Scoring multiplies this
+/// rank (not the raw priority) so a P1 task always outscores a P5 task. Stray
+/// values are clamped into the valid range.
+pub fn priority_rank(priority: i32) -> i32 {
+    LOWEST_PRIORITY + 1 - priority.clamp(HIGHEST_PRIORITY, LOWEST_PRIORITY)
+}
+
 pub fn score_task(task: &TaskContext, now: DateTime<Utc>, weights: ScoringWeights) -> i32 {
-    let mut score = task.task.priority * weights.priority_step
-        + task.project_priority * weights.project_priority_step;
+    let mut score = priority_rank(task.task.priority) * weights.priority_step
+        + priority_rank(task.project_priority) * weights.project_priority_step;
     if task.task.pinned {
         score += weights.pinned;
     }
@@ -116,6 +131,20 @@ mod tests {
         urgent.task.status = TaskStatus::InProgress;
         urgent.task.due_at = Some(now - Duration::days(1));
         assert!(score_task(&urgent, now, ScoringWeights::default()) > baseline + 200);
+    }
+
+    #[test]
+    fn p1_outranks_p5() {
+        let now = Utc::now();
+        let mut highest = context();
+        highest.task.priority = 1;
+        let mut lowest = context();
+        lowest.task.priority = 5;
+        assert!(
+            score_task(&highest, now, ScoringWeights::default())
+                > score_task(&lowest, now, ScoringWeights::default()),
+            "P1 must score higher than P5"
+        );
     }
 
     #[test]

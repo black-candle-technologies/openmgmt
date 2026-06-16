@@ -72,10 +72,22 @@ pub fn StatusBadge(#[prop(into)] status: String) -> impl IntoView {
     view! { <span class=format!("badge badge-{tone}")>{label}</span> }
 }
 
-/// Priority chip (`P1`..`P5`), coloured by severity.
+/// Human label for a priority value. P1 is the highest priority, P5 the lowest.
+pub fn priority_label(value: i32) -> &'static str {
+    match value {
+        1 => "Highest",
+        2 => "High",
+        3 => "Medium",
+        4 => "Low",
+        _ => "Lowest",
+    }
+}
+
+/// Priority chip (`P1`..`P5`), coloured by severity. P1 is the highest priority.
 #[component]
 pub fn PriorityBadge(value: i32) -> impl IntoView {
-    view! { <span class=format!("priority priority-p{value}") title=format!("Priority {value}")>{format!("P{value}")}</span> }
+    let title = format!("P{value} · {} priority", priority_label(value));
+    view! { <span class=format!("priority priority-p{value}") title=title>{format!("P{value}")}</span> }
 }
 
 /// Standard page header with eyebrow, title, optional description, and an

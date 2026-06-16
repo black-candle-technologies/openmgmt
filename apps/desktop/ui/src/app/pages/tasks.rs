@@ -69,7 +69,7 @@ fn sort_tasks(tasks: &mut [Task], sort: TaskSort, snapshot: &Snapshot) {
                     .then_with(|| is_overdue(b, now).cmp(&is_overdue(a, now)))
                     .then_with(|| status_rank(b.status).cmp(&status_rank(a.status)))
                     .then_with(|| due_key(a).cmp(&due_key(b)))
-                    .then_with(|| b.priority.cmp(&a.priority))
+                    .then_with(|| a.priority.cmp(&b.priority))
             });
         }
         TaskSort::Priority => tasks.sort_by(|a, b| {
@@ -81,7 +81,7 @@ fn sort_tasks(tasks: &mut [Task], sort: TaskSort, snapshot: &Snapshot) {
         TaskSort::Status => tasks.sort_by(|a, b| {
             status_rank(b.status)
                 .cmp(&status_rank(a.status))
-                .then_with(|| b.priority.cmp(&a.priority))
+                .then_with(|| a.priority.cmp(&b.priority))
         }),
         TaskSort::Project => tasks.sort_by(|a, b| {
             let pa = snapshot
@@ -92,17 +92,17 @@ fn sort_tasks(tasks: &mut [Task], sort: TaskSort, snapshot: &Snapshot) {
                 .project_name(&b.project_id)
                 .unwrap_or_default()
                 .to_lowercase();
-            pa.cmp(&pb).then_with(|| b.priority.cmp(&a.priority))
+            pa.cmp(&pb).then_with(|| a.priority.cmp(&b.priority))
         }),
         TaskSort::Tag => tasks.sort_by(|a, b| {
             let ta = a.tags.first().map(|tag| tag.to_lowercase());
             let tb = b.tags.first().map(|tag| tag.to_lowercase());
             // Tasks with tags sort before those without.
             match (ta, tb) {
-                (Some(x), Some(y)) => x.cmp(&y).then_with(|| b.priority.cmp(&a.priority)),
+                (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.priority.cmp(&b.priority)),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => b.priority.cmp(&a.priority),
+                (None, None) => a.priority.cmp(&b.priority),
             }
         }),
     }
