@@ -1,0 +1,13 @@
+.git
+.gitignore
+
+target
+data
+
+apps/desktop/src-tauri/gen
+apps/desktop/ui/dist
+.trunk
+
+*.log
+.DS_Store
+Thumbs.db

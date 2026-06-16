@@ -15,6 +15,11 @@ The Tauri desktop shell exposes three manual sync commands:
 - `clear_sync_error` clears the locally stored sync error without changing the
   configured server or disabling sync.
 
+The desktop UI exposes these actions from the **Sync** sidebar page. See
+[`SYNC_UI.md`](SYNC_UI.md) for the manual verification checklist.
+
+There is still no background sync loop. Real authentication, advanced conflict
+resolution, and multi-user task requests are also not implemented yet.
 This step does not add a background sync loop or a full settings interface.
 Real authentication, advanced conflict resolution, and multi-user task
 requests are also not implemented yet.

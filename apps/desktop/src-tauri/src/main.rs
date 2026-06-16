@@ -10,10 +10,10 @@ fn main() {
 
     let database =
         Database::open(default_database_path()).expect("failed to open OpenMgmt database");
-    database.seed().expect("failed to seed OpenMgmt database");
 
     tauri::Builder::default()
         .manage(AppService::new(database))
+        .manage(commands::SyncRuntimeState::default())
         .invoke_handler(tauri::generate_handler![
             commands::list_organizations,
             commands::create_organization,
@@ -34,7 +34,12 @@ fn main() {
             commands::complete_task,
             commands::block_task,
             commands::unblock_task,
-            commands::seed_database,
+            commands::get_sync_settings,
+            commands::update_sync_settings,
+            commands::get_sync_status,
+            commands::sync_now,
+            commands::test_sync_connection,
+            commands::clear_sync_error,
             commands::open_tv_board_window,
         ])
         .run(tauri::generate_context!())
