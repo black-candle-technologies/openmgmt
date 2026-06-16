@@ -314,7 +314,9 @@ impl Database {
             skipped_local_echo_count: 0,
             results: Vec::with_capacity(events.len()),
         };
-        for event in events {
+        let mut ordered_events = events.iter().collect::<Vec<_>>();
+        ordered_events.sort_by_key(|event| remote_apply_dependency_rank(event.entity_type));
+        for event in ordered_events {
             let applied = self.apply_remote_sync_event(event)?;
             match applied.status {
                 RemoteApplyStatus::Applied => result.applied_count += 1,
@@ -1303,6 +1305,14 @@ fn parse_sync_state_time(key: &str, value: Option<String>) -> Result<Option<Date
         .transpose()
 }
 
+fn remote_apply_dependency_rank(entity_type: SyncEntityType) -> u8 {
+    match entity_type {
+        SyncEntityType::Organization => 0,
+        SyncEntityType::Project => 1,
+        SyncEntityType::Task => 2,
+    }
+}
+
 fn normalize_optional(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let value = value.trim();
@@ -2050,6 +2060,43 @@ mod tests {
         let result = db
             .apply_remote_sync_events(&[organization_event, project_event, task_event])
             .unwrap();
+        assert_eq!(result.applied_count, 3);
+        assert_eq!(db.get_task("task-1").unwrap().title, "Remote Task");
+        assert!(db.list_unsynced_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remote_batches_apply_dependency_order_even_when_pulled_out_of_order() {
+        let db = Database::in_memory().unwrap();
+        let organization = remote_organization("org-1");
+        let project = remote_project("project-1", &organization.id);
+        let task = remote_task("task-1", &project.id);
+        let organization_event = remote_event(
+            "event-1",
+            SyncEntityType::Organization,
+            &organization.id,
+            SyncOperation::Created,
+            serde_json::json!({"entity": organization}),
+        );
+        let project_event = remote_event(
+            "event-2",
+            SyncEntityType::Project,
+            &project.id,
+            SyncOperation::Created,
+            serde_json::json!({"entity": project}),
+        );
+        let task_event = remote_event(
+            "event-3",
+            SyncEntityType::Task,
+            &task.id,
+            SyncOperation::Created,
+            serde_json::json!({"entity": task}),
+        );
+
+        let result = db
+            .apply_remote_sync_events(&[task_event, project_event, organization_event])
+            .unwrap();
+
         assert_eq!(result.applied_count, 3);
         assert_eq!(db.get_task("task-1").unwrap().title, "Remote Task");
         assert!(db.list_unsynced_events().unwrap().is_empty());

@@ -143,11 +143,6 @@ pub fn get_board_state(service: State<'_, AppService>) -> CommandResult<BoardSta
 }
 
 #[tauri::command]
-pub fn seed_database(service: State<'_, AppService>) -> CommandResult<()> {
-    core(service.seed_database())
-}
-
-#[tauri::command]
 pub fn get_sync_settings(service: State<'_, AppService>) -> CommandResult<SyncSettings> {
     core(service.get_sync_settings())
 }

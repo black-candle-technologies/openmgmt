@@ -21,7 +21,6 @@ is no Node.js, npm, pnpm, Corepack, React, Vite, Electron, or hosted service.
 - Tuneable urgency scoring and seven-column auto-shifting board
 - Dedicated fullscreen TV board with manual refresh and 10-second auto-refresh
 - Local SQLite database at `data/openmgmt.sqlite`
-- Idempotent database seed that repairs partially seeded databases
 - Claude and MCP-compatible AI access through a separate rmcp server
 - Read-only MCP by default, with explicit opt-in writes
 
@@ -51,18 +50,10 @@ Set-Location apps/desktop/src-tauri
 cargo tauri dev
 ```
 
-The app migrates and seeds the database on startup. Select **Open TV Board** to
-open a separate, frameless fullscreen Tauri window. The main app and TV board
-use the same repository-local `data/openmgmt.sqlite` file.
-
-## Seed the database
-
-Startup seeding creates the default organizations, the OpenMgmt project, and
-tasks in several statuses. It is safe to run repeatedly. To repair or reload
-seed data while the app is open, select **Seed database** in the sidebar.
-
-The seed includes active, overdue, blocked, scheduled, inbox, and in-progress
-tasks so the TV board has useful data on a new database.
+The app migrates the database on startup without adding demo data. Select
+**Open TV Board** to open a separate, frameless fullscreen Tauri window. The
+main app and TV board use the same repository-local `data/openmgmt.sqlite`
+file.
 
 ## Supported MVP workflow
 
@@ -121,7 +112,6 @@ After `cargo tauri dev` opens the app:
 4. Select **Done** and confirm it appears in Done Today.
 5. Block another task with a reason, unblock it, and cancel a disposable task.
 6. Select **Open TV Board** and confirm task cards and all seven columns render.
-7. Select **Seed database** twice and confirm it succeeds without duplicates.
 
 ## Known MVP limitations
 

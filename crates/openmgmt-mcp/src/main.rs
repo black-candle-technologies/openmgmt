@@ -14,7 +14,6 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let database = Database::open(default_database_path()).context("open database")?;
-    database.seed().context("seed database")?;
     let writes_enabled = std::env::var("OPENMGMT_MCP_WRITE_ENABLED")
         .is_ok_and(|value| value.eq_ignore_ascii_case("true"));
     let server = OpenMgmtMcp::new(AppService::new(database), writes_enabled);

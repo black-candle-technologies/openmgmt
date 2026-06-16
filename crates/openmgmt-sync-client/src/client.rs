@@ -373,6 +373,77 @@ mod tests {
         }
     }
 
+    fn remote_project_event(event_id: &str) -> SyncEvent {
+        let now = chrono::Utc::now();
+        let project = Project {
+            id: "remote-project".into(),
+            organization_id: "remote-org".into(),
+            name: "Remote Project".into(),
+            slug: "remote-project".into(),
+            description: None,
+            project_type: ProjectType::Software,
+            status: ProjectStatus::Active,
+            priority: 3,
+            deadline: None,
+            repo_url: None,
+            notes: None,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+        };
+        SyncEvent {
+            event_id: event_id.into(),
+            device_id: "other-device".into(),
+            actor_user_id: None,
+            target_user_id: None,
+            workspace_id: None,
+            sequence: 2,
+            entity_type: SyncEntityType::Project,
+            entity_id: project.id.clone(),
+            operation: SyncOperation::Created,
+            payload_json: serde_json::json!({"entity": project}),
+            created_at: now,
+            synced_at: None,
+        }
+    }
+
+    fn remote_task_event(event_id: &str) -> SyncEvent {
+        let now = chrono::Utc::now();
+        let task = Task {
+            id: "remote-task".into(),
+            project_id: "remote-project".into(),
+            title: "Remote Task".into(),
+            description: None,
+            status: TaskStatus::Inbox,
+            priority: 3,
+            due_at: None,
+            scheduled_at: None,
+            started_at: None,
+            completed_at: None,
+            estimated_minutes: None,
+            time_limit_minutes: None,
+            pinned: false,
+            blocked_reason: None,
+            tags: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        SyncEvent {
+            event_id: event_id.into(),
+            device_id: "other-device".into(),
+            actor_user_id: None,
+            target_user_id: None,
+            workspace_id: None,
+            sequence: 3,
+            entity_type: SyncEntityType::Task,
+            entity_id: task.id.clone(),
+            operation: SyncOperation::Created,
+            payload_json: serde_json::json!({"entity": task}),
+            created_at: now,
+            synced_at: None,
+        }
+    }
+
     #[tokio::test]
     async fn disabled_sync_returns_disabled() {
         let database = Database::in_memory().unwrap();
@@ -490,6 +561,36 @@ mod tests {
             Some("checkpoint-1")
         );
         assert_eq!(database.list_organizations().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn out_of_order_remote_dependencies_apply_and_advance_checkpoint() {
+        let (server_url, _) = test_server(
+            vec![
+                remote_task_event("remote-task-event"),
+                remote_project_event("remote-project-event"),
+                remote_organization_event("remote-organization-event"),
+            ],
+            false,
+        )
+        .await;
+        let database = configured_database(Some(server_url));
+        database
+            .set_sync_state(CHECKPOINT_KEY, "checkpoint-0")
+            .unwrap();
+
+        let result = OpenMgmtSyncClient::new(SyncClientConfig::default())
+            .sync_once(&database)
+            .await
+            .unwrap();
+
+        assert_eq!(result.pulled_event_count, 3);
+        assert_eq!(result.applied_event_count, 3);
+        assert_eq!(
+            database.get_sync_state(CHECKPOINT_KEY).unwrap().as_deref(),
+            Some("checkpoint-1")
+        );
+        assert_eq!(database.get_task("remote-task").unwrap().title, "Remote Task");
     }
 
     #[tokio::test]

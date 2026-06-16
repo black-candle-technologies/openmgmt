@@ -267,16 +267,6 @@ pub fn App() -> impl IntoView {
                 </nav>
                 <div class="sidebar-actions">
                     <button class="ghost dark" on:click=move |_| state.refresh()>"Refresh data"</button>
-                    <button class="ghost dark" on:click=move |_| {
-                        spawn_local(async move {
-                            finish_action(
-                                state,
-                                invoke::<()>("seed_database", serde_json::json!({})).await,
-                                "Database seed is ready.",
-                                "Seed failed",
-                            ).await;
-                        });
-                    }>"Seed database"</button>
                     <button class="primary tv" on:click=move |_| {
                         spawn_local(async move {
                             match invoke::<()>("open_tv_board_window", serde_json::json!({})).await {
@@ -656,7 +646,7 @@ fn Dashboard(state: AppState) -> impl IntoView {
                     let board=state.snapshot.get().board;
                     let tasks=board.now.into_iter().chain(board.overdue).chain(board.due_soon).take(7).collect::<Vec<_>>();
                     if tasks.is_empty() {
-                        view! { <div class="empty">"No urgent tasks. Seed the database or create a task."</div> }.into_any()
+                        view! { <div class="empty">"No urgent tasks. Create a task to populate the queue."</div> }.into_any()
                     } else {
                         tasks.into_iter().map(|item| view! {
                             <TaskCard task=item.context.task project=item.context.project_name state />
@@ -1241,7 +1231,7 @@ fn BoardView(
             {move ||error.get().map(|message|view!{<div class="board-message error">{message}</div>})}
             {move ||loading.get().then(||view!{<div class="board-message">"Refreshing board..."</div>})}
             {move ||(!loading.get() && error.get().is_none() && board_task_count(&board.get())==0).then(||view!{
-                <div class="board-empty"><h2>"No board tasks"</h2><p>"Create an active task or run Seed Database in the main window."</p></div>
+                <div class="board-empty"><h2>"No board tasks"</h2><p>"Create an active task in the main window."</p></div>
             })}
             <section class="board-columns">
                 <BoardColumn title="NOW" tasks=Signal::derive(move ||board.get().now) class="now" />
