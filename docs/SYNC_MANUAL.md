@@ -20,3 +20,6 @@ The desktop UI exposes these actions from the **Sync** sidebar page. See
 
 There is still no background sync loop. Real authentication, advanced conflict
 resolution, and multi-user task requests are also not implemented yet.
+This step does not add a background sync loop or a full settings interface.
+Real authentication, advanced conflict resolution, and multi-user task
+requests are also not implemented yet.
