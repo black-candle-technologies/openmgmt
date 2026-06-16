@@ -616,7 +616,7 @@ impl Database {
                     p.deadline,p.repo_url,p.notes,p.created_at,p.updated_at,p.archived_at
              FROM projects p JOIN organizations o ON o.id=p.organization_id
              WHERE p.archived_at IS NULL AND p.status != 'archived' AND o.archived_at IS NULL
-             ORDER BY p.priority DESC,p.name",
+             ORDER BY p.priority ASC,p.name",
         )?;
         Ok(statement
             .query_map([], map_project)?
@@ -785,7 +785,7 @@ impl Database {
              JOIN organizations o ON o.id=p.organization_id
              WHERE t.status != 'canceled' AND p.archived_at IS NULL
                AND p.status != 'archived' AND o.archived_at IS NULL
-             ORDER BY t.priority DESC,t.created_at",
+             ORDER BY t.priority ASC,t.created_at",
         )?;
         Ok(statement
             .query_map([], map_task)?
@@ -1057,7 +1057,8 @@ impl Database {
                     description: Some("Local-first project and task operations console.".into()),
                     project_type: ProjectType::Software,
                     status: ProjectStatus::Active,
-                    priority: 5,
+                    // P1 = highest priority.
+                    priority: 1,
                     deadline: None,
                     repo_url: Some("https://github.com/LaneBucher/openmgmt".into()),
                     notes: None,
@@ -1067,11 +1068,13 @@ impl Database {
         })?;
 
         let now = Utc::now();
+        // Priorities use P1 = highest .. P5 = lowest, so the most urgent seed
+        // work (in-progress MVP, overdue decision) is P1/P2.
         let seeds = [
             (
                 "Review the MVP on the TV board",
                 TaskStatus::InProgress,
-                5,
+                1,
                 Some(now + Duration::hours(2)),
                 Some(now),
                 true,
@@ -1089,7 +1092,7 @@ impl Database {
             (
                 "Resolve overdue launch decision",
                 TaskStatus::Ready,
-                4,
+                2,
                 Some(now - Duration::hours(3)),
                 None,
                 false,
@@ -1098,7 +1101,7 @@ impl Database {
             (
                 "Confirm external dependency",
                 TaskStatus::Blocked,
-                4,
+                2,
                 Some(now + Duration::hours(8)),
                 None,
                 false,
@@ -1107,7 +1110,7 @@ impl Database {
             (
                 "Plan the afternoon review",
                 TaskStatus::Scheduled,
-                2,
+                4,
                 Some(now + Duration::hours(30)),
                 Some(now + Duration::hours(4)),
                 false,
@@ -1116,7 +1119,7 @@ impl Database {
             (
                 "Capture launch notes",
                 TaskStatus::Inbox,
-                2,
+                4,
                 None,
                 None,
                 false,

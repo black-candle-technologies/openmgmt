@@ -3,7 +3,7 @@ use openmgmt_core::{
     Project, ProjectPatch, SyncSettings, SyncSettingsPatch, SyncStatus, Task, TaskPatch,
 };
 use openmgmt_sync_client::{SyncConnectionTestResult, SyncOnceResult};
-use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::{Mutex, MutexGuard};
 
 type CommandResult<T> = Result<T, String>;
@@ -143,6 +143,11 @@ pub fn get_board_state(service: State<'_, AppService>) -> CommandResult<BoardSta
 }
 
 #[tauri::command]
+pub fn seed_database(service: State<'_, AppService>) -> CommandResult<()> {
+    core(service.seed_database())
+}
+
+#[tauri::command]
 pub fn get_sync_settings(service: State<'_, AppService>) -> CommandResult<SyncSettings> {
     core(service.get_sync_settings())
 }
@@ -193,19 +198,95 @@ pub fn clear_sync_error(service: State<'_, AppService>) -> CommandResult<SyncSta
     core(service.clear_sync_error())
 }
 
+/// Resolves the URL the TV board webview should load.
+///
+/// The host/origin must match `devUrl` (dev) or the Tauri protocol (prod) so the
+/// board window is recognised as an app URL and `window.__TAURI__` is available
+/// — otherwise `get_board_state` cannot be invoked.
+///
+/// * Dev (`debug_assertions`): the Trunk dev server from `build.devUrl` with
+///   `?board=1`. We use the same origin and root path the main window loads
+///   (`/`), avoiding any reliance on the dev server serving `/index.html`.
+/// * Prod: the packaged asset protocol (`tauri://localhost/index.html?board=1`).
+fn board_target_url(app: &AppHandle) -> Url {
+    if cfg!(debug_assertions) {
+        let mut url = app.config().build.dev_url.clone().unwrap_or_else(|| {
+            Url::parse("http://127.0.0.1:1420").expect("valid fallback dev url")
+        });
+        url.set_query(Some("board=1"));
+        url
+    } else {
+        Url::parse("tauri://localhost/index.html?board=1").expect("valid prod board url")
+    }
+}
+
+/// Opens (or recovers) the dedicated TV board window.
+///
+/// This MUST be an `async` command. Tauri runs synchronous commands on the
+/// main/UI thread, and `WebviewWindowBuilder::build()` (like `navigate`/
+/// `set_focus`) dispatches work to the main thread and blocks on a channel until
+/// it runs — so calling it from a sync command on the main thread deadlocks: the
+/// window is created but never finishes loading (it sits at `about:blank`, the
+/// "white board"), and the command never returns. Async commands are spawned off
+/// the main thread, letting the event loop service the dispatch and finish.
 #[tauri::command]
-pub fn open_tv_board_window(app: AppHandle) -> CommandResult<()> {
+pub async fn open_tv_board_window(app: AppHandle) -> CommandResult<()> {
+    // The board always opens as a normal, movable, resizable, decorated window.
+    // TODO: add an optional kiosk/fullscreen mode (e.g. a `kiosk: bool` arg)
+    // that sets `.fullscreen(true).decorations(false)` for wall-mounted displays.
+    let target = board_target_url(&app);
+    let dev = cfg!(debug_assertions);
+    tracing::info!(%target, dev, "open_tv_board_window: resolved board URL");
+
     if let Some(window) = app.get_webview_window("tv-board") {
+        // Do NOT blindly refocus: a previously-opened board may be stale or
+        // blank (e.g. the dev server was down when it first loaded). Navigate it
+        // to a freshly resolved board URL so a broken window is reloaded into a
+        // working one, and clear any stale kiosk/fullscreen/borderless state.
+        tracing::info!("open_tv_board_window: existing tv-board found, navigating + refocusing");
+        let _ = window.set_fullscreen(false);
+        let _ = window.set_decorations(true);
+        window.navigate(target).map_err(|error| error.to_string())?;
         window.set_focus().map_err(|error| error.to_string())?;
         return Ok(());
     }
-    WebviewWindowBuilder::new(&app, "tv-board", WebviewUrl::App("index.html".into()))
+
+    // `?board=1` is the primary board-mode signal; the initialization script is
+    // a fallback for environments that strip the query string.
+    match WebviewWindowBuilder::new(&app, "tv-board", WebviewUrl::External(target))
         .initialization_script("window.__OPENMGMT_BOARD__ = true;")
-        .title("OpenMgmt TV Board")
-        .fullscreen(true)
-        .decorations(false)
+        .title("OpenMgmt Board")
+        .inner_size(1440.0, 900.0)
+        .min_inner_size(960.0, 600.0)
+        .resizable(true)
+        .decorations(true)
+        .fullscreen(false)
+        .center()
         .build()
-        .map_err(|error| error.to_string())?;
+    {
+        Ok(window) => {
+            tracing::info!("open_tv_board_window: tv-board window built");
+            // Make sure the freshly built window takes focus and paints.
+            let _ = window.set_focus();
+            Ok(())
+        }
+        Err(error) => {
+            tracing::error!(%error, "open_tv_board_window: build failed");
+            Err(error.to_string())
+        }
+    }
+}
+
+/// Closes the dedicated TV board window (the in-board "Close Board" button).
+/// Closing only ever targets the `tv-board` label, never the main window.
+///
+/// Async for the same reason as [`open_tv_board_window`]: window operations
+/// dispatch to and block on the main thread, so they must not run on it.
+#[tauri::command]
+pub async fn close_tv_board_window(app: AppHandle) -> CommandResult<()> {
+    if let Some(window) = app.get_webview_window("tv-board") {
+        window.close().map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 

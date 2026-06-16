@@ -3,6 +3,13 @@ target = "index.html"
 dist = "dist"
 public_url = "/"
 
+# Bind a single loopback interface (127.0.0.1) rather than every hostname/
+# interface. On Windows, Trunk's default multi-address bind also opens the IPv6
+# `[::]` socket which (with dual-stack) collides with the IPv4 `0.0.0.0` socket
+# on the same port and fails with `os error 10048`. A single explicit address
+# avoids that self-conflict and keeps the dev origin identical to `devUrl` in
+# tauri.conf.json (required so the TV board window is recognised as an app URL).
 [serve]
+addresses = ["127.0.0.1"]
 port = 1420
 open = false
