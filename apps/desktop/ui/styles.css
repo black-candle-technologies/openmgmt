@@ -254,13 +254,17 @@ a { color: inherit; }
 .section-inline-action { display: flex; justify-content: flex-end; margin-bottom: 12px; }
 
 /* 7. Forms & drawer ------------------------------------------------------- */
-.form-field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+/* min-width:0 lets fields shrink inside the drawer's form-row grid instead of
+   forcing the row wider than the drawer (datetime inputs have a wide intrinsic
+   min-width that would otherwise overflow the right edge). */
+.form-field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; min-width: 0; }
 .form-field-label { font: 600 11px var(--mono); letter-spacing: 0.05em; color: var(--text-muted); text-transform: uppercase; }
 .form-field-hint { font-size: 11px; color: var(--text-muted); }
 .form-field input,
 .form-field select,
 .form-field textarea {
-  width: 100%; border: 1px solid var(--line-strong); background: #fff;
+  width: 100%; min-width: 0; max-width: 100%;
+  border: 1px solid var(--line-strong); background: #fff;
   padding: 9px 11px; border-radius: var(--radius-sm); font-size: 14px;
 }
 .form-field input:focus,
@@ -268,7 +272,9 @@ a { color: inherit; }
 .form-field textarea:focus { outline: 2px solid var(--lime-deep); outline-offset: -1px; border-color: var(--lime-deep); }
 .form-field input[type="color"] { height: 40px; padding: 4px; cursor: pointer; }
 .form-field textarea { min-height: 72px; resize: vertical; }
-.form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+/* minmax(0, 1fr) (not 1fr) so paired fields shrink to fit the drawer and never
+   overflow; the max-width:760px rule below collapses them to one column. */
+.form-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
 .form-check { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text-soft); margin: 8px 0 4px; }
 .form-check input { width: auto; }
 .form-advanced { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px 14px; margin: 6px 0 14px; background: var(--surface-2); }
