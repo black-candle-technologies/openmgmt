@@ -125,6 +125,7 @@ pub fn Dashboard(state: AppState, page: RwSignal<Page>) -> impl IntoView {
 
         <Section title="Quick actions">
             <div class="quick-actions">
+                <Button variant="subtle" on_click=Callback::new(move |_| page.set(Page::DailyOps))>"Daily Operations"</Button>
                 <Button variant="subtle" on_click=Callback::new(move |_| state.open_drawer(Drawer::CreateOrganization))>"New organization"</Button>
                 <Button variant="subtle" on_click=Callback::new(move |_| state.open_drawer(Drawer::CreateProject { organization_id: None }))>"New project"</Button>
                 <Button variant="subtle" on_click=Callback::new(move |_| state.open_drawer(Drawer::CreateTask { project_id: None }))>"New task"</Button>

@@ -8,6 +8,8 @@ pub mod pages;
 pub mod records;
 pub mod state;
 pub mod tags;
+pub mod timer;
+pub mod views;
 
 use chrono::Utc;
 use gloo_timers::callback::Interval;
@@ -66,17 +68,19 @@ pub fn App() -> impl IntoView {
                     <Feedback state />
                     {move || match page.get() {
                         Page::Dashboard => view! { <pages::Dashboard state page /> }.into_any(),
+                        Page::DailyOps => view! { <pages::DailyOpsPage state page now /> }.into_any(),
                         Page::Organizations => view! { <pages::OrganizationsPage state page /> }.into_any(),
                         Page::Projects => view! { <pages::ProjectsPage state page /> }.into_any(),
                         Page::Project(id) => view! { <pages::ProjectDetailPage state page id /> }.into_any(),
-                        Page::Tasks => view! { <pages::TasksPage state /> }.into_any(),
+                        Page::Tasks => view! { <pages::TasksPage state now /> }.into_any(),
                         Page::Today => view! { <pages::TodayPage state /> }.into_any(),
                         Page::Board => view! { <pages::BoardPage state now /> }.into_any(),
                         Page::Sync => view! { <pages::SyncPage /> }.into_any(),
+                        Page::Settings => view! { <pages::SettingsPage state /> }.into_any(),
                     }}
                 </main>
             </div>
-            <DrawerHost state />
+            <DrawerHost state now />
         </div>
     }
     .into_any()
@@ -94,12 +98,16 @@ fn Sidebar(state: AppState, page: RwSignal<Page>) -> impl IntoView {
             <nav class="sidebar-nav">
                 <p class="sidebar-label">"WORKSPACE"</p>
                 <NavButton label="Dashboard" target=Page::Dashboard page />
-                <NavButton label="Organizations" target=Page::Organizations page />
-                <NavButton label="Projects" target=Page::Projects page />
+                <NavButton label="Daily Operations" target=Page::DailyOps page />
                 <NavButton label="Tasks" target=Page::Tasks page />
                 <NavButton label="Today" target=Page::Today page />
+                <p class="sidebar-label">"STRUCTURE"</p>
+                <NavButton label="Projects" target=Page::Projects page />
+                <NavButton label="Organizations" target=Page::Organizations page />
+                <p class="sidebar-label">"OPERATIONS"</p>
                 <NavButton label="Board" target=Page::Board page />
                 <NavButton label="Sync" target=Page::Sync page />
+                <NavButton label="Settings" target=Page::Settings page />
             </nav>
             <div class="sidebar-foot">
                 <span class="local-dot"><i></i>"Local database"</span>
