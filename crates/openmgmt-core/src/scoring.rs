@@ -11,6 +11,7 @@ pub struct ScoringWeights {
     pub due_within_hour: i32,
     pub due_today: i32,
     pub due_tomorrow: i32,
+    pub due_soon_window_hours: i64,
     pub in_progress: i32,
     pub ready: i32,
     pub blocked: i32,
@@ -29,6 +30,7 @@ impl Default for ScoringWeights {
             due_within_hour: 60,
             due_today: 40,
             due_tomorrow: 20,
+            due_soon_window_hours: 24,
             in_progress: 55,
             ready: 15,
             blocked: -45,
@@ -38,9 +40,24 @@ impl Default for ScoringWeights {
     }
 }
 
+/// Highest (most urgent) selectable priority. Priorities run P1..P5 where a
+/// **lower number is more urgent**, so P1 is the highest priority and P5 the
+/// lowest/backlog.
+pub const HIGHEST_PRIORITY: i32 = 1;
+/// Lowest (least urgent) selectable priority.
+pub const LOWEST_PRIORITY: i32 = 5;
+
+/// Convert a 1–5 priority (P1 highest) into an urgency rank where a higher
+/// number means more urgent: P1 → 5, P3 → 3, P5 → 1. Scoring multiplies this
+/// rank (not the raw priority) so a P1 task always outscores a P5 task. Stray
+/// values are clamped into the valid range.
+pub fn priority_rank(priority: i32) -> i32 {
+    LOWEST_PRIORITY + 1 - priority.clamp(HIGHEST_PRIORITY, LOWEST_PRIORITY)
+}
+
 pub fn score_task(task: &TaskContext, now: DateTime<Utc>, weights: ScoringWeights) -> i32 {
-    let mut score = task.task.priority * weights.priority_step
-        + task.project_priority * weights.project_priority_step;
+    let mut score = priority_rank(task.task.priority) * weights.priority_step
+        + priority_rank(task.project_priority) * weights.project_priority_step;
     if task.task.pinned {
         score += weights.pinned;
     }
@@ -60,9 +77,9 @@ pub fn score_task(task: &TaskContext, now: DateTime<Utc>, weights: ScoringWeight
             weights.overdue_base + (-until.num_days() as i32 * weights.overdue_per_day)
         } else if until <= Duration::hours(1) {
             weights.due_within_hour
-        } else if until <= Duration::days(1) {
+        } else if until <= Duration::hours(weights.due_soon_window_hours.max(1)) {
             weights.due_today
-        } else if until <= Duration::days(2) {
+        } else if until <= Duration::hours(weights.due_soon_window_hours.max(1) * 2) {
             weights.due_tomorrow
         } else {
             0
@@ -119,6 +136,20 @@ mod tests {
     }
 
     #[test]
+    fn p1_outranks_p5() {
+        let now = Utc::now();
+        let mut highest = context();
+        highest.task.priority = 1;
+        let mut lowest = context();
+        lowest.task.priority = 5;
+        assert!(
+            score_task(&highest, now, ScoringWeights::default())
+                > score_task(&lowest, now, ScoringWeights::default()),
+            "P1 must score higher than P5"
+        );
+    }
+
+    #[test]
     fn blocked_paused_work_is_penalized() {
         let now = Utc::now();
         let baseline = score_task(&context(), now, ScoringWeights::default());
@@ -126,5 +157,23 @@ mod tests {
         paused.task.status = TaskStatus::Blocked;
         paused.project_status = ProjectStatus::Paused;
         assert!(score_task(&paused, now, ScoringWeights::default()) < baseline);
+    }
+
+    #[test]
+    fn due_soon_window_changes_due_score() {
+        let now = Utc::now();
+        let mut task = context();
+        task.task.due_at = Some(now + Duration::hours(10));
+
+        let narrow = ScoringWeights {
+            due_soon_window_hours: 4,
+            ..ScoringWeights::default()
+        };
+        let wide = ScoringWeights {
+            due_soon_window_hours: 24,
+            ..ScoringWeights::default()
+        };
+
+        assert!(score_task(&task, now, wide) > score_task(&task, now, narrow));
     }
 }

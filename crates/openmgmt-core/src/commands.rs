@@ -1,8 +1,10 @@
 use crate::{
     db::{Database, Result},
     models::{
-        BoardState, NewOrganization, NewProject, NewTask, Organization, OrganizationPatch, Project,
-        ProjectPatch, Task, TaskPatch, TaskStatus,
+        BoardState, NewOrganization, NewProject, NewSavedTaskView, NewTask, Organization,
+        OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch,
+        ScoringSettings, ScoringSettingsPatch, Task, TaskPatch, TaskQueryFilter, TaskSort,
+        TaskStatus, TaskTimerSession, TaskWithContext,
     },
     sync::{SyncSettings, SyncSettingsPatch, SyncStatus},
 };
@@ -71,6 +73,27 @@ impl AppService {
     pub fn complete_task(&self, id: &str) -> Result<Task> {
         self.database.transition_task(id, TaskStatus::Done, None)
     }
+    pub fn start_task_timer(&self, task_id: &str) -> Result<TaskTimerSession> {
+        self.database.start_task_timer(task_id)
+    }
+    pub fn pause_task_timer(&self, task_id: &str) -> Result<TaskTimerSession> {
+        self.database.pause_task_timer(task_id)
+    }
+    pub fn resume_task_timer(&self, task_id: &str) -> Result<TaskTimerSession> {
+        self.database.resume_task_timer(task_id)
+    }
+    pub fn stop_task_timer(&self, task_id: &str) -> Result<TaskTimerSession> {
+        self.database.stop_task_timer(task_id)
+    }
+    pub fn complete_task_with_timer(&self, task_id: &str) -> Result<Task> {
+        self.database.complete_task_with_timer(task_id)
+    }
+    pub fn list_task_timer_sessions(&self, task_id: &str) -> Result<Vec<TaskTimerSession>> {
+        self.database.list_task_timer_sessions(task_id)
+    }
+    pub fn get_active_timer_session(&self, task_id: &str) -> Result<Option<TaskTimerSession>> {
+        self.database.get_active_timer_session(task_id)
+    }
     pub fn block_task(&self, id: &str, reason: String) -> Result<Task> {
         self.database
             .transition_task(id, TaskStatus::Blocked, Some(reason))
@@ -81,8 +104,52 @@ impl AppService {
     pub fn get_board_state(&self) -> Result<BoardState> {
         self.database.board_state()
     }
-    pub fn seed_database(&self) -> Result<()> {
-        self.database.seed()
+    pub fn list_saved_task_views(&self) -> Result<Vec<SavedTaskView>> {
+        self.database.list_saved_task_views()
+    }
+    pub fn get_saved_task_view(&self, id: &str) -> Result<SavedTaskView> {
+        self.database.get_saved_task_view(id)
+    }
+    pub fn create_saved_task_view(&self, input: NewSavedTaskView) -> Result<SavedTaskView> {
+        self.database.create_saved_task_view(input)
+    }
+    pub fn update_saved_task_view(
+        &self,
+        id: &str,
+        patch: SavedTaskViewPatch,
+    ) -> Result<SavedTaskView> {
+        self.database.update_saved_task_view(id, patch)
+    }
+    pub fn archive_saved_task_view(&self, id: &str) -> Result<()> {
+        self.database.archive_saved_task_view(id)
+    }
+    pub fn query_tasks(
+        &self,
+        filter: TaskQueryFilter,
+        sort: Option<TaskSort>,
+    ) -> Result<Vec<TaskWithContext>> {
+        self.database.query_tasks(filter, sort)
+    }
+    pub fn get_scoring_settings(&self) -> Result<ScoringSettings> {
+        self.database.get_scoring_settings()
+    }
+    pub fn update_scoring_settings(&self, patch: ScoringSettingsPatch) -> Result<ScoringSettings> {
+        self.database.update_scoring_settings(patch)
+    }
+    pub fn reset_scoring_settings(&self) -> Result<ScoringSettings> {
+        self.database.reset_scoring_settings()
+    }
+    pub fn export_tasks_json(&self) -> Result<String> {
+        self.database.export_tasks_json()
+    }
+    pub fn export_tasks_csv(&self) -> Result<String> {
+        self.database.export_tasks_csv()
+    }
+    pub fn export_all_json(&self) -> Result<String> {
+        self.database.export_all_json()
+    }
+    pub fn backup_sqlite_database(&self, target_path: &str) -> Result<()> {
+        self.database.backup_sqlite_database(target_path)
     }
     pub fn get_sync_settings(&self) -> Result<SyncSettings> {
         self.database.get_sync_settings()

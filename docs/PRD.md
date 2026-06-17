@@ -42,7 +42,7 @@ completed today.
 - `cargo build` and `cargo test` pass from a fresh clone after Rust
   prerequisites are installed.
 - Every specified Tauri command is exposed.
-- Migrations and seed operations are idempotent.
+- Migrations are idempotent and first launch creates an empty workspace.
 - The separate TV board is readable at a distance and refreshes every 10
   seconds.
 - MCP delete/archive tools are absent and write tools are disabled by default.

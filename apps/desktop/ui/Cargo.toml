@@ -22,4 +22,4 @@ serde-wasm-bindgen = "0.6.5"
 wasm-bindgen = "0.2.104"
 wasm-bindgen-futures = "0.4.54"
 js-sys = "0.3.81"
-web-sys = { version = "0.3.81", features = ["console", "HtmlInputElement", "HtmlSelectElement", "HtmlTextAreaElement", "Location", "Window"] }
+web-sys = { version = "0.3.81", features = ["console", "Blob", "Document", "Element", "HtmlAnchorElement", "HtmlElement", "HtmlInputElement", "HtmlSelectElement", "HtmlTextAreaElement", "Location", "Url", "UrlSearchParams", "Window"] }

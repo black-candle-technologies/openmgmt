@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod board;
 #[cfg(feature = "native")]
 pub mod commands;
