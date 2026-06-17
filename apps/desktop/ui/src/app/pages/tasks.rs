@@ -24,8 +24,8 @@ pub fn TasksPage(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoView
     let filter = RwSignal::new(TaskFilterState::all_active());
     let active_view = RwSignal::new(Some("all-tasks".to_string()));
 
-    // Saved views from the backend; falls back to the known system presets when
-    // the database has not been seeded yet.
+    // Saved views from the backend; falls back to known system presets while
+    // the database is still loading.
     let saved_views = RwSignal::new(Vec::<SavedTaskView>::new());
     spawn_local(async move {
         if let Ok(list) = invoke::<Vec<SavedTaskView>>("list_saved_task_views", json!({})).await {

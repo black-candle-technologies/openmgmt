@@ -40,7 +40,7 @@ impl TaskFilterState {
 }
 
 /// The nine system saved views, used as a fallback strip before the database is
-/// seeded and to give each known slug a stable label.
+/// loaded and to give each known slug a stable label.
 pub fn default_view_presets() -> Vec<(&'static str, &'static str)> {
     vec![
         ("all-tasks", "All Tasks"),

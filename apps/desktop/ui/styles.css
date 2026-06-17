@@ -260,6 +260,7 @@ a { color: inherit; }
 .form-field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; min-width: 0; }
 .form-field-label { font: 600 11px var(--mono); letter-spacing: 0.05em; color: var(--text-muted); text-transform: uppercase; }
 .form-field-hint { font-size: 11px; color: var(--text-muted); }
+.form-help { margin: -4px 0 8px; color: var(--text-muted); font-size: 12px; line-height: 1.45; }
 .form-field input,
 .form-field select,
 .form-field textarea {

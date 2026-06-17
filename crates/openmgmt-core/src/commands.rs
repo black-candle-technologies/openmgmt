@@ -151,9 +151,6 @@ impl AppService {
     pub fn backup_sqlite_database(&self, target_path: &str) -> Result<()> {
         self.database.backup_sqlite_database(target_path)
     }
-    pub fn seed_database(&self) -> Result<()> {
-        self.database.seed()
-    }
     pub fn get_sync_settings(&self) -> Result<SyncSettings> {
         self.database.get_sync_settings()
     }

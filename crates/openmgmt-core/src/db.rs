@@ -1,11 +1,12 @@
+#[cfg(test)]
+use crate::models::{ProjectStatus, ProjectType};
 use crate::{
     board::build_board,
     models::{
         ActiveTimerInfo, BoardState, NewOrganization, NewProject, NewSavedTaskView, NewTask,
-        Organization, OrganizationPatch, Project, ProjectPatch, ProjectStatus, ProjectType,
-        SavedTaskView, SavedTaskViewPatch, ScoringSettings, ScoringSettingsPatch, Task,
-        TaskContext, TaskPatch, TaskQueryFilter, TaskSort, TaskSortField, TaskStatus,
-        TaskTimerSession, TaskWithContext,
+        Organization, OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch,
+        ScoringSettings, ScoringSettingsPatch, Task, TaskContext, TaskPatch, TaskQueryFilter,
+        TaskSort, TaskSortField, TaskStatus, TaskTimerSession, TaskWithContext,
     },
     scoring::{ScoringWeights, score_task},
     sync::{
@@ -16,7 +17,9 @@ use crate::{
         SyncEntityType, SyncEvent, SyncOperation, SyncSettings, SyncSettingsPatch, SyncStatus,
     },
 };
-use chrono::{DateTime, Duration, Utc};
+#[cfg(test)]
+use chrono::Duration;
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::{
     cmp::Ordering,
@@ -56,6 +59,7 @@ enum MutationOrigin {
     Local,
     #[allow(dead_code)]
     Remote,
+    #[cfg(test)]
     Seed,
 }
 
@@ -1566,6 +1570,7 @@ impl Database {
         Ok(build_board(contexts, Utc::now()))
     }
 
+    #[cfg(test)]
     pub fn seed(&self) -> Result<()> {
         let organizations = [
             ("Black Candle", "black-candle", "#d85b52", "BC"),
@@ -2800,6 +2805,46 @@ mod tests {
         let db = Database::in_memory().unwrap();
         db.seed().unwrap();
         db
+    }
+
+    #[test]
+    fn fresh_database_has_no_user_domain_records() {
+        let db = Database::in_memory().unwrap();
+
+        assert!(db.list_organizations().unwrap().is_empty());
+        assert!(db.list_projects().unwrap().is_empty());
+        assert!(db.list_tasks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fresh_database_keeps_required_settings_and_empty_board() {
+        let db = Database::in_memory().unwrap();
+
+        assert_eq!(db.get_scoring_settings().unwrap().id, "default");
+        assert!(!db.list_saved_task_views().unwrap().is_empty());
+        let board = db.board_state().unwrap();
+        assert!(board.now.is_empty());
+        assert!(board.next_up.is_empty());
+        assert!(board.due_soon.is_empty());
+        assert!(board.waiting_blocked.is_empty());
+        assert!(board.later_today.is_empty());
+        assert!(board.overdue.is_empty());
+        assert!(board.done_today.is_empty());
+    }
+
+    #[test]
+    fn fresh_database_exports_empty_user_data() {
+        let db = Database::in_memory().unwrap();
+
+        let tasks_json = db.export_tasks_json().unwrap();
+        let tasks: Vec<TaskWithContext> = serde_json::from_str(&tasks_json).unwrap();
+        assert!(tasks.is_empty());
+
+        let all_json = db.export_all_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&all_json).unwrap();
+        assert_eq!(value["organizations"].as_array().unwrap().len(), 0);
+        assert_eq!(value["projects"].as_array().unwrap().len(), 0);
+        assert_eq!(value["tasks"].as_array().unwrap().len(), 0);
     }
 
     fn remote_event(

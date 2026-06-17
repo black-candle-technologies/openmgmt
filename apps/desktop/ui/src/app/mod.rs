@@ -14,7 +14,6 @@ pub mod views;
 use chrono::Utc;
 use gloo_timers::callback::Interval;
 use leptos::prelude::*;
-use serde_json::json;
 use wasm_bindgen_futures::spawn_local;
 
 use board::BoardView;
@@ -156,19 +155,9 @@ fn TopBar(state: AppState, page: RwSignal<Page>) -> impl IntoView {
             </div>
             <div class="topbar-actions">
                 <Button variant="ghost" on_click=Callback::new(move |_| state.refresh())>"Refresh"</Button>
-                <Button variant="subtle" on_click=Callback::new(move |_| {
-                    spawn_local(async move {
-                        finish_action(
-                            state,
-                            invoke::<()>("seed_database", json!({})).await,
-                            "Database seeded.",
-                            "Seed failed",
-                        ).await;
-                    });
-                })>"Seed database"</Button>
                 <Button variant="primary" on_click=Callback::new(move |_| {
                     spawn_local(async move {
-                        match invoke::<()>("open_tv_board_window", json!({})).await {
+                        match invoke::<()>("open_tv_board_window", serde_json::json!({})).await {
                             Ok(_) => state.notice.set(Some("TV board opened.".into())),
                             Err(error) => state.fail("Could not open TV board", error),
                         }

@@ -57,8 +57,10 @@ Set-Location apps/desktop/src-tauri
 cargo tauri dev
 ```
 
-The app migrates and seeds the database on startup. Select **Open TV Board** in
-the top bar to open the board in a separate, normal Tauri window (decorated,
+On first launch, the app creates and migrates an empty local SQLite database at
+`data/openmgmt.sqlite`. It does not create sample organizations, projects, or
+tasks; users create their own workspace records. Select **Open TV Board** in the
+top bar to open the board in a separate, normal Tauri window (decorated,
 movable, and resizable; centered at 1440x900). The board window renders a dark
 operations layout and never shows a blank white screen. In development it loads
 the Trunk dev server with the board query string (`http://127.0.0.1:1420/?board=1`);
@@ -67,16 +69,7 @@ The main app and TV board use the same repository-local `data/openmgmt.sqlite` f
 
 The left sidebar navigates Dashboard, Organizations, Projects, Tasks, Today, and
 an embedded Board. The top bar exposes the current page title, a status
-indicator, and the Refresh, Seed database, and Open TV Board actions.
-
-## Seed the database
-
-Startup seeding creates the default organizations, the OpenMgmt project, and
-tasks in several statuses. It is safe to run repeatedly. To repair or reload
-seed data while the app is open, select **Seed database** in the sidebar.
-
-The seed includes active, overdue, blocked, scheduled, inbox, and in-progress
-tasks so the TV board has useful data on a new database.
+indicator, and the Refresh and Open TV Board actions.
 
 ## Supported MVP workflow
 
@@ -140,7 +133,6 @@ After `cargo tauri dev` opens the app:
 6. Select **Open TV Board** and confirm it opens in a normal, movable,
    resizable window (not fullscreen) with all seven columns and readable cards,
    and no blank white screen.
-7. Select **Seed database** twice and confirm it succeeds without duplicates.
 
 ## Troubleshooting (Windows)
 

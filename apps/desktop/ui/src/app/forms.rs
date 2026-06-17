@@ -196,6 +196,7 @@ fn ProjectForm(
 
     let editing_id = existing.as_ref().map(|item| item.id.clone());
     let editing = editing_id.is_some();
+    let has_organizations = Signal::derive(move || !state.snapshot.get().organizations.is_empty());
     let selected_org = existing
         .as_ref()
         .map(|item| item.organization_id.clone())
@@ -280,7 +281,13 @@ fn ProjectForm(
         }>
             <FormField label="Organization">
                 <select node_ref=organization required disabled=editing>
-                    <option value="">"Select organization"</option>
+                    <option value="">
+                        {move || if has_organizations.get() {
+                            "Select organization"
+                        } else {
+                            "Create an organization before adding projects"
+                        }}
+                    </option>
                     {let selected = selected_org.clone(); move || {
                         let selected = selected.clone();
                         state.snapshot.get().organizations.into_iter().map(|item| {
@@ -290,6 +297,9 @@ fn ProjectForm(
                     }}
                 </select>
             </FormField>
+            {move || (!editing && !has_organizations.get()).then(|| view! {
+                <p class="form-help">"Create an organization first, then add your first project."</p>
+            })}
             <FormField label="Name">
                 <input node_ref=name value=init_name placeholder="Project name" required />
             </FormField>
@@ -331,7 +341,7 @@ fn ProjectForm(
                 <textarea node_ref=notes placeholder="Context, links, decisions">{init_notes}</textarea>
             </FormField>
             <div class="drawer-actions">
-                <button class="btn btn-primary" type="submit">{submit_label}</button>
+                <button class="btn btn-primary" type="submit" disabled=move || !editing && !has_organizations.get()>{submit_label}</button>
                 {archive.map(|(id, archive_name)| view! {
                     <button class="btn btn-danger-soft" type="button" on:click=move |_| {
                         if !confirmed(&format!("Archive project {archive_name}? Its tasks will be hidden.")) { return; }
@@ -411,6 +421,7 @@ fn TaskForm(
         .as_ref()
         .map(|item| item.tags.join(", "))
         .unwrap_or_default();
+    let has_projects = Signal::derive(move || !state.snapshot.get().projects.is_empty());
     let submit_label = if editing {
         "Save changes"
     } else {
@@ -469,7 +480,13 @@ fn TaskForm(
         }>
             <FormField label="Project">
                 <select node_ref=project required disabled=editing>
-                    <option value="">"Select project"</option>
+                    <option value="">
+                        {move || if has_projects.get() {
+                            "Select project"
+                        } else {
+                            "Create a project before adding tasks"
+                        }}
+                    </option>
                     {let selected = selected_project.clone(); move || {
                         let selected = selected.clone();
                         state.snapshot.get().projects.into_iter().map(|item| {
@@ -479,6 +496,9 @@ fn TaskForm(
                     }}
                 </select>
             </FormField>
+            {move || (!editing && !has_projects.get()).then(|| view! {
+                <p class="form-help">"Tasks belong to projects. Create a project before adding tasks."</p>
+            })}
             <FormField label="Title">
                 <input node_ref=title value=init_title placeholder="What needs to happen" required />
             </FormField>
@@ -532,7 +552,7 @@ fn TaskForm(
                 </label>
             </details>
             <div class="drawer-actions">
-                <button class="btn btn-primary" type="submit">{submit_label}</button>
+                <button class="btn btn-primary" type="submit" disabled=move || !editing && !has_projects.get()>{submit_label}</button>
             </div>
         </form>
     }

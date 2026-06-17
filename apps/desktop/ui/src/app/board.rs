@@ -424,7 +424,7 @@ pub fn BoardView(
                     return view! {
                         <div class="tv-empty">
                             <h2>"No active board tasks"</h2>
-                            <p>"Create an active task or run Seed database in the main window."</p>
+                            <p>"Create your first organization, project, and task to populate the board."</p>
                         </div>
                     }
                     .into_any();

@@ -348,11 +348,6 @@ fn validate_backup_target(target_path: &str, backup_dir: &Path) -> CommandResult
 }
 
 #[tauri::command]
-pub fn seed_database(service: State<'_, AppService>) -> CommandResult<()> {
-    core(service.seed_database())
-}
-
-#[tauri::command]
 pub fn get_sync_settings(service: State<'_, AppService>) -> CommandResult<SyncSettings> {
     core(service.get_sync_settings())
 }
