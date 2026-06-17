@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/openmgmt-core",
+  "crates/openmgmt-gpt-bridge",
   "crates/openmgmt-mcp",
   "crates/openmgmt-protocol",
   "crates/openmgmt-server",

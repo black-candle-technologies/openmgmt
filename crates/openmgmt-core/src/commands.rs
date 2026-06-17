@@ -1,10 +1,10 @@
 use crate::{
     db::{Database, Result},
     models::{
-        BoardState, NewOrganization, NewProject, NewSavedTaskView, NewTask, Organization,
-        OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch,
-        ScoringSettings, ScoringSettingsPatch, Task, TaskPatch, TaskQueryFilter, TaskSort,
-        TaskStatus, TaskTimerSession, TaskWithContext,
+        BoardState, GptActionLog, NewGptActionLog, NewOrganization, NewProject, NewSavedTaskView,
+        NewTask, Organization, OrganizationPatch, Project, ProjectPatch, SavedTaskView,
+        SavedTaskViewPatch, ScoringSettings, ScoringSettingsPatch, Task, TaskPatch,
+        TaskQueryFilter, TaskSort, TaskStatus, TaskTimerSession, TaskWithContext,
     },
     sync::{SyncSettings, SyncSettingsPatch, SyncStatus},
 };
@@ -150,6 +150,12 @@ impl AppService {
     }
     pub fn backup_sqlite_database(&self, target_path: &str) -> Result<()> {
         self.database.backup_sqlite_database(target_path)
+    }
+    pub fn record_gpt_action(&self, input: NewGptActionLog) -> Result<GptActionLog> {
+        self.database.record_gpt_action(input)
+    }
+    pub fn list_gpt_action_logs(&self) -> Result<Vec<GptActionLog>> {
+        self.database.list_gpt_action_logs()
     }
     pub fn get_sync_settings(&self) -> Result<SyncSettings> {
         self.database.get_sync_settings()

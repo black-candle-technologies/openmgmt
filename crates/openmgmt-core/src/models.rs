@@ -246,6 +246,32 @@ pub struct TaskWithContext {
     pub active_timer: Option<ActiveTimerInfo>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GptActionLog {
+    pub id: String,
+    pub created_at: DateTime<Utc>,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: Option<String>,
+    pub method: String,
+    pub path: String,
+    pub request_summary: String,
+    pub success: bool,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewGptActionLog {
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: Option<String>,
+    pub method: String,
+    pub path: String,
+    pub request_summary: String,
+    pub success: bool,
+    pub error_message: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskQueryFilter {
     pub organization_id: Option<String>,

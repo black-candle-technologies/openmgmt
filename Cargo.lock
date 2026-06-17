@@ -2788,6 +2788,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "openmgmt-gpt-bridge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "openmgmt-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "openmgmt-mcp"
 version = "0.1.0"
 dependencies = [

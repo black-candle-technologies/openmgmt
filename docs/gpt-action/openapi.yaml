@@ -1,0 +1,755 @@
+openapi: 3.1.0
+info:
+  title: OpenMgmt GPT Action Bridge
+  version: 0.1.0
+  description: Authenticated bridge for a custom GPT to inspect and optionally update OpenMgmt.
+servers:
+  - url: https://YOUR-BRIDGE-HOST
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      security: []
+      summary: Check bridge health.
+      responses:
+        "200":
+          description: Bridge status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /api/openmgmt/summary:
+    get:
+      operationId: getOpenMgmtSummary
+      summary: Get workspace counts and board counts.
+      responses:
+        "200":
+          description: Workspace summary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Summary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/openmgmt/organizations:
+    get:
+      operationId: listOrganizations
+      summary: List active organizations.
+      responses:
+        "200":
+          description: Organizations.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Organization"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      operationId: createOrganization
+      summary: Create an organization when write mode is enabled.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateOrganizationRequest"
+      responses:
+        "200":
+          description: Created organization.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Organization"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/WriteDisabled"
+  /api/openmgmt/projects:
+    get:
+      operationId: listProjects
+      summary: List active projects with organization context.
+      parameters:
+        - $ref: "#/components/parameters/organizationId"
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/ProjectStatus"
+        - name: type
+          in: query
+          schema:
+            $ref: "#/components/schemas/ProjectType"
+      responses:
+        "200":
+          description: Projects.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ProjectWithOrganization"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      operationId: createProject
+      summary: Create a project in an existing organization when write mode is enabled.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProjectRequest"
+      responses:
+        "200":
+          description: Created project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/WriteDisabled"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/openmgmt/tasks:
+    get:
+      operationId: listTasks
+      summary: Query tasks with project and organization context.
+      parameters:
+        - $ref: "#/components/parameters/organizationId"
+        - $ref: "#/components/parameters/projectId"
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/TaskStatus"
+        - name: priority
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 5
+        - name: tag
+          in: query
+          schema:
+            type: string
+        - name: text
+          in: query
+          schema:
+            type: string
+        - name: due_before
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: due_after
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: scheduled_before
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: scheduled_after
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: pinned
+          in: query
+          schema:
+            type: boolean
+        - name: blocked
+          in: query
+          schema:
+            type: boolean
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+      responses:
+        "200":
+          description: Matching tasks.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TaskWithContext"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      operationId: createTask
+      summary: Create a task when write mode is enabled.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTaskRequest"
+      responses:
+        "200":
+          description: Created task.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskWithContext"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/WriteDisabled"
+  /api/openmgmt/tasks/{id}:
+    get:
+      operationId: getTask
+      summary: Get one task with context.
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      responses:
+        "200":
+          description: Task.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskWithContext"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      operationId: updateTask
+      summary: Update allowed task fields when write mode is enabled.
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateTaskRequest"
+      responses:
+        "200":
+          description: Updated task.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskWithContext"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/WriteDisabled"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/openmgmt/tasks/{id}/complete:
+    post:
+      operationId: completeTask
+      summary: Complete a task and stop any active timer.
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      responses:
+        "200":
+          description: Completed task.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskWithContext"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/WriteDisabled"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/openmgmt/tasks/{id}/start:
+    post:
+      operationId: startTask
+      summary: Start work on a task by starting its timer.
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      responses:
+        "200":
+          description: Started task.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskWithContext"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/WriteDisabled"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/openmgmt/tasks/{id}/block:
+    post:
+      operationId: blockTask
+      summary: Mark a task blocked with a reason.
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+      responses:
+        "200":
+          description: Blocked task.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskWithContext"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/WriteDisabled"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/openmgmt/board:
+    get:
+      operationId: getBoardState
+      summary: Get the current scored board.
+      responses:
+        "200":
+          description: Board state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BoardState"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/openmgmt/today:
+    get:
+      operationId: getTodayPlan
+      summary: Get a deterministic GPT-friendly today plan.
+      responses:
+        "200":
+          description: Today plan.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TodayPlan"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    organizationId:
+      name: organization_id
+      in: query
+      schema:
+        type: string
+    projectId:
+      name: project_id
+      in: query
+      schema:
+        type: string
+    taskId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    WriteDisabled:
+      description: GPT write mode is disabled.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadRequest:
+      description: Invalid request.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+    HealthResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        service:
+          type: string
+        version:
+          type: string
+        write_enabled:
+          type: boolean
+    Summary:
+      type: object
+      properties:
+        organization_count:
+          type: integer
+        project_count:
+          type: integer
+        open_task_count:
+          type: integer
+        blocked_task_count:
+          type: integer
+        overdue_task_count:
+          type: integer
+        due_soon_task_count:
+          type: integer
+        in_progress_task_count:
+          type: integer
+        done_today_count:
+          type: integer
+        board:
+          $ref: "#/components/schemas/BoardSummary"
+    BoardSummary:
+      type: object
+      properties:
+        now:
+          type: integer
+        next_up:
+          type: integer
+        overdue:
+          type: integer
+        due_soon:
+          type: integer
+        waiting_blocked:
+          type: integer
+        later_today:
+          type: integer
+        done_today:
+          type: integer
+    Organization:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        slug:
+          type: string
+        description:
+          type: [string, "null"]
+        color:
+          type: [string, "null"]
+        icon:
+          type: [string, "null"]
+    ProjectWithOrganization:
+      type: object
+      properties:
+        project:
+          $ref: "#/components/schemas/Project"
+        organization:
+          anyOf:
+            - $ref: "#/components/schemas/Organization"
+            - type: "null"
+    Project:
+      type: object
+      properties:
+        id:
+          type: string
+        organization_id:
+          type: string
+        name:
+          type: string
+        project_type:
+          $ref: "#/components/schemas/ProjectType"
+        status:
+          $ref: "#/components/schemas/ProjectStatus"
+        priority:
+          type: integer
+          description: P1 is highest priority and P5 is lowest.
+    ProjectType:
+      type: string
+      enum: [software, writing, business, film_story, marketing_pr, research, operations, personal, other]
+    ProjectStatus:
+      type: string
+      enum: [active, paused, completed, archived]
+    TaskStatus:
+      type: string
+      enum: [inbox, backlog, scheduled, ready, in_progress, blocked, waiting, done, canceled]
+    Task:
+      type: object
+      properties:
+        id:
+          type: string
+        project_id:
+          type: string
+        title:
+          type: string
+        description:
+          type: [string, "null"]
+        status:
+          $ref: "#/components/schemas/TaskStatus"
+        priority:
+          type: integer
+          description: P1 is highest priority and P5 is lowest.
+        due_at:
+          type: [string, "null"]
+          format: date-time
+        scheduled_at:
+          type: [string, "null"]
+          format: date-time
+        estimated_minutes:
+          type: [integer, "null"]
+        time_limit_minutes:
+          type: [integer, "null"]
+        pinned:
+          type: boolean
+        blocked_reason:
+          type: [string, "null"]
+        tags:
+          type: array
+          items:
+            type: string
+    TaskWithContext:
+      type: object
+      properties:
+        task:
+          $ref: "#/components/schemas/Task"
+        project_id:
+          type: string
+        project_name:
+          type: string
+        project_type:
+          $ref: "#/components/schemas/ProjectType"
+        organization_id:
+          type: string
+        organization_name:
+          type: string
+        organization_color:
+          type: [string, "null"]
+        organization_icon:
+          type: [string, "null"]
+        urgency_score:
+          type: integer
+        active_timer:
+          type: [object, "null"]
+    ScoredTask:
+      type: object
+      properties:
+        urgency_score:
+          type: integer
+        id:
+          type: string
+        title:
+          type: string
+        status:
+          $ref: "#/components/schemas/TaskStatus"
+        priority:
+          type: integer
+        project_name:
+          type: string
+        organization_name:
+          type: string
+    BoardState:
+      type: object
+      properties:
+        generated_at:
+          type: string
+          format: date-time
+        now:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScoredTask"
+        next_up:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScoredTask"
+        overdue:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScoredTask"
+        due_soon:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScoredTask"
+        waiting_blocked:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScoredTask"
+        later_today:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScoredTask"
+        done_today:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScoredTask"
+    TodayPlan:
+      type: object
+      properties:
+        now:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScoredTask"
+        next_up:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScoredTask"
+        overdue:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScoredTask"
+        due_soon:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScoredTask"
+        blocked:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScoredTask"
+        in_progress:
+          type: array
+          items:
+            $ref: "#/components/schemas/TaskWithContext"
+        pinned:
+          type: array
+          items:
+            $ref: "#/components/schemas/TaskWithContext"
+        done_today:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScoredTask"
+        recommended_next_task:
+          anyOf:
+            - $ref: "#/components/schemas/TaskWithContext"
+            - type: "null"
+    CreateTaskRequest:
+      type: object
+      required: [project_id, title]
+      properties:
+        project_id:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+        status:
+          $ref: "#/components/schemas/TaskStatus"
+        priority:
+          type: integer
+          minimum: 1
+          maximum: 5
+        due_at:
+          type: string
+          format: date-time
+        scheduled_at:
+          type: string
+          format: date-time
+        estimated_minutes:
+          type: integer
+        time_limit_minutes:
+          type: integer
+        pinned:
+          type: boolean
+        tags:
+          type: array
+          items:
+            type: string
+    UpdateTaskRequest:
+      type: object
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        status:
+          $ref: "#/components/schemas/TaskStatus"
+        priority:
+          type: integer
+          minimum: 1
+          maximum: 5
+        due_at:
+          type: string
+          format: date-time
+        scheduled_at:
+          type: string
+          format: date-time
+        estimated_minutes:
+          type: integer
+        time_limit_minutes:
+          type: integer
+        pinned:
+          type: boolean
+        blocked_reason:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+    CreateOrganizationRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        slug:
+          type: string
+        description:
+          type: string
+        color:
+          type: string
+        icon:
+          type: string
+    CreateProjectRequest:
+      type: object
+      required: [organization_id, name]
+      properties:
+        organization_id:
+          type: string
+          description: ID of an existing organization. Create the organization first if it does not exist.
+        name:
+          type: string
+        slug:
+          type: string
+        description:
+          type: string
+        type:
+          $ref: "#/components/schemas/ProjectType"
+        status:
+          $ref: "#/components/schemas/ProjectStatus"
+        priority:
+          type: integer
+          minimum: 1
+          maximum: 5
+          description: P1 is highest priority and P5 is lowest. Defaults to 3.
+        deadline:
+          type: string
+          format: date-time
+        repo_url:
+          type: string
+        notes:
+          type: string

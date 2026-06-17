@@ -3,10 +3,11 @@ use crate::models::{ProjectStatus, ProjectType};
 use crate::{
     board::build_board,
     models::{
-        ActiveTimerInfo, BoardState, NewOrganization, NewProject, NewSavedTaskView, NewTask,
-        Organization, OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch,
-        ScoringSettings, ScoringSettingsPatch, Task, TaskContext, TaskPatch, TaskQueryFilter,
-        TaskSort, TaskSortField, TaskStatus, TaskTimerSession, TaskWithContext,
+        ActiveTimerInfo, BoardState, GptActionLog, NewGptActionLog, NewOrganization, NewProject,
+        NewSavedTaskView, NewTask, Organization, OrganizationPatch, Project, ProjectPatch,
+        SavedTaskView, SavedTaskViewPatch, ScoringSettings, ScoringSettingsPatch, Task,
+        TaskContext, TaskPatch, TaskQueryFilter, TaskSort, TaskSortField, TaskStatus,
+        TaskTimerSession, TaskWithContext,
     },
     scoring::{ScoringWeights, score_task},
     sync::{
@@ -184,6 +185,22 @@ impl Database {
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS gpt_action_log (
+              id TEXT PRIMARY KEY NOT NULL,
+              created_at TEXT NOT NULL,
+              action TEXT NOT NULL,
+              resource_type TEXT NOT NULL,
+              resource_id TEXT,
+              method TEXT NOT NULL,
+              path TEXT NOT NULL,
+              request_summary TEXT NOT NULL,
+              success INTEGER NOT NULL,
+              error_message TEXT
+            );
+            CREATE INDEX IF NOT EXISTS gpt_action_log_created_idx
+              ON gpt_action_log(created_at);
+            CREATE INDEX IF NOT EXISTS gpt_action_log_resource_idx
+              ON gpt_action_log(resource_type, resource_id);
             CREATE TABLE IF NOT EXISTS sync_events (
               event_id TEXT PRIMARY KEY NOT NULL,
               device_id TEXT NOT NULL,
@@ -1561,6 +1578,53 @@ impl Database {
         Ok(())
     }
 
+    pub fn record_gpt_action(&self, input: NewGptActionLog) -> Result<GptActionLog> {
+        let now = Utc::now();
+        let log = GptActionLog {
+            id: Uuid::new_v4().to_string(),
+            created_at: now,
+            action: input.action,
+            resource_type: input.resource_type,
+            resource_id: input.resource_id,
+            method: input.method,
+            path: input.path,
+            request_summary: input.request_summary,
+            success: input.success,
+            error_message: input.error_message,
+        };
+        self.connection()?.execute(
+            "INSERT INTO gpt_action_log (
+                id,created_at,action,resource_type,resource_id,method,path,
+                request_summary,success,error_message
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                log.id,
+                timestamp(log.created_at),
+                log.action,
+                log.resource_type,
+                log.resource_id,
+                log.method,
+                log.path,
+                log.request_summary,
+                log.success as i32,
+                log.error_message
+            ],
+        )?;
+        Ok(log)
+    }
+
+    pub fn list_gpt_action_logs(&self) -> Result<Vec<GptActionLog>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,created_at,action,resource_type,resource_id,method,path,
+                    request_summary,success,error_message
+             FROM gpt_action_log ORDER BY created_at DESC",
+        )?;
+        Ok(statement
+            .query_map([], map_gpt_action_log)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn board_state(&self) -> Result<BoardState> {
         let contexts = self
             .task_context_rows()?
@@ -2409,6 +2473,21 @@ fn map_saved_task_view(row: &Row<'_>) -> rusqlite::Result<SavedTaskView> {
         created_at: parse_time(row.get(7)?)?,
         updated_at: parse_time(row.get(8)?)?,
         archived_at: parse_optional_time(row.get(9)?)?,
+    })
+}
+
+fn map_gpt_action_log(row: &Row<'_>) -> rusqlite::Result<GptActionLog> {
+    Ok(GptActionLog {
+        id: row.get(0)?,
+        created_at: parse_time(row.get(1)?)?,
+        action: row.get(2)?,
+        resource_type: row.get(3)?,
+        resource_id: row.get(4)?,
+        method: row.get(5)?,
+        path: row.get(6)?,
+        request_summary: row.get(7)?,
+        success: row.get(8)?,
+        error_message: row.get(9)?,
     })
 }
 
