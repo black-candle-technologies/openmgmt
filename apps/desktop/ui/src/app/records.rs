@@ -2,6 +2,8 @@
 //! cards. These bridge presentation (components.rs) and behaviour (state +
 //! drawers + task transitions).
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use leptos::prelude::*;
 use openmgmt_core::{Organization, Project, Task, TaskStatus, TaskWithContext};
@@ -382,7 +384,7 @@ pub fn OrganizationCard(
     let org_id = organization.id.clone();
     let counts = Signal::derive(move || {
         let snapshot = state.snapshot.get();
-        let project_ids: Vec<String> = snapshot
+        let project_ids: HashSet<String> = snapshot
             .projects
             .iter()
             .filter(|project| project.organization_id == org_id)

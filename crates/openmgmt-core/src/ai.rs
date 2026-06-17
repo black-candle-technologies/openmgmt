@@ -133,10 +133,43 @@ fn tool(
 }
 
 fn is_local_base_url(value: &str) -> bool {
-    value.starts_with("http://localhost")
-        || value.starts_with("http://127.0.0.1")
-        || value.starts_with("http://[::1]")
-        || value.starts_with("http://0.0.0.0")
+    let rest = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"));
+    let Some(rest) = rest else {
+        return false;
+    };
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some(end) = bracketed.find(']') else {
+            return false;
+        };
+        let host = &bracketed[..end];
+        let remainder = &bracketed[end + 1..];
+        if !remainder.is_empty() && !remainder.starts_with(':') {
+            return false;
+        }
+        (host, remainder.strip_prefix(':'))
+    } else {
+        let mut parts = authority.splitn(2, ':');
+        let host = parts.next().unwrap_or_default();
+        (host, parts.next())
+    };
+    if let Some(port) = port
+        && (port.is_empty() || !port.chars().all(|character| character.is_ascii_digit()))
+    {
+        return false;
+    }
+
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0")
 }
 
 #[cfg(test)]
@@ -186,5 +219,30 @@ mod tests {
         permissive.write_enabled = true;
         let check = enforce_ai_tool_permission(&permissive, &write, true);
         assert!(!check.allowed);
+    }
+
+    #[test]
+    fn local_base_url_requires_exact_local_host() {
+        for url in [
+            "http://localhost",
+            "https://localhost:11434/v1",
+            "http://127.0.0.1:1234",
+            "https://127.0.0.1/path",
+            "http://[::1]:8080/v1",
+            "https://0.0.0.0:8000",
+        ] {
+            assert!(is_local_base_url(url), "{url} should be local");
+        }
+
+        for url in [
+            "http://localhost.evil.com",
+            "http://127.0.0.1.evil.com",
+            "ftp://localhost",
+            "http://[::1]evil",
+            "http://[::1.evil]",
+            "not a url",
+        ] {
+            assert!(!is_local_base_url(url), "{url} should not be local");
+        }
     }
 }

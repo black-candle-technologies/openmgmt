@@ -2781,6 +2781,7 @@ dependencies = [
  "serde",
  "tauri",
  "tauri-build",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

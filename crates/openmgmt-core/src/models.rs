@@ -70,6 +70,72 @@ string_enum!(TaskSortField {
     Tag => "tag",
 });
 
+string_enum!(AiProviderKind {
+    OpenAi => "openai",
+    Anthropic => "anthropic",
+    LocalOpenAiCompatible => "local_openai_compatible",
+    Ollama => "ollama",
+    LmStudio => "lm_studio",
+    CustomOpenAiCompatible => "custom_openai_compatible",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiToolAccess {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiToolPermission {
+    ReadData,
+    WriteData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiProvider {
+    pub id: String,
+    pub name: String,
+    pub kind: AiProviderKind,
+    pub base_url: Option<String>,
+    pub api_key_ref: Option<String>,
+    pub default_model: Option<String>,
+    pub enabled: bool,
+    pub local_only: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiSettings {
+    pub read_enabled: bool,
+    pub write_enabled: bool,
+    pub destructive_tools_enabled: bool,
+    pub default_provider_id: Option<String>,
+    pub default_model_id: Option<String>,
+    pub local_only_mode: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiToolMetadata {
+    pub name: String,
+    pub description: String,
+    pub access: AiToolAccess,
+    pub destructive: bool,
+    pub required_permission: AiToolPermission,
+    pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiToolPermissionCheck {
+    pub tool: AiToolMetadata,
+    pub allowed: bool,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Organization {
     pub id: String,

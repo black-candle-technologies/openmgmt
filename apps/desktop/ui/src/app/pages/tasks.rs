@@ -148,6 +148,7 @@ pub fn TasksPage(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoView
                     on:change=move |event| {
                         let value = event_target_value(&event);
                         filter.update(|f| f.sort_field = value);
+                        active_view.set(None);
                     }
                 >
                     <option value="urgency">"Urgency"</option>
@@ -165,6 +166,7 @@ pub fn TasksPage(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoView
                     on:change=move |event| {
                         let desc = event_target_value(&event) == "desc";
                         filter.update(|f| f.sort_desc = desc);
+                        active_view.set(None);
                     }
                 >
                     <option value="desc">"Descending"</option>

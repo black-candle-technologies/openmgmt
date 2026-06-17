@@ -149,7 +149,7 @@ a { color: inherit; }
 
 .spinner {
   width: 11px; height: 11px; border-radius: 50%;
-  border: 2px solid currentColor; border-right-color: transparent;
+  border: 2px solid currentcolor; border-right-color: transparent;
   display: inline-block; animation: spin 0.7s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -446,6 +446,7 @@ a { color: inherit; }
    urgency (NOT Kanban columns), scannable from across a room. */
 .er-board {
   --er-cols: 44px minmax(200px, 2.4fr) minmax(94px, 1fr) minmax(96px, 1.1fr) minmax(128px, 1.5fr) 118px minmax(104px, 1fr) 62px 58px 92px;
+
   min-width: 1180px;
   background: var(--board-surface);
   border: 1px solid var(--board-line);
@@ -871,7 +872,7 @@ a { color: inherit; }
   flex-shrink: 0; width: 40px; height: 40px; display: grid; place-items: center;
   border-radius: var(--radius-sm); background: var(--surface-sunken); color: var(--green);
 }
-.sync-intro-mark svg { fill: none; stroke: currentColor; stroke-width: 2px; stroke-linecap: round; stroke-linejoin: round; }
+.sync-intro-mark svg { fill: none; stroke: currentcolor; stroke-width: 2px; stroke-linecap: round; stroke-linejoin: round; }
 .sync-intro p { margin: 0; color: var(--text-soft); font-size: 14px; line-height: 1.55; max-width: 72ch; }
 
 /* Config (left) + status (right) split; collapses to one column when narrow. */

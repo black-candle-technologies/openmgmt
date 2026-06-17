@@ -80,7 +80,14 @@ pub fn DailyOpsPage(
         results
             .get()
             .into_iter()
-            .filter(|row| tag.is_empty() || row.task.tags.iter().any(|t| t == &tag))
+            .filter(|row| {
+                tag.is_empty()
+                    || row
+                        .task
+                        .tags
+                        .iter()
+                        .any(|item| item.eq_ignore_ascii_case(&tag))
+            })
             .collect::<Vec<_>>()
     });
 
@@ -98,8 +105,10 @@ pub fn DailyOpsPage(
             .cloned()
     });
 
-    let now_bucket = lens(filtered, |row, _| row.task.status == TaskStatus::InProgress);
-    let due_soon_bucket = lens(filtered, |row, now| {
+    let now_bucket = lens(filtered, now_sig, |row, _| {
+        row.task.status == TaskStatus::InProgress
+    });
+    let due_soon_bucket = lens(filtered, now_sig, |row, now| {
         is_active(row.task.status)
             && !matches!(row.task.status, TaskStatus::Blocked | TaskStatus::Waiting)
             && row
@@ -107,20 +116,20 @@ pub fn DailyOpsPage(
                 .due_at
                 .is_some_and(|at| at >= now && at <= now + Duration::hours(24))
     });
-    let blocked_bucket = lens(filtered, |row, _| {
+    let blocked_bucket = lens(filtered, now_sig, |row, _| {
         matches!(row.task.status, TaskStatus::Blocked | TaskStatus::Waiting)
     });
     let tagged_bucket =
-        lens(filtered, |row, _| {
+        lens(filtered, now_sig, |row, _| {
             is_active(row.task.status)
                 && row.task.tags.iter().any(|tag| {
                     tag.eq_ignore_ascii_case("mvp") || tag.eq_ignore_ascii_case("launch")
                 })
         });
-    let pinned_bucket = lens(filtered, |row, _| {
+    let pinned_bucket = lens(filtered, now_sig, |row, _| {
         row.task.pinned && is_active(row.task.status)
     });
-    let done_today_bucket = lens(filtered, |row, now| {
+    let done_today_bucket = lens(filtered, now_sig, |row, now| {
         row.task.status == TaskStatus::Done
             && row
                 .task
@@ -176,10 +185,11 @@ pub fn DailyOpsPage(
 /// Build a reactive bucket from `filtered`, evaluated against the current clock.
 fn lens(
     filtered: Signal<Vec<TaskWithContext>>,
+    now: Signal<DateTime<Utc>>,
     predicate: fn(&TaskWithContext, DateTime<Utc>) -> bool,
 ) -> Signal<Vec<TaskWithContext>> {
     Signal::derive(move || {
-        let now = Utc::now();
+        let now = now.get();
         filtered
             .get()
             .into_iter()

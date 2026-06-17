@@ -95,6 +95,8 @@ pub struct AppState {
     /// Wall-clock time of the last successful data load. Used by the board to
     /// show a "last refreshed" timestamp without blanking existing data.
     pub synced_at: RwSignal<Option<DateTime<Utc>>>,
+    refresh_token: RwSignal<u64>,
+    board_refresh_token: RwSignal<u64>,
 }
 
 impl AppState {
@@ -106,6 +108,8 @@ impl AppState {
             loading: RwSignal::new(true),
             drawer: RwSignal::new(None),
             synced_at: RwSignal::new(None),
+            refresh_token: RwSignal::new(0),
+            board_refresh_token: RwSignal::new(0),
         }
     }
 
@@ -116,14 +120,24 @@ impl AppState {
     }
 
     pub async fn reload(self) {
+        let token = self.refresh_token.get_untracked().wrapping_add(1);
+        self.refresh_token.set(token);
         self.loading.set(true);
         match load_snapshot().await {
             Ok(snapshot) => {
+                if self.refresh_token.get_untracked() != token {
+                    return;
+                }
                 self.snapshot.set(snapshot);
                 self.synced_at.set(Some(Utc::now()));
                 self.error.set(None);
             }
-            Err(error) => self.fail("Refresh failed", error),
+            Err(error) => {
+                if self.refresh_token.get_untracked() != token {
+                    return;
+                }
+                self.fail("Refresh failed", error);
+            }
         }
         self.loading.set(false);
     }
@@ -139,10 +153,15 @@ impl AppState {
     }
 
     pub async fn reload_board(self) {
+        let token = self.board_refresh_token.get_untracked().wrapping_add(1);
+        self.board_refresh_token.set(token);
         self.loading.set(true);
         web_sys::console::log_1(&JsValue::from_str("[board] get_board_state: requesting"));
         match invoke::<BoardState>("get_board_state", serde_json::json!({})).await {
             Ok(board) => {
+                if self.board_refresh_token.get_untracked() != token {
+                    return;
+                }
                 web_sys::console::log_1(&JsValue::from_str(&format!(
                     "[board] get_board_state: ok ({} task(s))",
                     board_total(&board)
@@ -154,6 +173,9 @@ impl AppState {
                 self.error.set(None);
             }
             Err(error) => {
+                if self.board_refresh_token.get_untracked() != token {
+                    return;
+                }
                 web_sys::console::error_1(&JsValue::from_str(&format!(
                     "[board] get_board_state: FAILED — {error}"
                 )));
@@ -243,11 +265,12 @@ pub fn is_board_window() -> bool {
     let Some(window) = web_sys::window() else {
         return false;
     };
-    let query_mode = window
-        .location()
-        .search()
-        .ok()
-        .is_some_and(|query| query.contains("board=1") || query.contains("mode=board"));
+    let query_mode = window.location().search().ok().is_some_and(|query| {
+        web_sys::UrlSearchParams::new_with_str(&query).is_ok_and(|params| {
+            params.get("board").as_deref() == Some("1")
+                || params.get("mode").as_deref() == Some("board")
+        })
+    });
     let initialized_mode =
         js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("__OPENMGMT_BOARD__"))
             .ok()
@@ -371,7 +394,6 @@ pub fn prompt_with_default(message: &str, default: &str) -> Option<String> {
                 .flatten()
         })
         .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
 }
 
 /// Triggers a client-side file download of in-memory text by building a Blob,

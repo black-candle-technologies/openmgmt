@@ -11,6 +11,7 @@ pub struct ScoringWeights {
     pub due_within_hour: i32,
     pub due_today: i32,
     pub due_tomorrow: i32,
+    pub due_soon_window_hours: i64,
     pub in_progress: i32,
     pub ready: i32,
     pub blocked: i32,
@@ -29,6 +30,7 @@ impl Default for ScoringWeights {
             due_within_hour: 60,
             due_today: 40,
             due_tomorrow: 20,
+            due_soon_window_hours: 24,
             in_progress: 55,
             ready: 15,
             blocked: -45,
@@ -75,9 +77,9 @@ pub fn score_task(task: &TaskContext, now: DateTime<Utc>, weights: ScoringWeight
             weights.overdue_base + (-until.num_days() as i32 * weights.overdue_per_day)
         } else if until <= Duration::hours(1) {
             weights.due_within_hour
-        } else if until <= Duration::days(1) {
+        } else if until <= Duration::hours(weights.due_soon_window_hours.max(1)) {
             weights.due_today
-        } else if until <= Duration::days(2) {
+        } else if until <= Duration::hours(weights.due_soon_window_hours.max(1) * 2) {
             weights.due_tomorrow
         } else {
             0
@@ -155,5 +157,23 @@ mod tests {
         paused.task.status = TaskStatus::Blocked;
         paused.project_status = ProjectStatus::Paused;
         assert!(score_task(&paused, now, ScoringWeights::default()) < baseline);
+    }
+
+    #[test]
+    fn due_soon_window_changes_due_score() {
+        let now = Utc::now();
+        let mut task = context();
+        task.task.due_at = Some(now + Duration::hours(10));
+
+        let narrow = ScoringWeights {
+            due_soon_window_hours: 4,
+            ..ScoringWeights::default()
+        };
+        let wide = ScoringWeights {
+            due_soon_window_hours: 24,
+            ..ScoringWeights::default()
+        };
+
+        assert!(score_task(&task, now, wide) > score_task(&task, now, narrow));
     }
 }

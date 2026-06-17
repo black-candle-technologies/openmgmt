@@ -39,19 +39,32 @@ impl ScoringForm {
         }
     }
 
-    fn to_patch(&self) -> ScoringSettingsPatch {
-        ScoringSettingsPatch {
-            priority_weight: self.priority_weight.trim().parse().ok(),
-            pinned_boost: self.pinned_boost.trim().parse().ok(),
-            overdue_boost: self.overdue_boost.trim().parse().ok(),
-            due_soon_boost: self.due_soon_boost.trim().parse().ok(),
-            in_progress_boost: self.in_progress_boost.trim().parse().ok(),
-            blocked_penalty: self.blocked_penalty.trim().parse().ok(),
-            waiting_penalty: self.waiting_penalty.trim().parse().ok(),
-            paused_project_penalty: self.paused_project_penalty.trim().parse().ok(),
-            due_soon_window_hours: self.due_soon_window_hours.trim().parse().ok(),
-        }
+    fn to_patch(&self) -> Result<ScoringSettingsPatch, String> {
+        Ok(ScoringSettingsPatch {
+            priority_weight: Some(parse_score("Priority weight", &self.priority_weight)?),
+            pinned_boost: Some(parse_score("Pinned boost", &self.pinned_boost)?),
+            overdue_boost: Some(parse_score("Overdue boost", &self.overdue_boost)?),
+            due_soon_boost: Some(parse_score("Due soon boost", &self.due_soon_boost)?),
+            in_progress_boost: Some(parse_score("In-progress boost", &self.in_progress_boost)?),
+            blocked_penalty: Some(parse_score("Blocked penalty", &self.blocked_penalty)?),
+            waiting_penalty: Some(parse_score("Waiting penalty", &self.waiting_penalty)?),
+            paused_project_penalty: Some(parse_score(
+                "Paused-project penalty",
+                &self.paused_project_penalty,
+            )?),
+            due_soon_window_hours: Some(parse_score(
+                "Due-soon window (hours)",
+                &self.due_soon_window_hours,
+            )?),
+        })
     }
+}
+
+fn parse_score(label: &str, value: &str) -> Result<i32, String> {
+    value
+        .trim()
+        .parse()
+        .map_err(|_| format!("{label} must be a valid whole number."))
 }
 
 #[component]
@@ -65,12 +78,21 @@ pub fn SettingsPage(state: AppState) -> impl IntoView {
                 form.set(ScoringForm::from_settings(&settings));
                 loaded.set(true);
             }
-            Err(error) => state.fail("Load scoring settings failed", error),
+            Err(error) => {
+                loaded.set(true);
+                state.fail("Load scoring settings failed", error);
+            }
         }
     });
 
     let save = move || {
-        let patch = form.get_untracked().to_patch();
+        let patch = match form.get_untracked().to_patch() {
+            Ok(patch) => patch,
+            Err(error) => {
+                state.fail("Save scoring settings failed", error);
+                return;
+            }
+        };
         spawn_local(async move {
             match invoke::<ScoringSettings>("update_scoring_settings", json!({ "patch": patch }))
                 .await
@@ -209,6 +231,11 @@ fn backup(state: AppState) {
     ) else {
         return;
     };
+    let path = path.trim().to_owned();
+    if path.is_empty() {
+        state.fail("Backup failed", "Destination path is required.".into());
+        return;
+    }
     spawn_local(async move {
         match invoke::<()>("backup_sqlite_database", json!({ "target_path": path })).await {
             Ok(()) => state.notice.set(Some("Database backup written.".into())),

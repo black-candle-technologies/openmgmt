@@ -12,9 +12,10 @@
       // the primary signal; the injected global is a fallback.
       (function () {
         var search = window.location.search || "";
+        var params = new URLSearchParams(search);
         var isBoard =
-          search.indexOf("board=1") !== -1 ||
-          search.indexOf("mode=board") !== -1 ||
+          params.get("board") === "1" ||
+          params.get("mode") === "board" ||
           window.__OPENMGMT_BOARD__ === true;
         if (isBoard) {
           window.__OPENMGMT_BOARD__ = true;

@@ -1308,7 +1308,7 @@ impl Database {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id,name,slug,description,filter_json,sort_json,is_system,created_at,updated_at,archived_at
-             FROM saved_task_views ORDER BY is_system DESC, name COLLATE NOCASE",
+             FROM saved_task_views WHERE archived_at IS NULL ORDER BY is_system DESC, name COLLATE NOCASE",
         )?;
         Ok(statement
             .query_map([], map_saved_task_view)?
@@ -1317,23 +1317,16 @@ impl Database {
 
     pub fn get_saved_task_view(&self, id: &str) -> Result<SavedTaskView> {
         let connection = self.connection()?;
-        connection
-            .query_row(
-                "SELECT id,name,slug,description,filter_json,sort_json,is_system,created_at,updated_at,archived_at
-                 FROM saved_task_views WHERE id=?1",
-                [id],
-                map_saved_task_view,
-            )
-            .optional()?
-            .ok_or(CoreError::NotFound("saved task view"))
+        get_saved_task_view_with_connection(&connection, id)
     }
 
     pub fn create_saved_task_view(&self, input: NewSavedTaskView) -> Result<SavedTaskView> {
         require_name(&input.name)?;
         let now = Utc::now();
+        let slug = normalized_saved_view_slug(input.slug, &input.name)?;
         let view = SavedTaskView {
             id: Uuid::new_v4().to_string(),
-            slug: input.slug.unwrap_or_else(|| slugify(&input.name)),
+            slug,
             name: input.name,
             description: input.description,
             filter_json: input.filter_json,
@@ -1354,7 +1347,7 @@ impl Database {
         patch: SavedTaskViewPatch,
     ) -> Result<SavedTaskView> {
         let connection = self.connection()?;
-        let mut view = self.get_saved_task_view(id)?;
+        let mut view = get_saved_task_view_with_connection(&connection, id)?;
         if view.is_system {
             return Err(CoreError::Validation(
                 "system saved task views cannot be edited".into(),
@@ -1365,8 +1358,7 @@ impl Database {
             view.name = name;
         }
         if let Some(slug) = patch.slug {
-            require_name(&slug)?;
-            view.slug = slugify(&slug);
+            view.slug = normalized_saved_view_slug(Some(slug), &view.name)?;
         }
         if let Some(description) = patch.description {
             view.description = description;
@@ -2439,6 +2431,43 @@ fn insert_saved_task_view_with_connection(
     Ok(())
 }
 
+fn get_saved_task_view_with_connection(connection: &Connection, id: &str) -> Result<SavedTaskView> {
+    connection
+        .query_row(
+            "SELECT id,name,slug,description,filter_json,sort_json,is_system,created_at,updated_at,archived_at
+             FROM saved_task_views WHERE id=?1",
+            [id],
+            map_saved_task_view,
+        )
+        .optional()?
+        .ok_or(CoreError::NotFound("saved task view"))
+}
+
+fn normalized_saved_view_slug(input: Option<String>, name: &str) -> Result<String> {
+    match input {
+        Some(value) => {
+            let slug = slugify(&value);
+            if slug.is_empty() {
+                Err(CoreError::Validation(
+                    "saved task view slug must contain letters or numbers".into(),
+                ))
+            } else {
+                Ok(slug)
+            }
+        }
+        None => {
+            let slug = slugify(name);
+            if slug.is_empty() {
+                Err(CoreError::Validation(
+                    "saved task view name must produce a valid slug".into(),
+                ))
+            } else {
+                Ok(slug)
+            }
+        }
+    }
+}
+
 fn map_scoring_settings(row: &Row<'_>) -> rusqlite::Result<ScoringSettings> {
     Ok(ScoringSettings {
         id: row.get(0)?,
@@ -2523,6 +2552,7 @@ fn scoring_settings_to_weights(settings: &ScoringSettings) -> ScoringWeights {
         due_within_hour: settings.due_soon_boost + 20,
         due_today: settings.due_soon_boost,
         due_tomorrow: settings.due_soon_boost / 2,
+        due_soon_window_hours: settings.due_soon_window_hours as i64,
         in_progress: settings.in_progress_boost,
         ready: ScoringWeights::default().ready,
         blocked: settings.blocked_penalty,
@@ -3642,5 +3672,154 @@ mod tests {
             + board.later_today.len()
             + board.overdue.len();
         assert!(active_count > 0);
+    }
+
+    #[test]
+    fn archived_saved_task_views_are_hidden_from_list() {
+        let db = Database::in_memory().unwrap();
+        let view = db
+            .create_saved_task_view(NewSavedTaskView {
+                name: "Archive Me".into(),
+                slug: None,
+                description: None,
+                filter_json: serde_json::json!({}),
+                sort_json: serde_json::json!({}),
+            })
+            .unwrap();
+
+        db.archive_saved_task_view(&view.id).unwrap();
+
+        assert!(
+            !db.list_saved_task_views()
+                .unwrap()
+                .iter()
+                .any(|item| item.id == view.id)
+        );
+        assert!(
+            db.get_saved_task_view(&view.id)
+                .unwrap()
+                .archived_at
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn saved_task_view_slugs_are_normalized_and_validated() {
+        let db = Database::in_memory().unwrap();
+        let custom = db
+            .create_saved_task_view(NewSavedTaskView {
+                name: "Custom".into(),
+                slug: Some("  Mixed Case Slug  ".into()),
+                description: None,
+                filter_json: serde_json::json!({}),
+                sort_json: serde_json::json!({}),
+            })
+            .unwrap();
+        assert_eq!(custom.slug, "mixed-case-slug");
+
+        let missing = db
+            .create_saved_task_view(NewSavedTaskView {
+                name: "Missing Slug View".into(),
+                slug: None,
+                description: None,
+                filter_json: serde_json::json!({}),
+                sort_json: serde_json::json!({}),
+            })
+            .unwrap();
+        assert_eq!(missing.slug, "missing-slug-view");
+
+        for slug in ["   ", "!!!"] {
+            assert!(matches!(
+                db.create_saved_task_view(NewSavedTaskView {
+                    name: format!("Bad {slug}"),
+                    slug: Some(slug.into()),
+                    description: None,
+                    filter_json: serde_json::json!({}),
+                    sort_json: serde_json::json!({}),
+                }),
+                Err(CoreError::Validation(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn update_saved_task_view_completes_and_normalizes_slug() {
+        let db = Database::in_memory().unwrap();
+        let view = db
+            .create_saved_task_view(NewSavedTaskView {
+                name: "Editable".into(),
+                slug: None,
+                description: None,
+                filter_json: serde_json::json!({}),
+                sort_json: serde_json::json!({}),
+            })
+            .unwrap();
+
+        let updated = db
+            .update_saved_task_view(
+                &view.id,
+                SavedTaskViewPatch {
+                    name: Some("Updated".into()),
+                    slug: Some("Updated Slug".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated.name, "Updated");
+        assert_eq!(updated.slug, "updated-slug");
+    }
+
+    #[test]
+    fn scoring_due_soon_window_affects_query_urgency() {
+        let db = seeded_database();
+        let task = db
+            .list_tasks()
+            .unwrap()
+            .into_iter()
+            .find(|task| !matches!(task.status, TaskStatus::Done | TaskStatus::Canceled))
+            .unwrap();
+        db.update_task(
+            &task.id,
+            TaskPatch {
+                due_at: Some(Some(Utc::now() + Duration::hours(10))),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let wide_score = db
+            .query_tasks(
+                TaskQueryFilter {
+                    include_done: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+            .into_iter()
+            .find(|row| row.task.id == task.id)
+            .unwrap()
+            .urgency_score;
+        db.update_scoring_settings(ScoringSettingsPatch {
+            due_soon_window_hours: Some(4),
+            ..Default::default()
+        })
+        .unwrap();
+        let narrow_score = db
+            .query_tasks(
+                TaskQueryFilter {
+                    include_done: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+            .into_iter()
+            .find(|row| row.task.id == task.id)
+            .unwrap()
+            .urgency_score;
+
+        assert!(wide_score > narrow_score);
     }
 }

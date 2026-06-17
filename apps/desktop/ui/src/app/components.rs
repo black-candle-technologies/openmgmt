@@ -17,6 +17,7 @@ pub fn Button(
 ) -> impl IntoView {
     view! {
         <button
+            type="button"
             class=format!("btn btn-{variant}")
             disabled=disabled
             on:click=move |_| on_click.run(())
@@ -34,9 +35,14 @@ pub fn IconButton(
     #[prop(into)] on_click: Callback<()>,
     children: Children,
 ) -> impl IntoView {
-    let _ = label;
     view! {
-        <button class="icon-btn" title=title on:click=move |_| on_click.run(())>
+        <button
+            type="button"
+            class="icon-btn"
+            title=title
+            aria-label=label
+            on:click=move |_| on_click.run(())
+        >
             {children()}
         </button>
     }

@@ -195,6 +195,7 @@ fn ProjectForm(
     let notes = NodeRef::<leptos::html::Textarea>::new();
 
     let editing_id = existing.as_ref().map(|item| item.id.clone());
+    let editing = editing_id.is_some();
     let selected_org = existing
         .as_ref()
         .map(|item| item.organization_id.clone())
@@ -278,7 +279,7 @@ fn ProjectForm(
             });
         }>
             <FormField label="Organization">
-                <select node_ref=organization required>
+                <select node_ref=organization required disabled=editing>
                     <option value="">"Select organization"</option>
                     {let selected = selected_org.clone(); move || {
                         let selected = selected.clone();
@@ -467,7 +468,7 @@ fn TaskForm(
             });
         }>
             <FormField label="Project">
-                <select node_ref=project required>
+                <select node_ref=project required disabled=editing>
                     <option value="">"Select project"</option>
                     {let selected = selected_project.clone(); move || {
                         let selected = selected.clone();
@@ -520,9 +521,11 @@ fn TaskForm(
                 <FormField label="Tags" hint="Comma separated">
                     <input node_ref=tags value=init_tags placeholder="design, urgent" />
                 </FormField>
-                <FormField label="Blocked reason">
-                    <input node_ref=blocked_reason value=init_blocked placeholder="Why is this waiting?" />
-                </FormField>
+                {editing.then(|| view! {
+                    <FormField label="Blocked reason">
+                        <input node_ref=blocked_reason value=init_blocked placeholder="Why is this waiting?" />
+                    </FormField>
+                })}
                 <label class="form-check">
                     <input node_ref=pinned type="checkbox" checked=init_pinned />
                     <span>"Pin to top of board"</span>

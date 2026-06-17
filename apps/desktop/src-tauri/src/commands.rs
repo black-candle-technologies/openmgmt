@@ -5,6 +5,7 @@ use openmgmt_core::{
     TaskQueryFilter, TaskSort, TaskTimerSession, TaskWithContext,
 };
 use openmgmt_sync_client::{SyncConnectionTestResult, SyncOnceResult};
+use std::path::{Component, Path, PathBuf};
 use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::{Mutex, MutexGuard};
 
@@ -279,10 +280,71 @@ pub fn export_all_json(service: State<'_, AppService>) -> CommandResult<String> 
 
 #[tauri::command]
 pub fn backup_sqlite_database(
+    app: AppHandle,
     service: State<'_, AppService>,
     target_path: String,
 ) -> CommandResult<()> {
-    core(service.backup_sqlite_database(&target_path))
+    let target_path = validate_backup_target(
+        &target_path,
+        &app.path()
+            .app_data_dir()
+            .map_err(|error| format!("could not resolve app data directory: {error}"))?
+            .join("backups"),
+    )?;
+    core(
+        service.backup_sqlite_database(
+            target_path
+                .to_str()
+                .ok_or_else(|| "backup path must be valid UTF-8".to_string())?,
+        ),
+    )
+}
+
+fn validate_backup_target(target_path: &str, backup_dir: &Path) -> CommandResult<PathBuf> {
+    let trimmed = target_path.trim();
+    if trimmed.is_empty() {
+        return Err("backup destination path is required".into());
+    }
+    let requested = Path::new(trimmed);
+    if requested.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(
+            "backup destination must be a safe filename under the app backup directory".into(),
+        );
+    }
+    if requested.file_name().is_none() {
+        return Err("backup destination must include a filename".into());
+    }
+
+    std::fs::create_dir_all(backup_dir)
+        .map_err(|error| format!("could not create backup directory: {error}"))?;
+    let canonical_backup_dir = backup_dir
+        .canonicalize()
+        .map_err(|error| format!("could not validate backup directory: {error}"))?;
+    let candidate = backup_dir.join(requested);
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| "backup destination must include a parent directory".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create backup parent directory: {error}"))?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|error| format!("could not validate backup parent directory: {error}"))?;
+    if !canonical_parent.starts_with(&canonical_backup_dir) {
+        return Err("backup destination escapes the app backup directory".into());
+    }
+    if candidate
+        .symlink_metadata()
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err("backup destination cannot be a symlink".into());
+    }
+    Ok(candidate)
 }
 
 #[tauri::command]
@@ -443,5 +505,29 @@ mod tests {
         let _guard = runtime.try_start().expect("first sync should start");
 
         assert_eq!(runtime.try_start().unwrap_err(), "sync is already running");
+    }
+
+    #[test]
+    fn backup_target_validation_rejects_unsafe_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let backup_dir = temp.path().join("backups");
+
+        assert!(validate_backup_target("", &backup_dir).is_err());
+        assert!(validate_backup_target("..\\escape.sqlite", &backup_dir).is_err());
+        assert!(validate_backup_target("../escape.sqlite", &backup_dir).is_err());
+        assert!(validate_backup_target("C:\\temp\\escape.sqlite", &backup_dir).is_err());
+    }
+
+    #[test]
+    fn backup_target_validation_allows_safe_relative_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let backup_dir = temp.path().join("backups");
+
+        let target = validate_backup_target("daily/openmgmt.sqlite", &backup_dir).unwrap();
+        assert!(target.starts_with(&backup_dir));
+        assert_eq!(
+            target.file_name().and_then(|value| value.to_str()),
+            Some("openmgmt.sqlite")
+        );
     }
 }
