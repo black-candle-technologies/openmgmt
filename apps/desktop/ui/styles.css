@@ -858,3 +858,78 @@ a { color: inherit; }
   .qtask-status, .qtask-org, .qtask-project, .qtask-due, .qtask-urgency { grid-column: 2 / -1; }
   .qtask-timer { grid-column: 1 / -1; justify-content: flex-start; }
 }
+
+/* 18. Sync page ----------------------------------------------------------- */
+/* The Sync page reuses the shared design language (panels, metrics, badges,
+   buttons, form fields). Classes here only cover the few sync-specific layouts:
+   the intro card, the config/status two-column split, the enable toggle, and
+   the status fact cards / rows. */
+
+/* Local-first intro card with a small privacy lock mark. */
+.sync-intro { display: flex; align-items: flex-start; gap: 14px; }
+.sync-intro-mark {
+  flex-shrink: 0; width: 40px; height: 40px; display: grid; place-items: center;
+  border-radius: var(--radius-sm); background: var(--surface-sunken); color: var(--green);
+}
+.sync-intro-mark svg { fill: none; stroke: currentColor; stroke-width: 2px; stroke-linecap: round; stroke-linejoin: round; }
+.sync-intro p { margin: 0; color: var(--text-soft); font-size: 14px; line-height: 1.55; max-width: 72ch; }
+
+/* Config (left) + status (right) split; collapses to one column when narrow. */
+.sync-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+.sync-layout .panel { margin-bottom: 0; }
+
+/* Panel header carrying an eyebrow label, title, and optional status badge. */
+.sync-panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+.sync-panel-head .eyebrow { margin-bottom: 6px; }
+.sync-panel-title { font-size: 16px; letter-spacing: -0.01em; }
+
+/* Device settings form. */
+.sync-config { display: flex; flex-direction: column; gap: 16px; }
+.sync-config-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px 16px; }
+.sync-config-fields .form-field { margin-bottom: 0; }
+.sync-form-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.form-field-hint-warn { color: var(--warn); }
+
+/* Enable-sync toggle switch (green when on). */
+.sync-toggle { display: inline-flex; align-items: center; gap: 12px; cursor: pointer; }
+.sync-toggle input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.sync-toggle-track {
+  position: relative; flex-shrink: 0; width: 42px; height: 24px;
+  border-radius: var(--radius-pill); background: var(--surface-sunken);
+  border: 1px solid var(--line-strong); transition: background 0.15s ease, border-color 0.15s ease;
+}
+.sync-toggle-thumb {
+  position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%;
+  background: #fff; box-shadow: var(--shadow-sm); transition: transform 0.15s ease;
+}
+.sync-toggle input:checked + .sync-toggle-track { background: var(--green); border-color: var(--green); }
+.sync-toggle input:checked + .sync-toggle-track .sync-toggle-thumb { transform: translateX(18px); }
+.sync-toggle input:focus-visible + .sync-toggle-track { outline: 2px solid var(--lime-deep); outline-offset: 2px; }
+.sync-toggle-text { display: flex; flex-direction: column; gap: 2px; }
+.sync-toggle-title { font-weight: 600; font-size: 14px; color: var(--text); }
+.sync-toggle-hint { font-size: 12px; color: var(--text-muted); }
+
+/* Status metric cards (number card reuses .metric; fact cards mirror its frame). */
+.sync-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 16px; }
+.sync-metrics .metric { margin: 0; }
+.sync-fact {
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 18px 20px; box-shadow: var(--shadow-sm); min-width: 0;
+}
+.sync-fact-label { display: block; color: var(--text-muted); font: 600 10px var(--mono); letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 10px; }
+.sync-fact-value { font-size: 15px; font-weight: 600; color: var(--text); overflow-wrap: anywhere; word-break: break-word; }
+.sync-fact-value.is-muted { color: var(--text-muted); font-weight: 500; }
+
+/* Last successful / attempted: compact definition rows. */
+.sync-rows { display: flex; flex-direction: column; }
+.sync-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.sync-row:last-child { border-bottom: 0; }
+.sync-row-label { font: 600 11px var(--mono); letter-spacing: 0.05em; color: var(--text-muted); text-transform: uppercase; }
+.sync-row-value { font: 12px var(--mono); color: var(--text-soft); text-align: right; min-width: 0; overflow-wrap: anywhere; }
+
+.sync-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+.sync-result { margin: 14px 0 0; font: 12px var(--mono); color: var(--text-muted); line-height: 1.5; overflow-wrap: anywhere; }
+
+@media (max-width: 1000px) {
+  .sync-layout { grid-template-columns: 1fr; }
+}
