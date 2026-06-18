@@ -5,6 +5,15 @@
 //! conflict report. Tasks can be planned by drag-and-drop (onto an hour slot or a
 //! day) or via a lightweight schedule/reschedule modal as a reliable fallback.
 //!
+//! Drag-and-drop reliability notes:
+//! * The native webview file-drop handler is disabled for the main window
+//!   (`dragDropEnabled: false` in `tauri.conf.json`) so HTML5 drag events fire.
+//! * The drag payload is serialized into `DataTransfer` (custom MIME) so it
+//!   survives the native drag round-trip; a Leptos signal is the fallback.
+//! * A pointer-based "Move mode" is offered as an explicit, always-available
+//!   fallback (handle → click a slot/day/panel) for environments where native
+//!   HTML5 drag-and-drop still misbehaves.
+//!
 //! Scheduled datetimes are stored in UTC; everything here renders and accepts
 //! local time via the shared helpers in [`crate::app::state`], matching how the
 //! rest of the app bridges the local `datetime-local`/`date`/`time` inputs.
@@ -15,12 +24,17 @@ use openmgmt_core::{
     CalendarBlock, RecurrenceRule, ScheduleConflict, ScheduleTaskInput, ScheduledBlockCompletion,
     Task, TaskWithContext,
 };
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
+use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::app::components::*;
 use crate::app::state::*;
 use crate::app::tags::TagChip;
+
+/// Custom MIME used to carry the full drag payload through `DataTransfer`.
+const DRAG_MIME: &str = "application/x-openmgmt-schedule-drag";
 
 /// Recurrence choices offered in the schedule modal.
 const RECURRENCE_OPTIONS: [(RecurrenceRule, &str); 5] = [
@@ -30,6 +44,13 @@ const RECURRENCE_OPTIONS: [(RecurrenceRule, &str); 5] = [
     (RecurrenceRule::Weekly, "Weekly"),
     (RecurrenceRule::Monthly, "Monthly"),
 ];
+
+/// Debug-only console trace (silent in release builds).
+fn trace(message: impl AsRef<str>) {
+    if cfg!(debug_assertions) {
+        web_sys::console::log_1(&JsValue::from_str(message.as_ref()));
+    }
+}
 
 /// All schedule data the page renders, loaded together so the views stay in sync.
 #[derive(Clone, Default)]
@@ -41,12 +62,16 @@ struct ScheduleData {
     conflicts: Vec<ScheduleConflict>,
 }
 
-/// The payload carried while a task is being dragged. Carrying the existing
-/// reminder/deadline/recurrence means a drag-reschedule preserves that metadata
-/// (the backend overwrites those fields from the schedule input).
-#[derive(Clone)]
+/// The payload moved while a task is being dragged (or held in "Move mode").
+///
+/// It is `Serialize`/`Deserialize` so it can ride through the native drag via
+/// `DataTransfer` JSON rather than relying solely on an in-memory signal. It
+/// carries the existing reminder/deadline/recurrence so a drag-reschedule
+/// preserves that metadata (the backend overwrites those fields from the input).
+#[derive(Clone, Serialize, Deserialize)]
 struct DragData {
     task_id: String,
+    title: String,
     /// Present when the task is already on the calendar (so a drop reschedules).
     block_id: Option<String>,
     duration_minutes: i64,
@@ -88,7 +113,10 @@ struct Sched {
     data: RwSignal<ScheduleData>,
     loading: RwSignal<bool>,
     generation: StoredValue<u32>,
+    /// Native-drag payload fallback (when `DataTransfer` JSON is unavailable).
     drag: RwSignal<Option<DragData>>,
+    /// Pointer-based "Move mode" payload: set on handle click, placed on target click.
+    moving: RwSignal<Option<DragData>>,
     active_zone: RwSignal<Option<String>>,
     modal: RwSignal<Option<ScheduleTarget>>,
     ics: RwSignal<Option<String>>,
@@ -127,10 +155,14 @@ impl Sched {
             } else {
                 "schedule_task"
             };
-            match invoke::<CalendarBlock>(command, json!({ "task_id": task_id, "input": input }))
-                .await
+            match invoke_schedule::<CalendarBlock>(
+                command,
+                json!({ "taskId": task_id, "input": input }),
+            )
+            .await
             {
                 Ok(block) => {
+                    trace(format!("[sched] {command} ok block={}", block.id));
                     self.state.notice.set(Some(
                         if reschedule {
                             "Task rescheduled."
@@ -141,33 +173,45 @@ impl Sched {
                     ));
                     self.reload();
                     self.state.refresh();
-                    if let Ok(conflicts) =
-                        invoke::<Vec<ScheduleConflict>>("list_schedule_conflicts", json!({})).await
-                        && conflicts
-                            .iter()
-                            .any(|c| c.first.id == block.id || c.second.id == block.id)
+                    match invoke_schedule::<Vec<ScheduleConflict>>(
+                        "list_schedule_conflicts",
+                        json!({}),
+                    )
+                    .await
                     {
-                        self.state.notice.set(Some(
-                            "Scheduled — heads up: this overlaps another block. See Conflicts below."
-                                .to_string(),
-                        ));
+                        Ok(conflicts)
+                            if conflicts
+                                .iter()
+                                .any(|c| c.first.id == block.id || c.second.id == block.id) =>
+                        {
+                            self.state.notice.set(Some(
+                                "Scheduled — heads up: this overlaps another block. See Conflicts below."
+                                    .to_string(),
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(error) => self.state.fail("Conflict refresh failed", error),
                     }
                 }
-                Err(error) => self.state.fail(
-                    if reschedule {
-                        "Reschedule failed"
-                    } else {
-                        "Schedule failed"
-                    },
-                    error,
-                ),
+                Err(error) => {
+                    trace(format!("[sched] {command} failed: {error}"));
+                    self.state.fail(
+                        if reschedule {
+                            "Reschedule failed"
+                        } else {
+                            "Schedule failed"
+                        },
+                        error,
+                    )
+                }
             }
         });
     }
 
     fn clear(self, task_id: String) {
         spawn_local(async move {
-            match invoke::<Task>("clear_task_schedule", json!({ "task_id": task_id })).await {
+            match invoke_schedule::<Task>("clear_task_schedule", json!({ "taskId": task_id })).await
+            {
                 Ok(_) => {
                     self.state.notice.set(Some("Schedule cleared.".to_string()));
                     self.reload();
@@ -180,9 +224,9 @@ impl Sched {
 
     fn complete_block(self, block_id: String) {
         spawn_local(async move {
-            match invoke::<ScheduledBlockCompletion>(
+            match invoke_schedule::<ScheduledBlockCompletion>(
                 "complete_scheduled_block",
-                json!({ "block_id": block_id }),
+                json!({ "blockId": block_id }),
             )
             .await
             {
@@ -205,8 +249,11 @@ impl Sched {
 
     fn skip_block(self, block_id: String) {
         spawn_local(async move {
-            match invoke::<CalendarBlock>("skip_scheduled_block", json!({ "block_id": block_id }))
-                .await
+            match invoke_schedule::<CalendarBlock>(
+                "skip_scheduled_block",
+                json!({ "blockId": block_id }),
+            )
+            .await
             {
                 Ok(_) => {
                     self.state.notice.set(Some("Block skipped.".to_string()));
@@ -220,7 +267,7 @@ impl Sched {
 
     fn complete_task(self, task_id: String) {
         spawn_local(async move {
-            match invoke::<Task>("complete_task", json!({ "id": task_id })).await {
+            match invoke_schedule::<Task>("complete_task", json!({ "id": task_id })).await {
                 Ok(_) => {
                     self.state.notice.set(Some("Task completed.".to_string()));
                     self.reload();
@@ -231,13 +278,9 @@ impl Sched {
         });
     }
 
-    /// Drop the currently-dragged task onto a local date + whole-hour slot.
-    fn drop_at(self, y: i32, mo: u32, d: u32, hour: u32) {
-        self.active_zone.set(None);
-        let Some(drag) = self.drag.get_untracked() else {
-            return;
-        };
-        self.drag.set(None);
+    /// Shared scheduling core for both native drop and pointer placement: build a
+    /// schedule input from a payload + local date/hour and invoke the backend.
+    fn schedule_drag(self, drag: DragData, y: i32, mo: u32, d: u32, hour: u32) {
         match local_to_utc(y, mo, d, hour) {
             Ok(start) => {
                 let input = ScheduleTaskInput {
@@ -256,27 +299,184 @@ impl Sched {
         }
     }
 
-    /// Drop onto the unschedule zone: only meaningful for an already-scheduled task.
-    fn drop_unschedule(self) {
-        self.active_zone.set(None);
-        let Some(drag) = self.drag.get_untracked() else {
-            return;
-        };
-        self.drag.set(None);
+    fn unschedule_drag(self, drag: DragData) {
         if drag.block_id.is_some() {
             self.clear(drag.task_id.clone());
+        } else {
+            self.state
+                .notice
+                .set(Some("That task is already unscheduled.".to_string()));
         }
+    }
+
+    // --- native drag/drop entry points ---
+
+    /// Handle a native drop onto a date + whole-hour slot.
+    fn drop_at(self, ev: &web_sys::DragEvent, y: i32, mo: u32, d: u32, hour: u32) {
+        self.active_zone.set(None);
+        match read_drop_payload(ev, self) {
+            Some(drag) => {
+                trace(format!("[sched] drop slot {y:04}-{mo:02}-{d:02} {hour}:00"));
+                self.drag.set(None);
+                self.schedule_drag(drag, y, mo, d, hour);
+            }
+            None => {
+                self.drag.set(None);
+                self.state
+                    .fail("Drop failed", "no task payload found.".to_string());
+            }
+        }
+    }
+
+    /// Handle a native drop onto the unschedule zone.
+    fn drop_unschedule(self, ev: &web_sys::DragEvent) {
+        self.active_zone.set(None);
+        match read_drop_payload(ev, self) {
+            Some(drag) => {
+                trace("[sched] drop unschedule");
+                self.drag.set(None);
+                self.unschedule_drag(drag);
+            }
+            None => {
+                self.drag.set(None);
+                self.state
+                    .fail("Drop failed", "no task payload found.".to_string());
+            }
+        }
+    }
+
+    // --- pointer "Move mode" entry points ---
+
+    fn start_move(self, drag: DragData) {
+        trace(format!("[sched] move start task={}", drag.task_id));
+        self.moving.set(Some(drag));
+    }
+
+    fn cancel_move(self) {
+        self.moving.set(None);
+    }
+
+    fn place_at(self, y: i32, mo: u32, d: u32, hour: u32) {
+        let Some(drag) = self.moving.get_untracked() else {
+            return;
+        };
+        self.moving.set(None);
+        trace(format!(
+            "[sched] place slot {y:04}-{mo:02}-{d:02} {hour}:00"
+        ));
+        self.schedule_drag(drag, y, mo, d, hour);
+    }
+
+    fn place_unschedule(self) {
+        let Some(drag) = self.moving.get_untracked() else {
+            return;
+        };
+        self.moving.set(None);
+        self.unschedule_drag(drag);
     }
 }
 
 async fn load_schedule_data() -> Result<ScheduleData, String> {
     Ok(ScheduleData {
-        today: invoke("get_schedule_today", json!({})).await?,
-        week: invoke("get_schedule_week", json!({})).await?,
-        unscheduled: invoke("get_unscheduled_tasks", json!({})).await?,
-        overdue: invoke("get_overdue_tasks", json!({})).await?,
-        conflicts: invoke("list_schedule_conflicts", json!({})).await?,
+        today: invoke_schedule("get_schedule_today", json!({})).await?,
+        week: invoke_schedule("get_schedule_week", json!({})).await?,
+        unscheduled: invoke_schedule("get_unscheduled_tasks", json!({})).await?,
+        overdue: invoke_schedule("get_overdue_tasks", json!({})).await?,
+        conflicts: invoke_schedule("list_schedule_conflicts", json!({})).await?,
     })
+}
+
+async fn invoke_schedule<T: DeserializeOwned>(
+    command: &str,
+    args: serde_json::Value,
+) -> Result<T, String> {
+    invoke(command, args)
+        .await
+        .map_err(|error| format!("{command}: {error}"))
+}
+
+// --- drag payload plumbing -------------------------------------------------
+
+fn drag_from_task(task: &Task) -> DragData {
+    let duration = match (task.scheduled_start_at, task.scheduled_end_at) {
+        (Some(start), Some(end)) => (end - start).num_minutes().max(5),
+        _ => task
+            .estimated_minutes
+            .or(task.time_limit_minutes)
+            .map(i64::from)
+            .unwrap_or(60)
+            .clamp(5, 24 * 60),
+    };
+    DragData {
+        task_id: task.id.clone(),
+        title: task.title.clone(),
+        block_id: task.calendar_block_id.clone(),
+        duration_minutes: duration,
+        reminder_at: task.reminder_at,
+        deadline_at: task.deadline_at,
+        recurrence_rule: task.recurrence_rule,
+        recurrence_timezone: task.recurrence_timezone.clone(),
+    }
+}
+
+/// Start a native drag: stash the payload both as `DataTransfer` JSON (primary)
+/// and in the signal (fallback), and set the move drop-effect.
+fn begin_drag(ev: &web_sys::DragEvent, ctx: Sched, data: DragData) {
+    ctx.drag.set(Some(data.clone()));
+    if let Some(transfer) = ev.data_transfer() {
+        match serde_json::to_string(&data) {
+            Ok(payload) => {
+                let _ = transfer.set_data(DRAG_MIME, &payload);
+            }
+            Err(error) => trace(format!("[sched] serialize failed: {error}")),
+        }
+        let _ = transfer.set_data("text/plain", &data.title);
+        transfer.set_effect_allowed("move");
+    }
+    trace(format!("[sched] dragstart task={}", data.task_id));
+}
+
+/// Read the drop payload: prefer the serialized `DataTransfer` JSON, fall back to
+/// the in-memory signal. Returns `None` only when neither is present.
+fn read_drop_payload(ev: &web_sys::DragEvent, ctx: Sched) -> Option<DragData> {
+    if let Some(transfer) = ev.data_transfer()
+        && let Ok(payload) = transfer.get_data(DRAG_MIME)
+        && !payload.is_empty()
+    {
+        match serde_json::from_str::<DragData>(&payload) {
+            Ok(data) => {
+                trace("[sched] payload from DataTransfer");
+                return Some(data);
+            }
+            Err(error) => trace(format!("[sched] payload parse failed: {error}")),
+        }
+    }
+    let fallback = ctx.drag.get_untracked();
+    if fallback.is_some() {
+        trace("[sched] payload from signal fallback");
+    }
+    fallback
+}
+
+fn allow_drop(ev: &web_sys::DragEvent) {
+    ev.prevent_default();
+    if let Some(transfer) = ev.data_transfer() {
+        transfer.set_drop_effect("move");
+    }
+}
+
+fn copy_to_clipboard(state: AppState, text: String) {
+    let Some(clipboard) = web_sys::window().map(|window| window.navigator().clipboard()) else {
+        state.fail("Copy failed", "clipboard is unavailable".into());
+        return;
+    };
+    let promise = clipboard.write_text(&text);
+    spawn_local(async move {
+        match JsFuture::from(promise).await {
+            Ok(_) => state.notice.set(Some("ICS copied to clipboard.".into())),
+            Err(_) => state.fail("Copy failed", "clipboard write was blocked".into()),
+        }
+    });
 }
 
 // --- small helpers ---------------------------------------------------------
@@ -291,27 +491,6 @@ fn local_to_utc(y: i32, mo: u32, d: u32, hour: u32) -> Result<DateTime<Utc>, Str
 fn combine_local(date: &str, time: &str) -> Result<DateTime<Utc>, String> {
     parse_datetime_local(format!("{date}T{time}"))?
         .ok_or_else(|| "Invalid date or time.".to_string())
-}
-
-fn drag_from_task(task: &Task) -> DragData {
-    let duration = match (task.scheduled_start_at, task.scheduled_end_at) {
-        (Some(start), Some(end)) => (end - start).num_minutes().max(5),
-        _ => task
-            .estimated_minutes
-            .or(task.time_limit_minutes)
-            .map(i64::from)
-            .unwrap_or(60)
-            .clamp(5, 24 * 60),
-    };
-    DragData {
-        task_id: task.id.clone(),
-        block_id: task.calendar_block_id.clone(),
-        duration_minutes: duration,
-        reminder_at: task.reminder_at,
-        deadline_at: task.deadline_at,
-        recurrence_rule: task.recurrence_rule,
-        recurrence_timezone: task.recurrence_timezone.clone(),
-    }
 }
 
 /// Visual state of a scheduled block relative to the live clock.
@@ -351,34 +530,6 @@ fn week_columns(now: DateTime<Utc>) -> Vec<DayColumn> {
         .collect()
 }
 
-fn allow_drop(ev: &web_sys::DragEvent) {
-    ev.prevent_default();
-    if let Some(transfer) = ev.data_transfer() {
-        transfer.set_drop_effect("move");
-    }
-}
-
-fn begin_drag(ev: &web_sys::DragEvent, label: &str) {
-    if let Some(transfer) = ev.data_transfer() {
-        let _ = transfer.set_data("text/plain", label);
-        transfer.set_effect_allowed("move");
-    }
-}
-
-fn copy_to_clipboard(state: AppState, text: String) {
-    let Some(clipboard) = web_sys::window().map(|window| window.navigator().clipboard()) else {
-        state.fail("Copy failed", "clipboard is unavailable".into());
-        return;
-    };
-    let promise = clipboard.write_text(&text);
-    spawn_local(async move {
-        match JsFuture::from(promise).await {
-            Ok(_) => state.notice.set(Some("ICS copied to clipboard.".into())),
-            Err(_) => state.fail("Copy failed", "clipboard write was blocked".into()),
-        }
-    });
-}
-
 // --- page ------------------------------------------------------------------
 
 #[component]
@@ -389,6 +540,7 @@ pub fn SchedulePage(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoV
         loading: RwSignal::new(true),
         generation: StoredValue::new(0),
         drag: RwSignal::new(None),
+        moving: RwSignal::new(None),
         active_zone: RwSignal::new(None),
         modal: RwSignal::new(None),
         ics: RwSignal::new(None),
@@ -406,7 +558,7 @@ pub fn SchedulePage(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoV
     let reload = Callback::new(move |_| ctx.reload());
     let export = Callback::new(move |_| {
         spawn_local(async move {
-            match invoke::<String>("generate_schedule_ics", json!({})).await {
+            match invoke_schedule::<String>("generate_schedule_ics", json!({})).await {
                 Ok(text) => ctx.ics.set(Some(text)),
                 Err(error) => ctx.state.fail("Export ICS failed", error),
             }
@@ -414,47 +566,72 @@ pub fn SchedulePage(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoV
     });
 
     view! {
-        <PageHeader
-            eyebrow="SCHEDULING"
-            title="Schedule"
-            description="Plan work across today, this week, and unscheduled tasks."
-        >
-            <Button variant="ghost" on_click=reload>"Refresh"</Button>
-            <button
-                class="btn btn-ghost sched-conflict-chip"
-                class:has-conflicts=move || !ctx.data.get().conflicts.is_empty()
-                type="button"
-                title="Re-check schedule conflicts"
-                on:click=move |_| ctx.reload()
+        <div class="sched-root" class:sched-is-moving=move || ctx.moving.get().is_some()>
+            <PageHeader
+                eyebrow="SCHEDULING"
+                title="Schedule"
+                description="Plan work across today, this week, and unscheduled tasks."
             >
-                "Conflicts"
-                <span class="sched-conflict-count">{move || ctx.data.get().conflicts.len()}</span>
-            </button>
-            <Button variant="primary" on_click=export>"Export ICS"</Button>
-        </PageHeader>
+                <Button variant="ghost" on_click=reload>"Refresh"</Button>
+                <button
+                    class="btn btn-ghost sched-conflict-chip"
+                    class:has-conflicts=move || !ctx.data.get().conflicts.is_empty()
+                    type="button"
+                    title="Re-check schedule conflicts"
+                    on:click=move |_| ctx.reload()
+                >
+                    "Conflicts"
+                    <span class="sched-conflict-count">{move || ctx.data.get().conflicts.len()}</span>
+                </button>
+                <Button variant="primary" on_click=export>"Export ICS"</Button>
+            </PageHeader>
 
-        {move || (!ctx.data.get().conflicts.is_empty()).then(|| {
-            let n = ctx.data.get().conflicts.len();
-            view! {
-                <div class="banner sched-conflict-banner">
-                    <span>{format!("⚠ {n} scheduling conflict{} — overlapping blocks are listed below.", if n == 1 { "" } else { "s" })}</span>
+            {move || ctx.moving.get().map(|drag| view! {
+                <div class="banner sched-move-banner">
+                    <span>{format!("Moving “{}” — click a time slot or day to place it, or the Unscheduled panel to clear.", drag.title)}</span>
+                    <button class="banner-dismiss" type="button" on:click=move |_| ctx.cancel_move()>"Cancel"</button>
                 </div>
-            }
-        })}
+            })}
 
-        <div class="sched-layout">
-            <div class="sched-main"><TodayTimeline ctx /></div>
-            <div class="sched-side">
-                <UnscheduledPanel ctx />
-                <OverduePanel ctx />
+            {move || (!ctx.data.get().conflicts.is_empty()).then(|| {
+                let n = ctx.data.get().conflicts.len();
+                view! {
+                    <div class="banner sched-conflict-banner">
+                        <span>{format!("⚠ {n} scheduling conflict{} — overlapping blocks are listed below.", if n == 1 { "" } else { "s" })}</span>
+                    </div>
+                }
+            })}
+
+            <div class="sched-layout">
+                <div class="sched-main"><TodayTimeline ctx /></div>
+                <div class="sched-side">
+                    <UnscheduledPanel ctx />
+                    <OverduePanel ctx />
+                </div>
             </div>
+
+            <WeekView ctx />
+            <ConflictsPanel ctx />
+
+            <ScheduleModal ctx />
+            <IcsModal ctx />
         </div>
+    }
+}
 
-        <WeekView ctx />
-        <ConflictsPanel ctx />
-
-        <ScheduleModal ctx />
-        <IcsModal ctx />
+/// Small grab handle that both seeds the native drag and starts pointer "Move
+/// mode" on click, so dragging *and* click-to-place both work from one control.
+#[component]
+fn DragHandle(ctx: Sched, task: Task) -> impl IntoView {
+    let move_data = drag_from_task(&task);
+    view! {
+        <button
+            class="sched-drag-handle"
+            type="button"
+            title="Drag to move, or click then pick a slot"
+            aria-label="Move task"
+            on:click=move |ev| { ev.stop_propagation(); ctx.start_move(move_data.clone()); }
+        >"⠿"</button>
     }
 }
 
@@ -512,6 +689,7 @@ fn TodayTimeline(ctx: Sched) -> impl IntoView {
                                 <div
                                     class="sched-slot"
                                     class:drop-active=move || ctx.active_zone.get().as_deref() == Some(format!("today-{h}").as_str())
+                                    on:dragenter=move |ev| { ev.prevent_default(); ctx.active_zone.set(Some(format!("today-{h}"))); }
                                     on:dragover=move |ev| {
                                         allow_drop(&ev);
                                         let id = format!("today-{h}");
@@ -519,7 +697,13 @@ fn TodayTimeline(ctx: Sched) -> impl IntoView {
                                             ctx.active_zone.set(Some(id));
                                         }
                                     }
-                                    on:drop=move |ev| { ev.prevent_default(); ctx.drop_at(ty, tmo, td, h); }
+                                    on:dragleave=move |_| {
+                                        let id = format!("today-{h}");
+                                        if ctx.active_zone.get_untracked().as_deref() == Some(id.as_str()) {
+                                            ctx.active_zone.set(None);
+                                        }
+                                    }
+                                    on:drop=move |ev| { ev.prevent_default(); ev.stop_propagation(); ctx.drop_at(&ev, ty, tmo, td, h); }
                                 >
                                     <span class="sched-slot-label">{hour_label(h)}</span>
                                     <div class="sched-slot-body">
@@ -529,6 +713,12 @@ fn TodayTimeline(ctx: Sched) -> impl IntoView {
                                             blocks.into_iter().map(|row| view! { <ScheduledCard ctx row /> }).collect_view().into_any()
                                         }}
                                     </div>
+                                    <button
+                                        class="sched-move-target"
+                                        type="button"
+                                        aria-label=move || format!("Place task at {}", hour_label(h))
+                                        on:click=move |_| ctx.place_at(ty, tmo, td, h)
+                                    ></button>
                                 </div>
                             }
                         }).collect_view()}
@@ -565,7 +755,7 @@ fn ScheduledCard(ctx: Sched, row: TaskWithContext) -> impl IntoView {
     let block_id = task.calendar_block_id.clone();
 
     let drag_task = task.clone();
-    let drag_label = title.clone();
+    let handle_task = task.clone();
     let title_task = task.clone();
     let resched_task = task.clone();
     let clear_id = task.id.clone();
@@ -581,13 +771,14 @@ fn ScheduledCard(ctx: Sched, row: TaskWithContext) -> impl IntoView {
         <article
             class=card_class
             draggable="true"
-            on:dragstart=move |ev| { ctx.drag.set(Some(drag_from_task(&drag_task))); begin_drag(&ev, &drag_label); }
+            on:dragstart=move |ev| begin_drag(&ev, ctx, drag_from_task(&drag_task))
             on:dragend=move |_| ctx.active_zone.set(None)
         >
             <div class="sched-card-head">
                 <PriorityBadge value=priority />
                 <span class="sched-card-time">{time_label}</span>
                 {recurrence.map(|rule| view! { <span class="sched-recur" title="Repeats">{"↻ "}{recurrence_label(rule)}</span> })}
+                <DragHandle ctx task=handle_task />
             </div>
             <button class="sched-card-title" on:click=move |_| ctx.modal.set(Some(ScheduleTarget::new(title_task.clone())))>{title}</button>
             <div class="sched-card-meta">
@@ -624,13 +815,19 @@ fn UnscheduledPanel(ctx: Sched) -> impl IntoView {
         <section
             class="panel sched-side-panel"
             class:drop-active=move || ctx.active_zone.get().as_deref() == Some("unschedule")
+            on:dragenter=move |ev| { ev.prevent_default(); ctx.active_zone.set(Some("unschedule".to_string())); }
             on:dragover=move |ev| {
                 allow_drop(&ev);
                 if ctx.active_zone.get_untracked().as_deref() != Some("unschedule") {
                     ctx.active_zone.set(Some("unschedule".to_string()));
                 }
             }
-            on:drop=move |ev| { ev.prevent_default(); ctx.drop_unschedule(); }
+            on:dragleave=move |_| {
+                if ctx.active_zone.get_untracked().as_deref() == Some("unschedule") {
+                    ctx.active_zone.set(None);
+                }
+            }
+            on:drop=move |ev| { ev.prevent_default(); ev.stop_propagation(); ctx.drop_unschedule(&ev); }
         >
             <div class="section-head">
                 <div class="section-head-title">
@@ -655,6 +852,12 @@ fn UnscheduledPanel(ctx: Sched) -> impl IntoView {
                     </div>
                 }.into_any()
             }}
+            <button
+                class="sched-move-target sched-move-unschedule"
+                type="button"
+                aria-label="Unschedule the task being moved"
+                on:click=move |_| ctx.place_unschedule()
+            ></button>
         </section>
     }
 }
@@ -674,7 +877,7 @@ fn UnscheduledCard(ctx: Sched, row: TaskWithContext) -> impl IntoView {
     let estimate = task.estimated_minutes.or(task.time_limit_minutes);
 
     let drag_task = task.clone();
-    let drag_label = title.clone();
+    let handle_task = task.clone();
     let title_task = task.clone();
     let schedule_task = task;
 
@@ -682,12 +885,13 @@ fn UnscheduledCard(ctx: Sched, row: TaskWithContext) -> impl IntoView {
         <article
             class="sched-card sched-card-queued"
             draggable="true"
-            on:dragstart=move |ev| { ctx.drag.set(Some(drag_from_task(&drag_task))); begin_drag(&ev, &drag_label); }
+            on:dragstart=move |ev| begin_drag(&ev, ctx, drag_from_task(&drag_task))
             on:dragend=move |_| ctx.active_zone.set(None)
         >
             <div class="sched-card-head">
                 <PriorityBadge value=priority />
                 {estimate.map(|minutes| view! { <span class="sched-card-est">{format!("~{minutes}m")}</span> })}
+                <DragHandle ctx task=handle_task />
             </div>
             <button class="sched-card-title" on:click=move |_| ctx.modal.set(Some(ScheduleTarget::new(title_task.clone())))>{title}</button>
             <div class="sched-card-meta">
@@ -801,7 +1005,9 @@ fn WeekView(ctx: Sched) -> impl IntoView {
                             let is_today = col.is_today;
                             let zone = format!("week-{y}-{mo}-{d}");
                             let zone_class = zone.clone();
-                            let zone_over = zone;
+                            let zone_enter = zone.clone();
+                            let zone_over = zone.clone();
+                            let zone_leave = zone;
 
                             let mut day_rows: Vec<TaskWithContext> = week
                                 .iter()
@@ -814,13 +1020,19 @@ fn WeekView(ctx: Sched) -> impl IntoView {
                                 <div
                                     class=if is_today { "sched-week-day sched-week-today" } else { "sched-week-day" }
                                     class:drop-active=move || ctx.active_zone.get().as_deref() == Some(zone_class.as_str())
+                                    on:dragenter=move |ev| { ev.prevent_default(); ctx.active_zone.set(Some(zone_enter.clone())); }
                                     on:dragover=move |ev| {
                                         allow_drop(&ev);
                                         if ctx.active_zone.get_untracked().as_deref() != Some(zone_over.as_str()) {
                                             ctx.active_zone.set(Some(zone_over.clone()));
                                         }
                                     }
-                                    on:drop=move |ev| { ev.prevent_default(); ctx.drop_at(y, mo, d, 9); }
+                                    on:dragleave=move |_| {
+                                        if ctx.active_zone.get_untracked().as_deref() == Some(zone_leave.as_str()) {
+                                            ctx.active_zone.set(None);
+                                        }
+                                    }
+                                    on:drop=move |ev| { ev.prevent_default(); ev.stop_propagation(); ctx.drop_at(&ev, y, mo, d, 9); }
                                 >
                                     <div class="sched-week-head">
                                         <span class="sched-week-dow">{weekday}</span>
@@ -835,6 +1047,12 @@ fn WeekView(ctx: Sched) -> impl IntoView {
                                             </div>
                                         }.into_any()
                                     }}
+                                    <button
+                                        class="sched-move-target"
+                                        type="button"
+                                        aria-label="Place task on this day"
+                                        on:click=move |_| ctx.place_at(y, mo, d, 9)
+                                    ></button>
                                 </div>
                             }
                         }).collect_view()}
@@ -853,7 +1071,6 @@ fn WeekLine(ctx: Sched, row: TaskWithContext) -> impl IntoView {
     let start_label = task.scheduled_start_at.map(fmt_time).unwrap_or_default();
 
     let drag_task = task.clone();
-    let drag_label = title.clone();
     let modal_task = task;
 
     view! {
@@ -861,7 +1078,7 @@ fn WeekLine(ctx: Sched, row: TaskWithContext) -> impl IntoView {
             class="sched-week-line"
             draggable="true"
             title="Drag to move · click to reschedule"
-            on:dragstart=move |ev| { ctx.drag.set(Some(drag_from_task(&drag_task))); begin_drag(&ev, &drag_label); }
+            on:dragstart=move |ev| begin_drag(&ev, ctx, drag_from_task(&drag_task))
             on:dragend=move |_| ctx.active_zone.set(None)
             on:click=move |_| ctx.modal.set(Some(ScheduleTarget::new(modal_task.clone())))
         >

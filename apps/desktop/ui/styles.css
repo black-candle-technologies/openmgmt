@@ -969,6 +969,7 @@ a { color: inherit; }
 }
 .sched-timeline { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: var(--radius-sm); overflow: hidden; }
 .sched-slot {
+  position: relative;
   display: grid; grid-template-columns: 66px minmax(0, 1fr); gap: 12px;
   padding: 8px 12px; border-bottom: 1px solid var(--line); min-height: 50px;
   transition: background 0.12s ease, box-shadow 0.12s ease;
@@ -1006,6 +1007,7 @@ a { color: inherit; }
 .sched-mini { padding: 5px 10px; font-size: 12px; }
 
 /* Side rail panels (Unscheduled / Overdue) */
+.sched-side-panel { position: relative; }
 .sched-side-hint { margin: -6px 0 12px; color: var(--text-muted); font-size: 12px; line-height: 1.45; }
 .sched-card-list { display: flex; flex-direction: column; gap: 9px; }
 .sched-clear { color: var(--text-muted); font: 11px var(--mono); text-transform: uppercase; text-align: center; padding: 16px 0; }
@@ -1024,6 +1026,7 @@ a { color: inherit; }
 /* Week agenda */
 .sched-week { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 10px; }
 .sched-week-day {
+  position: relative;
   min-width: 0; display: flex; flex-direction: column; gap: 7px;
   background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm);
   padding: 9px; min-height: 120px; transition: background 0.12s ease, box-shadow 0.12s ease;
@@ -1089,6 +1092,44 @@ a { color: inherit; }
 
 /* Scheduling indicators on shared task cards (Today / Dashboard / Daily Ops) */
 .task-card-sched { font: 700 11px var(--mono); color: var(--green); }
+
+/* Drag-and-drop: grab handle, native drop-over cue, and pointer "Move mode" */
+.sched-root { display: block; }
+
+.sched-drag-handle {
+  margin-left: auto; flex-shrink: 0; cursor: grab;
+  border: 1px solid var(--line); background: var(--surface-sunken); color: var(--text-muted);
+  border-radius: var(--radius-sm); padding: 1px 7px; font-size: 13px; line-height: 1.5;
+}
+.sched-drag-handle:hover { background: var(--line); color: var(--text-soft); }
+.sched-drag-handle:active { cursor: grabbing; }
+
+/* The native drop-over highlight should read as a valid target. */
+.sched-slot.drop-active .sched-slot-label { color: var(--green); }
+
+/* Move-mode banner (amber, distinct from error/notice) */
+.sched-move-banner { background: #eaf0db; color: #4a5b20; border-color: #d7e2bd; }
+
+/* Pointer "Move mode" target overlay: inert until a move is in progress, then it
+   covers its slot/day/panel so a click lands on the target rather than a card. */
+.sched-move-target {
+  position: absolute; inset: 0; z-index: 5;
+  border: 0; background: transparent; padding: 0;
+  border-radius: inherit; cursor: pointer; pointer-events: none;
+}
+.sched-is-moving .sched-move-target { pointer-events: auto; }
+.sched-is-moving .sched-slot,
+.sched-is-moving .sched-week-day {
+  outline: 1px dashed var(--lime-deep); outline-offset: -3px;
+}
+.sched-is-moving .sched-slot .sched-move-target:hover,
+.sched-is-moving .sched-week-day .sched-move-target:hover {
+  background: rgba(201, 239, 106, 0.22); box-shadow: inset 0 0 0 2px var(--lime-deep);
+}
+.sched-is-moving .sched-side-panel { outline: 1px dashed var(--warn); outline-offset: -3px; }
+.sched-is-moving .sched-move-unschedule:hover {
+  background: rgba(141, 48, 43, 0.12); box-shadow: inset 0 0 0 2px var(--danger);
+}
 
 /* Responsive */
 @media (max-width: 1180px) {
