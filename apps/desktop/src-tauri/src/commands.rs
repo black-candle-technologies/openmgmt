@@ -214,6 +214,15 @@ pub fn get_schedule_week(service: State<'_, AppService>) -> CommandResult<Vec<Ta
 }
 
 #[tauri::command]
+pub fn get_schedule_for_day(
+    service: State<'_, AppService>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> CommandResult<Vec<TaskWithContext>> {
+    core(service.get_schedule_for_day(start, end))
+}
+
+#[tauri::command]
 pub fn get_unscheduled_tasks(
     service: State<'_, AppService>,
 ) -> CommandResult<Vec<TaskWithContext>> {
@@ -223,6 +232,11 @@ pub fn get_unscheduled_tasks(
 #[tauri::command]
 pub fn get_overdue_tasks(service: State<'_, AppService>) -> CommandResult<Vec<TaskWithContext>> {
     core(service.get_overdue_tasks())
+}
+
+#[tauri::command]
+pub fn auto_start_due_scheduled_tasks(service: State<'_, AppService>) -> CommandResult<Vec<Task>> {
+    core(service.auto_start_due_scheduled_tasks())
 }
 
 #[tauri::command]

@@ -86,7 +86,9 @@ fn run_timer_command(
     spawn_local(async move {
         // Timer commands return either a session or a task; we only need the
         // success/failure signal, so deserialize into the permissive Value.
-        let result = invoke::<serde_json::Value>(command, json!({ "task_id": task_id })).await;
+        // Tauri v2 deserializes command args as camelCase, so the key must be
+        // `taskId` (not `task_id`) to match the `task_id` Rust parameter.
+        let result = invoke::<serde_json::Value>(command, json!({ "taskId": task_id })).await;
         finish_action(state, result, success, context).await;
     });
 }
@@ -202,7 +204,7 @@ pub fn TaskTimerPanel(
         spawn_local(async move {
             if let Ok(session) = invoke::<Option<TaskTimerSession>>(
                 "get_active_timer_session",
-                json!({ "task_id": id.clone() }),
+                json!({ "taskId": id.clone() }),
             )
             .await
             {
@@ -213,11 +215,9 @@ pub fn TaskTimerPanel(
                 );
                 queried_at.set(fetched_at);
             }
-            if let Ok(list) = invoke::<Vec<TaskTimerSession>>(
-                "list_task_timer_sessions",
-                json!({ "task_id": id }),
-            )
-            .await
+            if let Ok(list) =
+                invoke::<Vec<TaskTimerSession>>("list_task_timer_sessions", json!({ "taskId": id }))
+                    .await
             {
                 sessions.set(list);
             }

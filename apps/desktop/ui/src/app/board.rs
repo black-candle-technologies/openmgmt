@@ -5,15 +5,32 @@
 //! The same `ErBoard` table powers both the embedded in-app Board page and the
 //! dedicated full-window TV board (`BoardView`).
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use leptos::prelude::*;
-use openmgmt_core::{BoardState, ScoredTask, Task, TaskStatus};
+use openmgmt_core::{BoardState, RecurrenceRule, ScoredTask, Task, TaskStatus};
 use serde_json::json;
 use wasm_bindgen_futures::spawn_local;
 
 use super::components::{PriorityBadge, priority_label};
-use super::state::{AppState, humanize, invoke};
+use super::state::{AppState, fmt_time_range, humanize, invoke, recurrence_label};
 use super::tags::TagChip;
+
+/// A scheduled task "starts soon" when its planned start is within this window.
+const STARTS_SOON: Duration = Duration::minutes(30);
+
+/// Local time-range label for a task's scheduled block, when it has one.
+fn scheduled_range(task: &Task) -> Option<String> {
+    match (task.scheduled_start_at, task.scheduled_end_at) {
+        (Some(start), Some(end)) => Some(fmt_time_range(start, end)),
+        _ => None,
+    }
+}
+
+/// A recurring task's rule, or `None` for one-off / unset work.
+fn recurrence_of(task: &Task) -> Option<RecurrenceRule> {
+    task.recurrence_rule
+        .filter(|rule| *rule != RecurrenceRule::None)
+}
 
 /// Total tasks across every urgency bucket (includes "done today").
 pub fn board_task_count(board: &BoardState) -> usize {
@@ -111,6 +128,7 @@ fn ErRow(item: ScoredTask, tone: &'static str, now: Signal<DateTime<Utc>>) -> im
     let tags = task.tags.clone();
     let started_at = task.started_at;
     let limit = task.time_limit_minutes;
+    let recurrence = recurrence_of(&task);
 
     // DUE / WAIT cell: a blocked/waiting reason takes precedence; otherwise the
     // due time (with date for overdue), else a scheduled time, else nothing.
@@ -142,6 +160,7 @@ fn ErRow(item: ScoredTask, tone: &'static str, now: Signal<DateTime<Utc>>) -> im
             <span class="er-col-task">
                 {pinned.then(|| view! { <span class="er-pin" title="Pinned">"★"</span> })}
                 <span class="er-task-title" title=title_tooltip>{title}</span>
+                {recurrence.map(|rule| view! { <span class="er-recur" title="Repeats">{"↻ "}{recurrence_label(rule)}</span> })}
             </span>
             <span class="er-col-org">
                 <span class="er-org-dot" style=format!("background:{org_color}")></span>
@@ -236,6 +255,20 @@ fn BoardCard(
         "bc-due"
     };
 
+    // Scheduling indicators: planned time range, repeat badge, and a live
+    // "starts soon" / "overdue" cue derived from the card's tone + the clock.
+    let sched_range = scheduled_range(&task);
+    let recurrence = recurrence_of(&task);
+    let sched_start = task.scheduled_start_at;
+    let starts_soon = move || {
+        tone == "later"
+            && sched_start.is_some_and(|start| {
+                let n = now.get();
+                start > n && start - n <= STARTS_SOON
+            })
+    };
+    let overdue_sched = tone == "overdue" && task.scheduled_end_at.is_some();
+
     let timer = move || {
         started_at.map(|at| {
             view! {
@@ -247,12 +280,14 @@ fn BoardCard(
     };
 
     if size == "lower" {
+        let recurrence_line = recurrence;
         return view! {
             <div class=format!("board-line board-line-{tone}")>
                 <span class=format!("bc-pri bc-pri-p{priority}") title=title_attr>{format!("P{priority}")}</span>
                 <span class="bc-line-title">
                     {pinned.then(|| view! { <span class="bc-pin">"★"</span> })}
                     {title}
+                    {recurrence_line.map(|rule| view! { <span class="bc-recur" title="Repeats">{"↻ "}{recurrence_label(rule)}</span> })}
                 </span>
                 <span class=format!("bc-status bc-status-{tone}")>{status_label}</span>
                 <span class=due_class>{due}</span>
@@ -278,6 +313,14 @@ fn BoardCard(
                 <span class="bc-sep">"·"</span>
                 <span class="bc-project">{project}</span>
             </div>
+            {(sched_range.is_some() || recurrence.is_some() || overdue_sched).then(|| view! {
+                <div class="bc-sched">
+                    {sched_range.map(|range| view! { <span class="bc-sched-time" title="Scheduled block">{"◷ "}{range}</span> })}
+                    {recurrence.map(|rule| view! { <span class="bc-recur" title="Repeats">{"↻ "}{recurrence_label(rule)}</span> })}
+                    {overdue_sched.then(|| view! { <span class="bc-sched-overdue" title="Scheduled block elapsed">"⚠ Overdue"</span> })}
+                    {move || starts_soon().then(|| view! { <span class="bc-sched-soon" title="Starts soon">"⏱ Starts soon"</span> })}
+                </div>
+            })}
             <div class="bc-stats">
                 <span class=due_class>{due}</span>
                 {timer}

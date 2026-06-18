@@ -55,7 +55,9 @@ fn trace(message: impl AsRef<str>) {
 /// All schedule data the page renders, loaded together so the views stay in sync.
 #[derive(Clone, Default)]
 struct ScheduleData {
-    today: Vec<TaskWithContext>,
+    /// Scheduled tasks for the *selected* day (not necessarily real today).
+    day: Vec<TaskWithContext>,
+    /// Scheduled tasks for the week containing the selected day.
     week: Vec<TaskWithContext>,
     unscheduled: Vec<TaskWithContext>,
     overdue: Vec<TaskWithContext>,
@@ -101,7 +103,10 @@ struct DayColumn {
     mo: u32,
     d: u32,
     weekday: &'static str,
+    /// True when this column is the real wall-clock today.
     is_today: bool,
+    /// True when this column is the user's currently selected schedule day.
+    is_selected: bool,
 }
 
 /// Shared, `Copy` handle bundling every signal the schedule surfaces need, so
@@ -121,6 +126,8 @@ struct Sched {
     modal: RwSignal<Option<ScheduleTarget>>,
     ics: RwSignal<Option<String>>,
     now: Signal<DateTime<Utc>>,
+    /// The local day the timeline + week view are focused on, as `(year, month, day)`.
+    selected_day: RwSignal<(i32, u32, u32)>,
 }
 
 impl Sched {
@@ -130,8 +137,9 @@ impl Sched {
         let token = self.generation.get_value().wrapping_add(1);
         self.generation.set_value(token);
         self.loading.set(true);
+        let day = self.selected_day.get_untracked();
         spawn_local(async move {
-            let result = load_schedule_data().await;
+            let result = load_schedule_data(day).await;
             if self.generation.get_value() != token {
                 return;
             }
@@ -144,6 +152,25 @@ impl Sched {
             }
             self.loading.set(false);
         });
+    }
+
+    /// Focus the timeline + week view on a specific local day and reload its data.
+    fn select_day(self, day: (i32, u32, u32)) {
+        if self.selected_day.get_untracked() != day {
+            self.selected_day.set(day);
+            self.reload();
+        }
+    }
+
+    /// Step the selected day by `delta` days (negative = earlier).
+    fn shift_day(self, delta: i32) {
+        let (y, mo, d) = self.selected_day.get_untracked();
+        self.select_day(shift_local_day(y, mo, d, delta));
+    }
+
+    /// Jump the selection back to the real wall-clock today.
+    fn select_today(self) {
+        self.select_day(local_ymd(Utc::now()));
     }
 
     /// Schedule or reschedule a task, then refresh and surface a conflict warning
@@ -376,10 +403,20 @@ impl Sched {
     }
 }
 
-async fn load_schedule_data() -> Result<ScheduleData, String> {
+async fn load_schedule_data(day: (i32, u32, u32)) -> Result<ScheduleData, String> {
+    let (day_start, day_end) = local_day_window(day)?;
+    let (week_start, week_end) = local_week_window(day)?;
     Ok(ScheduleData {
-        today: invoke_schedule("get_schedule_today", json!({})).await?,
-        week: invoke_schedule("get_schedule_week", json!({})).await?,
+        day: invoke_schedule(
+            "get_schedule_for_day",
+            json!({ "start": day_start, "end": day_end }),
+        )
+        .await?,
+        week: invoke_schedule(
+            "get_schedule_for_day",
+            json!({ "start": week_start, "end": week_end }),
+        )
+        .await?,
         unscheduled: invoke_schedule("get_unscheduled_tasks", json!({})).await?,
         overdue: invoke_schedule("get_overdue_tasks", json!({})).await?,
         conflicts: invoke_schedule("list_schedule_conflicts", json!({})).await?,
@@ -482,15 +519,59 @@ fn copy_to_clipboard(state: AppState, text: String) {
 // --- small helpers ---------------------------------------------------------
 
 /// Build a UTC instant from a local date + whole hour by reusing the tested
-/// `datetime-local` → UTC bridge.
+/// `datetime-local` → UTC bridge (`combine_local` lives in [`crate::app::state`]).
 fn local_to_utc(y: i32, mo: u32, d: u32, hour: u32) -> Result<DateTime<Utc>, String> {
     combine_local(&format!("{y:04}-{mo:02}-{d:02}"), &format!("{hour:02}:00"))
 }
 
-/// Combine a `YYYY-MM-DD` date and `HH:MM` time (both local) into a UTC instant.
-fn combine_local(date: &str, time: &str) -> Result<DateTime<Utc>, String> {
-    parse_datetime_local(format!("{date}T{time}"))?
-        .ok_or_else(|| "Invalid date or time.".to_string())
+/// Local `(year, month, day)` shifted by `delta` days, handling month/year
+/// rollover via the browser `Date` (which normalises out-of-range day numbers).
+fn shift_local_day(y: i32, mo: u32, d: u32, delta: i32) -> (i32, u32, u32) {
+    let date = js_sys::Date::new_with_year_month_day(y as u32, mo as i32 - 1, d as i32 + delta);
+    (
+        date.get_full_year() as i32,
+        date.get_month() + 1,
+        date.get_date(),
+    )
+}
+
+/// Local day-of-week (0 = Sunday … 6 = Saturday) for a local `(y, mo, d)`.
+fn local_weekday_of(y: i32, mo: u32, d: u32) -> u32 {
+    js_sys::Date::new_with_year_month_day(y as u32, mo as i32 - 1, d as i32).get_day()
+}
+
+/// Monday of the week containing the given local day.
+fn week_monday(y: i32, mo: u32, d: u32) -> (i32, u32, u32) {
+    let weekday = local_weekday_of(y, mo, d); // 0 = Sunday
+    let offset = if weekday == 0 { 6 } else { weekday - 1 } as i32;
+    shift_local_day(y, mo, d, -offset)
+}
+
+/// UTC `[start, end)` window covering the local day (local midnight → next midnight).
+fn local_day_window(day: (i32, u32, u32)) -> Result<(DateTime<Utc>, DateTime<Utc>), String> {
+    let (y, mo, d) = day;
+    let start = local_to_utc(y, mo, d, 0)?;
+    let (ny, nmo, nd) = shift_local_day(y, mo, d, 1);
+    let end = local_to_utc(ny, nmo, nd, 0)?;
+    Ok((start, end))
+}
+
+/// UTC `[start, end)` window covering the Monday-based week containing `day`.
+fn local_week_window(day: (i32, u32, u32)) -> Result<(DateTime<Utc>, DateTime<Utc>), String> {
+    let (my, mmo, md) = week_monday(day.0, day.1, day.2);
+    let start = local_to_utc(my, mmo, md, 0)?;
+    let (ey, emo, ed) = shift_local_day(my, mmo, md, 7);
+    let end = local_to_utc(ey, emo, ed, 0)?;
+    Ok((start, end))
+}
+
+/// Parse a `<input type="date">` value (`YYYY-MM-DD`) into a local `(y, mo, d)`.
+fn parse_local_date(value: &str) -> Option<(i32, u32, u32)> {
+    let mut parts = value.split('-');
+    let y = parts.next()?.parse().ok()?;
+    let mo = parts.next()?.parse().ok()?;
+    let d = parts.next()?.parse().ok()?;
+    Some((y, mo, d))
 }
 
 /// Visual state of a scheduled block relative to the live clock.
@@ -507,27 +588,72 @@ fn block_state(
     }
 }
 
-/// Seven local day columns for the current Monday-based week.
-fn week_columns(now: DateTime<Utc>) -> Vec<DayColumn> {
-    let weekday = local_weekday(now); // 0 = Sunday … 6 = Saturday
-    let offset = if weekday == 0 { 6 } else { weekday - 1 } as i64;
-    let day_ms = 86_400_000i64;
-    let base_ms = now.timestamp_millis();
-    let today = local_ymd(now);
+/// Seven local day columns for the Monday-based week containing `selected`, each
+/// flagged for the real wall-clock today and for the current selection.
+fn week_columns_for(selected: (i32, u32, u32), real_today: (i32, u32, u32)) -> Vec<DayColumn> {
+    let (my, mmo, md) = week_monday(selected.0, selected.1, selected.2);
     (0..7)
         .map(|i| {
-            let ms = base_ms - offset * day_ms + (i as i64) * day_ms;
-            let dt = DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or(now);
-            let (y, mo, d) = local_ymd(dt);
+            let (y, mo, d) = shift_local_day(my, mmo, md, i);
             DayColumn {
                 y,
                 mo,
                 d,
-                weekday: weekday_short(local_weekday(dt)),
-                is_today: (y, mo, d) == today,
+                weekday: weekday_short(local_weekday_of(y, mo, d)),
+                is_today: (y, mo, d) == real_today,
+                is_selected: (y, mo, d) == selected,
             }
         })
         .collect()
+}
+
+/// Friendly label for the selected day, e.g. `Thursday, June 18` (or `Today` when
+/// the selection matches the real wall-clock day).
+fn selected_day_label(selected: (i32, u32, u32), real_today: (i32, u32, u32)) -> String {
+    let (y, mo, d) = selected;
+    let weekday = weekday_full(local_weekday_of(y, mo, d));
+    let date = format!("{}, {} {}", weekday, month_full(mo), d);
+    if selected == real_today {
+        format!("Today · {date}")
+    } else {
+        date
+    }
+}
+
+/// Full weekday name for a 0-based (Sunday) day-of-week.
+fn weekday_full(weekday: u32) -> &'static str {
+    const DAYS: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    DAYS.get(weekday as usize).copied().unwrap_or("")
+}
+
+/// Full month name for a 1-based month number.
+fn month_full(month: u32) -> &'static str {
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    MONTHS
+        .get(month.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or("")
 }
 
 // --- page ------------------------------------------------------------------
@@ -545,6 +671,7 @@ pub fn SchedulePage(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoV
         modal: RwSignal::new(None),
         ics: RwSignal::new(None),
         now: now.into(),
+        selected_day: RwSignal::new(local_ymd(Utc::now())),
     };
 
     // Reload on mount and whenever the global snapshot refreshes (every 10s, and
@@ -585,6 +712,37 @@ pub fn SchedulePage(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoV
                 </button>
                 <Button variant="primary" on_click=export>"Export ICS"</Button>
             </PageHeader>
+
+            <div class="sched-daynav">
+                <div class="sched-daynav-controls">
+                    <button class="btn btn-subtle" type="button" title="Previous day" on:click=move |_| ctx.shift_day(-1)>"‹ Prev"</button>
+                    <button
+                        class="btn btn-subtle"
+                        class:active=move || ctx.selected_day.get() == local_ymd(Utc::now())
+                        type="button"
+                        title="Jump to today"
+                        on:click=move |_| ctx.select_today()
+                    >"Today"</button>
+                    <button class="btn btn-subtle" type="button" title="Next day" on:click=move |_| ctx.shift_day(1)>"Next ›"</button>
+                    <input
+                        class="sched-daynav-date"
+                        type="date"
+                        prop:value=move || { let (y, mo, d) = ctx.selected_day.get(); format!("{y:04}-{mo:02}-{d:02}") }
+                        on:change=move |ev| {
+                            if let Some(day) = parse_local_date(&event_target_value(&ev)) {
+                                ctx.select_day(day);
+                            }
+                        }
+                    />
+                </div>
+                <span class="sched-daynav-label">
+                    {move || selected_day_label(ctx.selected_day.get(), local_ymd(Utc::now()))}
+                </span>
+            </div>
+
+            <p class="sched-explainer">
+                "Scheduled tasks move to NOW during their time block, Later Today before their block, and Overdue if the block passes unfinished. Tasks auto-start when their scheduled time arrives while the app is open."
+            </p>
 
             {move || ctx.moving.get().map(|drag| view! {
                 <div class="banner sched-move-banner">
@@ -639,29 +797,39 @@ fn DragHandle(ctx: Sched, task: Task) -> impl IntoView {
 
 #[component]
 fn TodayTimeline(ctx: Sched) -> impl IntoView {
+    // Heading flips between "Today" and the selected weekday so the main timeline
+    // is never mislabelled when the user has navigated away from the real today.
+    let heading = move || {
+        let selected = ctx.selected_day.get();
+        if selected == local_ymd(Utc::now()) {
+            "Today".to_string()
+        } else {
+            weekday_full(local_weekday_of(selected.0, selected.1, selected.2)).to_string()
+        }
+    };
     view! {
         <section class="panel sched-timeline-panel">
             <div class="section-head">
                 <div class="section-head-title">
-                    <h2>"Today"</h2>
-                    <span class="count-chip">{move || ctx.data.get().today.len()}</span>
+                    <h2>{heading}</h2>
+                    <span class="count-chip">{move || ctx.data.get().day.len()}</span>
                 </div>
                 <span class="sched-today-date">
-                    {move || { let (_, mo, d) = local_ymd(Utc::now()); format!("{} {}", month_short(mo), d) }}
+                    {move || { let (_, mo, d) = ctx.selected_day.get(); format!("{} {}", month_short(mo), d) }}
                 </span>
             </div>
             {move || {
-                let today = ctx.data.get().today;
-                if today.is_empty() && ctx.loading.get() {
+                let day = ctx.data.get().day;
+                if day.is_empty() && ctx.loading.get() {
                     return view! { <LoadingState label="Loading schedule…" /> }.into_any();
                 }
-                let (ty, tmo, td) = local_ymd(Utc::now());
+                let (ty, tmo, td) = ctx.selected_day.get();
 
                 // Core working window 8 AM–8 PM, widened to include any block that
                 // falls outside it so nothing is ever hidden.
                 let mut min_h = 8u32;
                 let mut max_h = 20u32;
-                for row in &today {
+                for row in &day {
                     if let Some(start) = row.task.scheduled_start_at {
                         let sh = local_hour(start);
                         min_h = min_h.min(sh);
@@ -672,15 +840,15 @@ fn TodayTimeline(ctx: Sched) -> impl IntoView {
                     }
                 }
                 let hours: Vec<u32> = (min_h..max_h.min(24)).collect();
-                let empty = today.is_empty();
+                let empty = day.is_empty();
 
                 view! {
                     {empty.then(|| view! {
-                        <p class="sched-empty-hint">"Nothing scheduled today. Drag an unscheduled task here to plan your day."</p>
+                        <p class="sched-empty-hint">"Nothing scheduled for this day. Drag an unscheduled task here to plan it."</p>
                     })}
                     <div class="sched-timeline">
                         {hours.into_iter().map(|h| {
-                            let blocks: Vec<TaskWithContext> = today
+                            let blocks: Vec<TaskWithContext> = day
                                 .iter()
                                 .filter(|row| row.task.scheduled_start_at.map(local_hour) == Some(h))
                                 .cloned()
@@ -993,16 +1161,21 @@ fn WeekView(ctx: Sched) -> impl IntoView {
         <section class="panel sched-week-panel">
             <div class="section-head">
                 <div class="section-head-title"><h2>"This week"</h2></div>
+                <span class="sched-week-hint">"Click a day to plan it"</span>
             </div>
             {move || {
                 let week = ctx.data.get().week;
-                let columns = week_columns(Utc::now());
+                let columns = week_columns_for(ctx.selected_day.get(), local_ymd(Utc::now()));
                 view! {
                     <div class="sched-week">
                         {columns.into_iter().map(|col| {
                             let (y, mo, d) = (col.y, col.mo, col.d);
                             let weekday = col.weekday;
                             let is_today = col.is_today;
+                            let is_selected = col.is_selected;
+                            let mut day_class = String::from("sched-week-day");
+                            if is_today { day_class.push_str(" sched-week-today"); }
+                            if is_selected { day_class.push_str(" sched-week-selected"); }
                             let zone = format!("week-{y}-{mo}-{d}");
                             let zone_class = zone.clone();
                             let zone_enter = zone.clone();
@@ -1018,7 +1191,7 @@ fn WeekView(ctx: Sched) -> impl IntoView {
 
                             view! {
                                 <div
-                                    class=if is_today { "sched-week-day sched-week-today" } else { "sched-week-day" }
+                                    class=day_class
                                     class:drop-active=move || ctx.active_zone.get().as_deref() == Some(zone_class.as_str())
                                     on:dragenter=move |ev| { ev.prevent_default(); ctx.active_zone.set(Some(zone_enter.clone())); }
                                     on:dragover=move |ev| {
@@ -1034,10 +1207,15 @@ fn WeekView(ctx: Sched) -> impl IntoView {
                                     }
                                     on:drop=move |ev| { ev.prevent_default(); ev.stop_propagation(); ctx.drop_at(&ev, y, mo, d, 9); }
                                 >
-                                    <div class="sched-week-head">
+                                    <button
+                                        class="sched-week-head"
+                                        type="button"
+                                        title="Show this day in the timeline"
+                                        on:click=move |_| ctx.select_day((y, mo, d))
+                                    >
                                         <span class="sched-week-dow">{weekday}</span>
                                         <span class="sched-week-date">{d}</span>
-                                    </div>
+                                    </button>
                                     {if day_rows.is_empty() {
                                         view! { <p class="sched-week-empty">"—"</p> }.into_any()
                                     } else {

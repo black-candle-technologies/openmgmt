@@ -112,11 +112,21 @@ impl AppService {
     pub fn get_schedule_week(&self) -> Result<Vec<TaskWithContext>> {
         self.database.get_schedule_week()
     }
+    pub fn get_schedule_for_day(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<TaskWithContext>> {
+        self.database.get_schedule_for_day(start, end)
+    }
     pub fn get_unscheduled_tasks(&self) -> Result<Vec<TaskWithContext>> {
         self.database.get_unscheduled_tasks()
     }
     pub fn get_overdue_tasks(&self) -> Result<Vec<TaskWithContext>> {
         self.database.get_overdue_tasks()
+    }
+    pub fn auto_start_due_scheduled_tasks(&self) -> Result<Vec<Task>> {
+        self.database.auto_start_due_scheduled_tasks()
     }
     pub fn schedule_task(&self, task_id: &str, input: ScheduleTaskInput) -> Result<CalendarBlock> {
         self.database.schedule_task(task_id, input)

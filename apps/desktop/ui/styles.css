@@ -953,6 +953,28 @@ a { color: inherit; }
 .sched-conflict-chip.has-conflicts .sched-conflict-count { background: #e9c3bf; color: var(--danger); }
 .sched-conflict-banner { background: var(--danger-soft); color: var(--danger); border-color: #d9aaa6; font-weight: 600; }
 
+/* Day navigation: prev / today / next / date picker + selected-day label */
+.sched-daynav {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  flex-wrap: wrap; margin: 0 0 12px; padding: 9px 12px;
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm);
+}
+.sched-daynav-controls { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.sched-daynav-controls .btn.active { background: var(--green); color: #fff; border-color: var(--green); }
+.sched-daynav-date {
+  font: 600 12px var(--mono); padding: 5px 8px; color: var(--text);
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-sm);
+}
+.sched-daynav-label { font-weight: 700; font-size: 14px; color: var(--text-soft); }
+
+/* Explainer: how scheduled tasks flow into the board buckets */
+.sched-explainer {
+  margin: 0 0 14px; padding: 10px 14px;
+  border-left: 3px solid var(--green); background: var(--surface-2);
+  border-radius: var(--radius-sm); color: var(--text-muted);
+  font-size: 12.5px; line-height: 1.5;
+}
+
 /* Two-column main / side layout */
 .sched-layout { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(0, 1fr); gap: 18px; align-items: start; }
 .sched-main { min-width: 0; }
@@ -1032,11 +1054,17 @@ a { color: inherit; }
   padding: 9px; min-height: 120px; transition: background 0.12s ease, box-shadow 0.12s ease;
 }
 .sched-week-today { background: var(--surface); border-top: 3px solid var(--green); box-shadow: var(--shadow-sm); }
+.sched-week-selected { box-shadow: inset 0 0 0 2px var(--green); background: var(--surface); }
 .sched-week-day.drop-active { box-shadow: inset 0 0 0 2px var(--lime-deep); background: rgba(201, 239, 106, 0.14); }
-.sched-week-head { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
+.sched-week-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 6px;
+  width: 100%; padding: 0; border: 0; background: transparent; cursor: pointer; text-align: left;
+}
+.sched-week-head:hover .sched-week-date { color: var(--green); text-decoration: underline; }
+.sched-week-hint { font: 600 11px var(--mono); letter-spacing: 0.04em; color: var(--text-muted); text-transform: uppercase; }
 .sched-week-dow { font: 700 10px var(--mono); letter-spacing: 0.08em; color: var(--text-muted); text-transform: uppercase; }
 .sched-week-date { font: 700 14px var(--mono); color: var(--text-soft); }
-.sched-week-today .sched-week-date { color: var(--green); }
+.sched-week-today .sched-week-date, .sched-week-selected .sched-week-date { color: var(--green); }
 .sched-week-empty { color: var(--text-muted); font: 13px var(--mono); text-align: center; margin: auto 0; }
 .sched-week-list { display: flex; flex-direction: column; gap: 6px; }
 .sched-week-line {
@@ -1143,4 +1171,36 @@ a { color: inherit; }
   .sched-week { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .sched-slot { grid-template-columns: 54px minmax(0, 1fr); }
   .sched-overdue-row { flex-direction: column; }
+}
+
+/* ---------------------------------------------------------------------------
+   Scheduling indicators on the Tasks page + board cards
+   --------------------------------------------------------------------------- */
+
+/* Tasks page: the per-row Schedule / Reschedule button */
+.qtask-schedule { flex-shrink: 0; padding: 5px 10px; font-size: 12px; }
+
+/* Board cards (NOW / NEXT panes): scheduled block, repeat, soon/overdue cues */
+.bc-sched { display: flex; align-items: center; gap: clamp(6px, 0.6vw, 12px); flex-wrap: wrap; }
+.bc-sched-time { font: 700 clamp(11px, 0.95vw, 17px) var(--mono); color: #c9ef6a; }
+.bc-recur {
+  font: 700 clamp(10px, 0.8vw, 14px) var(--mono); letter-spacing: 0.03em;
+  color: #cbe08e; background: rgba(201, 239, 106, 0.12);
+  border: 1px solid rgba(201, 239, 106, 0.3); padding: 1px 7px; border-radius: var(--radius-pill);
+}
+.bc-sched-soon {
+  font: 700 clamp(10px, 0.8vw, 14px) var(--mono);
+  color: #e0a52e; background: rgba(224, 165, 46, 0.14);
+  border: 1px solid rgba(224, 165, 46, 0.4); padding: 1px 7px; border-radius: var(--radius-pill);
+}
+.bc-sched-overdue {
+  font: 700 clamp(10px, 0.8vw, 14px) var(--mono);
+  color: #ff8a6a; background: rgba(229, 72, 77, 0.16);
+  border: 1px solid rgba(229, 72, 77, 0.45); padding: 1px 7px; border-radius: var(--radius-pill);
+}
+
+/* Embedded ER board: compact repeat marker beside a task title */
+.er-recur {
+  margin-left: 7px; font: 700 10px var(--mono); letter-spacing: 0.03em;
+  color: #9fb46a; white-space: nowrap;
 }

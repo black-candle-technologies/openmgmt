@@ -31,7 +31,6 @@ pub enum Page {
     Projects,
     Project(String),
     Tasks,
-    Today,
     Schedule,
     Board,
     Sync,
@@ -47,7 +46,6 @@ impl Page {
             Page::Projects => "Projects",
             Page::Project(_) => "Project",
             Page::Tasks => "Tasks",
-            Page::Today => "Today",
             Page::Schedule => "Schedule",
             Page::Board => "Board",
             Page::Sync => "Sync",
@@ -365,6 +363,14 @@ pub fn parse_datetime_local(value: String) -> Result<Option<DateTime<Utc>>, Stri
         .ok_or_else(|| format!("Date is outside the supported range: {value}"))
 }
 
+/// Combine a `YYYY-MM-DD` date and `HH:MM` time (both local) into a UTC instant,
+/// reusing the tested `datetime-local` → UTC bridge. Shared by the scheduling
+/// surfaces (the Schedule page and the Tasks-page schedule modal).
+pub fn combine_local(date: &str, time: &str) -> Result<DateTime<Utc>, String> {
+    parse_datetime_local(format!("{date}T{time}"))?
+        .ok_or_else(|| "Invalid date or time.".to_string())
+}
+
 pub fn datetime_local_value(value: Option<DateTime<Utc>>) -> String {
     let Some(value) = value else {
         return String::new();
@@ -396,11 +402,6 @@ fn js_date(value: DateTime<Utc>) -> js_sys::Date {
 /// Local hour-of-day (0–23) for a UTC instant.
 pub fn local_hour(value: DateTime<Utc>) -> u32 {
     js_date(value).get_hours()
-}
-
-/// Local day-of-week (0 = Sunday … 6 = Saturday) for a UTC instant.
-pub fn local_weekday(value: DateTime<Utc>) -> u32 {
-    js_date(value).get_day()
 }
 
 /// Local `(year, month, day)` for a UTC instant.

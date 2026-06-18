@@ -11,6 +11,7 @@ use serde_json::json;
 use wasm_bindgen_futures::spawn_local;
 
 use super::components::{Badge, EmptyState, LoadingState, PriorityBadge, StatusBadge};
+use super::schedule_modal::ScheduleTaskModal;
 use super::state::*;
 use super::tags::TagChip;
 use super::timer::TimerControls;
@@ -104,6 +105,9 @@ pub fn QueryTaskTable(
     queried_at: Signal<DateTime<Utc>>,
     loading: Signal<bool>,
 ) -> impl IntoView {
+    // The task targeted by the schedule/reschedule modal, hoisted here so a single
+    // modal overlays the whole table rather than one per row.
+    let schedule_target = RwSignal::new(None::<Task>);
     view! {
         <div class="qtask-table">
             <div class="qtask-row qtask-row-head">
@@ -126,12 +130,15 @@ pub fn QueryTaskTable(
                     }
                 } else {
                     rows.into_iter()
-                        .map(|row| view! { <QueryTaskRow state row now queried_at /> })
+                        .map(|row| view! { <QueryTaskRow state row now queried_at schedule_target /> })
                         .collect_view()
                         .into_any()
                 }
             }}
         </div>
+        {move || schedule_target.get().map(|task| view! {
+            <ScheduleTaskModal state task on_close=Callback::new(move |_| schedule_target.set(None)) />
+        })}
     }
 }
 
@@ -141,9 +148,11 @@ fn QueryTaskRow(
     row: TaskWithContext,
     now: Signal<DateTime<Utc>>,
     queried_at: Signal<DateTime<Utc>>,
+    schedule_target: RwSignal<Option<Task>>,
 ) -> impl IntoView {
     let task = row.task.clone();
     let edit_task = task.clone();
+    let schedule_task = task.clone();
     let title = task.title.clone();
     let status = task.status;
     let status_str = task.status.to_string();
@@ -159,6 +168,19 @@ fn QueryTaskRow(
         .due_at
         .map(|at| at.format("%b %-d, %-I:%M %p").to_string())
         .unwrap_or_else(|| "—".into());
+    // Scheduling indicators: a planned time chip + repeat badge so scheduled work
+    // reads at a glance, and the Schedule button flips to "Reschedule".
+    let scheduled = task.calendar_block_id.is_some() || task.scheduled_start_at.is_some();
+    let scheduled_label = match (task.scheduled_start_at, task.scheduled_end_at) {
+        (Some(start), Some(end)) => Some(fmt_time_range(start, end)),
+        (Some(start), None) => Some(fmt_time(start)),
+        _ => None,
+    };
+    let recurrence = task
+        .recurrence_rule
+        .filter(|rule| *rule != RecurrenceRule::None);
+    let can_schedule = !matches!(status, TaskStatus::Done | TaskStatus::Canceled);
+    let schedule_label = if scheduled { "Reschedule" } else { "Schedule" };
     let org_name = row.organization_name.clone();
     let org_color = row
         .organization_color
@@ -176,11 +198,11 @@ fn QueryTaskRow(
                     {pinned.then(|| view! { <span class="qtask-pin" title="Pinned">"★ "</span> })}
                     {title}
                 </button>
-                {(!tags.is_empty()).then(|| view! {
-                    <div class="qtask-tags">
-                        {tags.into_iter().take(5).map(|tag| view! { <TagChip tag /> }).collect_view()}
-                    </div>
-                })}
+                <div class="qtask-tags">
+                    {scheduled_label.map(|label| view! { <span class="task-card-sched" title="Scheduled time">{"◷ "}{label}</span> })}
+                    {recurrence.map(|rule| view! { <span class="task-card-recur" title="Repeats">{"↻ "}{recurrence_label(rule)}</span> })}
+                    {tags.into_iter().take(5).map(|tag| view! { <TagChip tag /> }).collect_view()}
+                </div>
             </div>
             <span class="qtask-status"><StatusBadge status=status_str /></span>
             <span class="qtask-org">
@@ -191,6 +213,11 @@ fn QueryTaskRow(
             <span class="qtask-due">{due_label}</span>
             <span class="qtask-urgency qtask-urg-col" title="Urgency score">{urgency}</span>
             <span class="qtask-timer qtask-timer-col">
+                {can_schedule.then(|| view! {
+                    <button class="btn btn-subtle qtask-schedule" type="button" title="Schedule this task" on:click=move |_| {
+                        schedule_target.set(Some(schedule_task.clone()));
+                    }>{schedule_label}</button>
+                })}
                 <TimerControls
                     state now queried_at
                     task_id=task_id
@@ -199,7 +226,7 @@ fn QueryTaskRow(
                     active=active
                 />
                 {can_cancel.then(|| view! {
-                    <button class="btn-link-danger qtask-cancel" title="Cancel task" on:click=move |_| {
+                    <button class="btn-link-danger qtask-cancel" type="button" title="Cancel task" on:click=move |_| {
                         if !confirmed(&format!("Cancel task {cancel_title}?")) { return; }
                         let id = cancel_id.clone();
                         spawn_local(async move {

@@ -10,7 +10,6 @@ mod schedule;
 mod settings;
 mod sync;
 mod tasks;
-mod today;
 
 pub use board::BoardPage;
 pub use daily_ops::DailyOpsPage;
@@ -22,4 +21,3 @@ pub use schedule::SchedulePage;
 pub use settings::SettingsPage;
 pub use sync::SyncPage;
 pub use tasks::TasksPage;
-pub use today::TodayPage;

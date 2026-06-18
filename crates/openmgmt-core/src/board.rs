@@ -162,4 +162,54 @@ mod tests {
         let board = build_board(vec![normal, pinned], now);
         assert_eq!(board.next_up[0].context.task.id, "pinned");
     }
+
+    /// A scheduled task lands in the right urgency column based on where the clock
+    /// sits relative to its time block: active → NOW, future-today → Later Today,
+    /// elapsed/unfinished → Overdue, completed → Done Today.
+    #[test]
+    fn scheduled_tasks_group_by_their_time_block() {
+        let now = Utc::now();
+
+        let mut active = task("active", TaskStatus::Scheduled, now);
+        active.task.scheduled_start_at = Some(now - Duration::minutes(5));
+        active.task.scheduled_end_at = Some(now + Duration::minutes(25));
+
+        let mut later = task("later", TaskStatus::Scheduled, now);
+        later.task.scheduled_start_at = Some(now + Duration::hours(2));
+        later.task.scheduled_end_at = Some(now + Duration::hours(3));
+
+        let mut elapsed = task("elapsed", TaskStatus::Scheduled, now);
+        elapsed.task.scheduled_start_at = Some(now - Duration::hours(2));
+        elapsed.task.scheduled_end_at = Some(now - Duration::hours(1));
+
+        let mut done = task("done", TaskStatus::Done, now);
+        done.task.scheduled_start_at = Some(now - Duration::hours(2));
+        done.task.scheduled_end_at = Some(now - Duration::hours(1));
+        done.task.completed_at = Some(now);
+
+        let board = build_board(vec![active, later, elapsed, done], now);
+        assert!(board.now.iter().any(|t| t.context.task.id == "active"));
+        assert!(
+            board
+                .later_today
+                .iter()
+                .any(|t| t.context.task.id == "later")
+        );
+        assert!(board.overdue.iter().any(|t| t.context.task.id == "elapsed"));
+        assert!(board.done_today.iter().any(|t| t.context.task.id == "done"));
+    }
+
+    /// Within a single urgency column (here NOW), a P1 task must outrank a P5 one.
+    #[test]
+    fn p1_outranks_p5_within_now_column() {
+        let now = Utc::now();
+        let mut p5 = task("p5", TaskStatus::InProgress, now);
+        p5.task.priority = 5;
+        let mut p1 = task("p1", TaskStatus::InProgress, now);
+        p1.task.priority = 1;
+        // Insert lowest-priority first so ordering can only come from scoring.
+        let board = build_board(vec![p5, p1], now);
+        assert_eq!(board.now[0].context.task.id, "p1");
+        assert_eq!(board.now[1].context.task.id, "p5");
+    }
 }

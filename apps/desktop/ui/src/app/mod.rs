@@ -6,6 +6,7 @@ pub mod components;
 pub mod forms;
 pub mod pages;
 pub mod records;
+pub mod schedule_modal;
 pub mod state;
 pub mod tags;
 pub mod timer;
@@ -14,12 +15,42 @@ pub mod views;
 use chrono::Utc;
 use gloo_timers::callback::Interval;
 use leptos::prelude::*;
+use openmgmt_core::Task;
+use serde_json::json;
+use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
 
 use board::BoardView;
 use components::Button;
 use forms::DrawerHost;
 use state::*;
+
+/// Auto-start any scheduled task whose time block is currently active.
+///
+/// Calls the idempotent `auto_start_due_scheduled_tasks` command: a task is only
+/// started once (it then has an active timer and is skipped next tick), so this
+/// is safe to run on every refresh. When something is started we surface a small
+/// notice and reload so it appears in NOW / In progress immediately. Errors are
+/// logged to the console rather than shown, to avoid banner spam on a timer tick.
+async fn run_auto_start(state: AppState) {
+    match invoke::<Vec<Task>>("auto_start_due_scheduled_tasks", json!({})).await {
+        Ok(started) if !started.is_empty() => {
+            let message = if started.len() == 1 {
+                format!("Auto-started scheduled task: {}", started[0].title)
+            } else {
+                format!("Auto-started {} scheduled tasks.", started.len())
+            };
+            state.notice.set(Some(message));
+            state.reload().await;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            web_sys::console::warn_1(&JsValue::from_str(&format!(
+                "[auto-start] auto_start_due_scheduled_tasks failed: {error}"
+            )));
+        }
+    }
+}
 
 #[component]
 pub fn App() -> impl IntoView {
@@ -57,6 +88,16 @@ pub fn App() -> impl IntoView {
     let snapshot_refresh = Interval::new(10_000, move || state.refresh());
     snapshot_refresh.forget();
 
+    // Auto-start scheduled tasks whose time block is active. Runs once on launch
+    // and then on a steady tick so a task scheduled for "now" starts without the
+    // user lifting a finger. Only the main window does this (never the TV board)
+    // so a task is never started twice. The command is idempotent.
+    spawn_local(async move { run_auto_start(state).await });
+    let auto_start_tick = Interval::new(15_000, move || {
+        spawn_local(async move { run_auto_start(state).await });
+    });
+    auto_start_tick.forget();
+
     let page = RwSignal::new(Page::Dashboard);
     view! {
         <div class="app-shell">
@@ -72,7 +113,6 @@ pub fn App() -> impl IntoView {
                         Page::Projects => view! { <pages::ProjectsPage state page /> }.into_any(),
                         Page::Project(id) => view! { <pages::ProjectDetailPage state page id /> }.into_any(),
                         Page::Tasks => view! { <pages::TasksPage state now /> }.into_any(),
-                        Page::Today => view! { <pages::TodayPage state /> }.into_any(),
                         Page::Schedule => view! { <pages::SchedulePage state now /> }.into_any(),
                         Page::Board => view! { <pages::BoardPage state now /> }.into_any(),
                         Page::Sync => view! { <pages::SyncPage /> }.into_any(),
@@ -100,7 +140,6 @@ fn Sidebar(state: AppState, page: RwSignal<Page>) -> impl IntoView {
                 <NavButton label="Dashboard" target=Page::Dashboard page />
                 <NavButton label="Daily Operations" target=Page::DailyOps page />
                 <NavButton label="Tasks" target=Page::Tasks page />
-                <NavButton label="Today" target=Page::Today page />
                 <NavButton label="Schedule" target=Page::Schedule page />
                 <p class="sidebar-label">"STRUCTURE"</p>
                 <NavButton label="Projects" target=Page::Projects page />

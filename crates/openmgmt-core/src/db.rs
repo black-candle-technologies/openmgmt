@@ -1425,6 +1425,19 @@ impl Database {
         self.scheduled_tasks_between(start, start + ChronoDuration::days(7))
     }
 
+    /// Scheduled tasks whose start falls within an explicit `[start, end)` window.
+    ///
+    /// Backs the Schedule page's day navigation: the UI computes the selected
+    /// local day's (or week's) UTC window and asks for exactly that range, so the
+    /// timeline is no longer pinned to the real "today".
+    pub fn get_schedule_for_day(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<TaskWithContext>> {
+        self.scheduled_tasks_between(start, end)
+    }
+
     pub fn get_unscheduled_tasks(&self) -> Result<Vec<TaskWithContext>> {
         Ok(self
             .query_tasks(TaskQueryFilter::default(), Some(TaskSort::default()))?
@@ -1447,6 +1460,49 @@ impl Database {
                         .is_some_and(|value| value < now)
             })
             .collect())
+    }
+
+    /// Start any scheduled task whose time block is currently active.
+    ///
+    /// "Active" means `scheduled_start_at <= now < scheduled_end_at`. A task is
+    /// only started when it is in a plannable state (not done, canceled, already
+    /// in progress, blocked, or waiting) and has no active timer session, so this
+    /// is idempotent: once a task is started it has an active timer and is skipped
+    /// on every subsequent call. Reuses [`start_task_timer`] so the task moves to
+    /// `InProgress` and a timer session is opened exactly as a manual start would.
+    /// Returns the tasks that were auto-started this call (empty when none are due).
+    pub fn auto_start_due_scheduled_tasks(&self) -> Result<Vec<Task>> {
+        let now = Utc::now();
+        let due: Vec<String> = self
+            .list_tasks()?
+            .into_iter()
+            .filter(|task| {
+                matches!(
+                    (task.scheduled_start_at, task.scheduled_end_at),
+                    (Some(start), Some(end)) if start <= now && now < end
+                ) && !matches!(
+                    task.status,
+                    TaskStatus::Done
+                        | TaskStatus::Canceled
+                        | TaskStatus::InProgress
+                        | TaskStatus::Blocked
+                        | TaskStatus::Waiting
+                )
+            })
+            .map(|task| task.id)
+            .collect();
+
+        let mut started = Vec::new();
+        for task_id in due {
+            // Skip anything already being timed; `start_task_timer` would also
+            // reject it, but checking first keeps this loop free of spurious errors.
+            if self.get_active_timer_session(&task_id)?.is_some() {
+                continue;
+            }
+            self.start_task_timer(&task_id)?;
+            started.push(self.get_task(&task_id)?);
+        }
+        Ok(started)
     }
 
     pub fn schedule_task(&self, task_id: &str, input: ScheduleTaskInput) -> Result<CalendarBlock> {
@@ -3771,6 +3827,124 @@ mod tests {
                 .iter()
                 .any(|item| item.context.task.id == overdue.id)
         );
+    }
+
+    #[test]
+    fn schedule_for_day_window_filters_by_start() {
+        let db = Database::in_memory().unwrap();
+        let inside = scheduling_task(&db, "Inside", 2, 30);
+        let outside = scheduling_task(&db, "Outside", 2, 30);
+        let day_start = Utc::now() + ChronoDuration::days(3);
+        let window_start = Utc.from_utc_datetime(
+            &day_start
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight"),
+        );
+        let window_end = window_start + ChronoDuration::days(1);
+        db.schedule_task(
+            &inside.id,
+            schedule_input(
+                window_start + ChronoDuration::hours(9),
+                window_start + ChronoDuration::hours(10),
+            ),
+        )
+        .unwrap();
+        db.schedule_task(
+            &outside.id,
+            schedule_input(
+                window_end + ChronoDuration::hours(9),
+                window_end + ChronoDuration::hours(10),
+            ),
+        )
+        .unwrap();
+
+        let rows = db.get_schedule_for_day(window_start, window_end).unwrap();
+        assert!(rows.iter().any(|item| item.task.id == inside.id));
+        assert!(!rows.iter().any(|item| item.task.id == outside.id));
+    }
+
+    #[test]
+    fn auto_start_starts_active_block_and_is_idempotent() {
+        let db = Database::in_memory().unwrap();
+        let active = scheduling_task(&db, "Active now", 2, 30);
+        let now = Utc::now();
+        db.schedule_task(
+            &active.id,
+            schedule_input(
+                now - ChronoDuration::minutes(5),
+                now + ChronoDuration::minutes(25),
+            ),
+        )
+        .unwrap();
+
+        let started = db.auto_start_due_scheduled_tasks().unwrap();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].id, active.id);
+        assert_eq!(started[0].status, TaskStatus::InProgress);
+        assert!(db.get_active_timer_session(&active.id).unwrap().is_some());
+
+        // Idempotent: the task already has an active timer, so a second tick
+        // must not start it again.
+        let second = db.auto_start_due_scheduled_tasks().unwrap();
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn auto_start_skips_future_elapsed_and_terminal_tasks() {
+        let db = Database::in_memory().unwrap();
+        let now = Utc::now();
+
+        let future = scheduling_task(&db, "Future", 2, 30);
+        db.schedule_task(
+            &future.id,
+            schedule_input(
+                now + ChronoDuration::hours(1),
+                now + ChronoDuration::minutes(90),
+            ),
+        )
+        .unwrap();
+
+        let elapsed = scheduling_task(&db, "Elapsed", 2, 30);
+        db.schedule_task(
+            &elapsed.id,
+            schedule_input(
+                now - ChronoDuration::hours(2),
+                now - ChronoDuration::hours(1),
+            ),
+        )
+        .unwrap();
+
+        let done = scheduling_task(&db, "Done", 2, 30);
+        db.schedule_task(
+            &done.id,
+            schedule_input(
+                now - ChronoDuration::minutes(5),
+                now + ChronoDuration::minutes(25),
+            ),
+        )
+        .unwrap();
+        db.transition_task(&done.id, TaskStatus::Done, None)
+            .unwrap();
+
+        let started = db.auto_start_due_scheduled_tasks().unwrap();
+        assert!(started.is_empty());
+        assert_eq!(
+            db.get_task(&future.id).unwrap().status,
+            TaskStatus::Scheduled
+        );
+        assert_eq!(
+            db.get_task(&elapsed.id).unwrap().status,
+            TaskStatus::Scheduled
+        );
+        assert_eq!(db.get_task(&done.id).unwrap().status, TaskStatus::Done);
+    }
+
+    #[test]
+    fn auto_start_with_no_scheduled_tasks_is_noop() {
+        let db = Database::in_memory().unwrap();
+        scheduling_task(&db, "Unscheduled", 2, 30);
+        assert!(db.auto_start_due_scheduled_tasks().unwrap().is_empty());
     }
 
     #[test]
