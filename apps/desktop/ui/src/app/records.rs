@@ -6,7 +6,7 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use leptos::prelude::*;
-use openmgmt_core::{Organization, Project, Task, TaskStatus, TaskWithContext};
+use openmgmt_core::{Organization, Project, RecurrenceRule, Task, TaskStatus, TaskWithContext};
 use serde_json::json;
 use wasm_bindgen_futures::spawn_local;
 
@@ -228,6 +228,15 @@ pub fn TaskCard(
         .map(|at| (Utc::now() - at).num_minutes().max(0));
     let limit = task.time_limit_minutes;
     let due_label = task.due_at.map(|at| at.format("%-I:%M %p").to_string());
+    // Scheduling indicators: planned time range + repeat badge, when present.
+    let scheduled_label = match (task.scheduled_start_at, task.scheduled_end_at) {
+        (Some(start), Some(end)) => Some(fmt_time_range(start, end)),
+        (Some(start), None) => Some(fmt_time(start)),
+        _ => None,
+    };
+    let recurrence = task
+        .recurrence_rule
+        .filter(|rule| *rule != RecurrenceRule::None);
     let has_project = !project_name.is_empty();
     let tags = task.tags.clone();
 
@@ -242,6 +251,8 @@ pub fn TaskCard(
                     <StatusBadge status />
                     {has_project.then(|| view! { <span class="task-card-project">{project_name.clone()}</span> })}
                     {due_label.map(|due| view! { <span class="task-card-chip">{due}</span> })}
+                    {scheduled_label.map(|label| view! { <span class="task-card-sched">{"◷ "}{label}</span> })}
+                    {recurrence.map(|rule| view! { <span class="task-card-recur" title="Repeats">{"↻ "}{recurrence_label(rule)}</span> })}
                     {elapsed.map(|minutes| view! { <span class="task-row-timer">{format!("{minutes}m")}</span> })}
                     {limit.map(|minutes| view! { <span class="task-card-chip">{format!("limit {minutes}m")}</span> })}
                     {tags.into_iter().take(4).map(|tag| view! { <TagChip tag /> }).collect_view()}

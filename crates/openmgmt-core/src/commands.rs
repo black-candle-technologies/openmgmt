@@ -1,13 +1,15 @@
 use crate::{
     db::{Database, Result},
     models::{
-        BoardState, NewOrganization, NewProject, NewSavedTaskView, NewTask, Organization,
-        OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch,
-        ScoringSettings, ScoringSettingsPatch, Task, TaskPatch, TaskQueryFilter, TaskSort,
-        TaskStatus, TaskTimerSession, TaskWithContext,
+        BoardState, CalendarBlock, NewOrganization, NewProject, NewSavedTaskView, NewTask,
+        Organization, OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch,
+        ScheduleConflict, ScheduleTaskInput, ScheduledBlockCompletion, ScoringSettings,
+        ScoringSettingsPatch, Task, TaskPatch, TaskQueryFilter, TaskSort, TaskStatus,
+        TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
     },
     sync::{SyncSettings, SyncSettingsPatch, SyncStatus},
 };
+use chrono::{DateTime, Utc};
 
 #[derive(Clone)]
 pub struct AppService {
@@ -103,6 +105,60 @@ impl AppService {
     }
     pub fn get_board_state(&self) -> Result<BoardState> {
         self.database.board_state()
+    }
+    pub fn get_schedule_today(&self) -> Result<Vec<TaskWithContext>> {
+        self.database.get_schedule_today()
+    }
+    pub fn get_schedule_week(&self) -> Result<Vec<TaskWithContext>> {
+        self.database.get_schedule_week()
+    }
+    pub fn get_unscheduled_tasks(&self) -> Result<Vec<TaskWithContext>> {
+        self.database.get_unscheduled_tasks()
+    }
+    pub fn get_overdue_tasks(&self) -> Result<Vec<TaskWithContext>> {
+        self.database.get_overdue_tasks()
+    }
+    pub fn schedule_task(&self, task_id: &str, input: ScheduleTaskInput) -> Result<CalendarBlock> {
+        self.database.schedule_task(task_id, input)
+    }
+    pub fn reschedule_task(
+        &self,
+        task_id: &str,
+        input: ScheduleTaskInput,
+    ) -> Result<CalendarBlock> {
+        self.database.reschedule_task(task_id, input)
+    }
+    pub fn clear_task_schedule(&self, task_id: &str) -> Result<Task> {
+        self.database.clear_task_schedule(task_id)
+    }
+    pub fn list_schedule_conflicts(&self) -> Result<Vec<ScheduleConflict>> {
+        self.database.list_schedule_conflicts()
+    }
+    pub fn suggest_next_time_block(
+        &self,
+        window_start: DateTime<Utc>,
+        window_end: DateTime<Utc>,
+        duration_minutes: i64,
+    ) -> Result<Option<TimeBlockSuggestion>> {
+        self.database
+            .suggest_next_time_block(window_start, window_end, duration_minutes)
+    }
+    pub fn suggest_tasks_for_time_window(
+        &self,
+        window_start: DateTime<Utc>,
+        window_end: DateTime<Utc>,
+    ) -> Result<Vec<TaskWithContext>> {
+        self.database
+            .suggest_tasks_for_time_window(window_start, window_end)
+    }
+    pub fn complete_scheduled_block(&self, block_id: &str) -> Result<ScheduledBlockCompletion> {
+        self.database.complete_scheduled_block(block_id)
+    }
+    pub fn skip_scheduled_block(&self, block_id: &str) -> Result<CalendarBlock> {
+        self.database.skip_scheduled_block(block_id)
+    }
+    pub fn generate_schedule_ics(&self) -> Result<String> {
+        self.database.generate_schedule_ics()
     }
     pub fn list_saved_task_views(&self) -> Result<Vec<SavedTaskView>> {
         self.database.list_saved_task_views()

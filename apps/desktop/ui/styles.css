@@ -935,3 +935,171 @@ a { color: inherit; }
 @media (max-width: 1000px) {
   .sync-layout { grid-template-columns: 1fr; }
 }
+
+/* 19. Schedule page ------------------------------------------------------- */
+/* The scheduling/calendar workspace reuses the shared tokens (paper surfaces,
+   dark-green accents, lime for "now", danger for overdue/conflicts). Layout: a
+   Today timeline (main) beside an Unscheduled + Overdue rail, with the week
+   agenda and conflict report below. Drag targets light up with a dashed accent. */
+
+/* Header conflict chip + warning banner */
+.sched-conflict-chip { display: inline-flex; align-items: center; gap: 7px; }
+.sched-conflict-count {
+  min-width: 20px; text-align: center; font: 700 11px var(--mono);
+  background: var(--surface-sunken); color: var(--text-muted);
+  border-radius: var(--radius-pill); padding: 1px 7px;
+}
+.sched-conflict-chip.has-conflicts { border-color: #d9aaa6; color: var(--danger); background: var(--danger-soft); }
+.sched-conflict-chip.has-conflicts .sched-conflict-count { background: #e9c3bf; color: var(--danger); }
+.sched-conflict-banner { background: var(--danger-soft); color: var(--danger); border-color: #d9aaa6; font-weight: 600; }
+
+/* Two-column main / side layout */
+.sched-layout { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+.sched-main { min-width: 0; }
+.sched-side { min-width: 0; display: flex; flex-direction: column; gap: 18px; }
+.sched-side .panel { margin-bottom: 0; }
+
+/* Today timeline */
+.sched-timeline-panel .section-head { margin-bottom: 12px; }
+.sched-today-date { font: 600 11px var(--mono); letter-spacing: 0.04em; color: var(--text-muted); text-transform: uppercase; }
+.sched-empty-hint {
+  margin: 0 0 14px; padding: 14px 16px; border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm); background: var(--surface-2);
+  color: var(--text-muted); font-size: 13px; text-align: center;
+}
+.sched-timeline { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: var(--radius-sm); overflow: hidden; }
+.sched-slot {
+  display: grid; grid-template-columns: 66px minmax(0, 1fr); gap: 12px;
+  padding: 8px 12px; border-bottom: 1px solid var(--line); min-height: 50px;
+  transition: background 0.12s ease, box-shadow 0.12s ease;
+}
+.sched-slot:last-child { border-bottom: 0; }
+.sched-slot-label { font: 600 11px var(--mono); color: var(--text-muted); text-transform: uppercase; padding-top: 6px; text-align: right; }
+.sched-slot-body { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.sched-slot-empty { display: block; min-height: 16px; }
+.sched-slot.drop-active { background: rgba(201, 239, 106, 0.18); box-shadow: inset 0 0 0 2px var(--lime-deep); }
+
+/* Scheduled / queued task cards */
+.sched-card {
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 10px 12px; display: flex; flex-direction: column; gap: 7px; cursor: grab;
+  border-left: 3px solid var(--line-strong);
+}
+.sched-card:active { cursor: grabbing; }
+.sched-card-active { border-left-color: var(--lime-deep); background: linear-gradient(90deg, rgba(201, 239, 106, 0.16), var(--surface) 60%); }
+.sched-card-overdue { border-left-color: var(--danger); background: linear-gradient(90deg, var(--danger-soft), var(--surface) 70%); }
+.sched-card-upcoming { border-left-color: #6b8299; }
+.sched-card-queued { border-left-color: var(--green); }
+.sched-card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sched-card-time { font: 700 12px var(--mono); color: var(--text-soft); }
+.sched-card-est { font: 600 11px var(--mono); color: var(--text-muted); background: var(--surface-sunken); padding: 2px 7px; border-radius: var(--radius-pill); }
+.sched-recur, .task-card-recur {
+  font: 700 10px var(--mono); letter-spacing: 0.03em; color: #5d6f2a;
+  background: #eaf0db; border: 1px solid #d7e2bd; padding: 1px 7px; border-radius: var(--radius-pill);
+}
+.sched-card-title { border: 0; background: transparent; text-align: left; cursor: pointer; font-size: 14px; font-weight: 600; color: var(--text); padding: 0; }
+.sched-card-title:hover { color: var(--green); text-decoration: underline; }
+.sched-card-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; color: var(--text-muted); font-size: 12px; }
+.sched-card-project { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sched-card-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+.sched-card-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.sched-mini { padding: 5px 10px; font-size: 12px; }
+
+/* Side rail panels (Unscheduled / Overdue) */
+.sched-side-hint { margin: -6px 0 12px; color: var(--text-muted); font-size: 12px; line-height: 1.45; }
+.sched-card-list { display: flex; flex-direction: column; gap: 9px; }
+.sched-clear { color: var(--text-muted); font: 11px var(--mono); text-transform: uppercase; text-align: center; padding: 16px 0; }
+.sched-side-panel.drop-active { box-shadow: inset 0 0 0 2px var(--lime-deep); background: rgba(201, 239, 106, 0.08); }
+
+.sched-overdue-panel { border-top: 3px solid var(--danger); }
+.sched-overdue-title { color: var(--danger); }
+.sched-overdue-row {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 10px;
+  background: var(--surface); border: 1px solid #e6c6c2; border-left: 3px solid var(--danger);
+  border-radius: var(--radius-sm); padding: 10px 12px; flex-wrap: wrap;
+}
+.sched-overdue-main { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.sched-overdue-when { font: 700 11px var(--mono); color: var(--danger); }
+
+/* Week agenda */
+.sched-week { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 10px; }
+.sched-week-day {
+  min-width: 0; display: flex; flex-direction: column; gap: 7px;
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 9px; min-height: 120px; transition: background 0.12s ease, box-shadow 0.12s ease;
+}
+.sched-week-today { background: var(--surface); border-top: 3px solid var(--green); box-shadow: var(--shadow-sm); }
+.sched-week-day.drop-active { box-shadow: inset 0 0 0 2px var(--lime-deep); background: rgba(201, 239, 106, 0.14); }
+.sched-week-head { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
+.sched-week-dow { font: 700 10px var(--mono); letter-spacing: 0.08em; color: var(--text-muted); text-transform: uppercase; }
+.sched-week-date { font: 700 14px var(--mono); color: var(--text-soft); }
+.sched-week-today .sched-week-date { color: var(--green); }
+.sched-week-empty { color: var(--text-muted); font: 13px var(--mono); text-align: center; margin: auto 0; }
+.sched-week-list { display: flex; flex-direction: column; gap: 6px; }
+.sched-week-line {
+  display: flex; align-items: center; gap: 6px; cursor: grab;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 5px 7px; min-width: 0;
+}
+.sched-week-line:hover { border-color: var(--line-strong); }
+.sched-week-line:active { cursor: grabbing; }
+.sched-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--line-strong); }
+.sched-dot.priority-p1 { background: #cd4c44; }
+.sched-dot.priority-p2 { background: #d39a36; }
+.sched-dot.priority-p3 { background: #6f9a3f; }
+.sched-dot.priority-p4, .sched-dot.priority-p5 { background: #8b958a; }
+.sched-week-time { font: 700 10px var(--mono); color: var(--text-muted); flex-shrink: 0; }
+.sched-week-line-title { font-size: 12px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+
+/* Conflict report */
+.sched-conflict-list { display: flex; flex-direction: column; gap: 8px; }
+.sched-conflict-row {
+  display: flex; align-items: flex-start; gap: 10px;
+  background: var(--danger-soft); border: 1px solid #e0b6b2; border-radius: var(--radius-sm); padding: 10px 12px;
+}
+.sched-conflict-mark { color: var(--danger); font-size: 15px; line-height: 1.3; }
+.sched-conflict-pair { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-width: 0; color: var(--text-soft); font-size: 13px; }
+.sched-conflict-item { display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; }
+.sched-conflict-item strong { color: var(--text); }
+.sched-conflict-time { font: 11px var(--mono); color: var(--danger); }
+.sched-conflict-vs { font: 600 10px var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--danger); }
+
+/* Schedule / ICS modal */
+.sched-modal-layer { position: fixed; inset: 0; z-index: 70; display: grid; place-items: center; padding: 20px; }
+.sched-modal-backdrop { position: absolute; inset: 0; background: rgba(20, 28, 20, 0.34); animation: fade 0.14s ease; }
+.sched-modal {
+  position: relative; width: min(460px, 100%); max-height: 90vh; overflow: auto;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: var(--shadow); padding: 20px; animation: slide-in 0.16s ease;
+}
+.sched-modal-ics { width: min(640px, 100%); }
+.sched-modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
+.sched-modal-head h2 { font-size: 17px; }
+.sched-modal-task { margin: 2px 0 16px; font-size: 14px; font-weight: 600; color: var(--text-soft); }
+.sched-modal-hint { margin: 4px 0 14px; color: var(--text-muted); font-size: 13px; line-height: 1.5; }
+.sched-modal-form { display: flex; flex-direction: column; }
+.sched-modal-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+.sched-ics-text {
+  width: 100%; min-height: 280px; resize: vertical;
+  border: 1px solid var(--line-strong); border-radius: var(--radius-sm);
+  background: var(--surface-2); color: var(--text-soft);
+  font: 12px var(--mono); line-height: 1.5; padding: 12px;
+}
+.sched-ics-text:focus { outline: 2px solid var(--lime-deep); outline-offset: -1px; }
+
+/* Scheduling indicators on shared task cards (Today / Dashboard / Daily Ops) */
+.task-card-sched { font: 700 11px var(--mono); color: var(--green); }
+
+/* Responsive */
+@media (max-width: 1180px) {
+  .sched-week { grid-template-columns: repeat(7, minmax(0, 1fr)); }
+}
+@media (max-width: 1000px) {
+  .sched-layout { grid-template-columns: 1fr; }
+  .sched-week { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+  .sched-week { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sched-slot { grid-template-columns: 54px minmax(0, 1fr); }
+  .sched-overdue-row { flex-direction: column; }
+}

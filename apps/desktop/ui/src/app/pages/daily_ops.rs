@@ -4,7 +4,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 use leptos::prelude::*;
-use openmgmt_core::{TaskStatus, TaskWithContext};
+use openmgmt_core::{RecurrenceRule, TaskStatus, TaskWithContext};
 use serde_json::json;
 use wasm_bindgen_futures::spawn_local;
 
@@ -307,6 +307,15 @@ fn DailyRow(
     let time_limit = task.time_limit_minutes;
     let active = row.active_timer.clone();
     let project = row.project_name.clone();
+    // Scheduling indicators surfaced inline so planned/recurring work reads at a glance.
+    let scheduled_label = match (task.scheduled_start_at, task.scheduled_end_at) {
+        (Some(start), Some(end)) => Some(fmt_time_range(start, end)),
+        (Some(start), None) => Some(fmt_time(start)),
+        _ => None,
+    };
+    let recurrence = task
+        .recurrence_rule
+        .filter(|rule| *rule != RecurrenceRule::None);
     let org_color = row
         .organization_color
         .clone()
@@ -324,6 +333,8 @@ fn DailyRow(
                     <StatusBadge status=status_str />
                     <span class="er-org-dot" style=format!("background:{org_color}")></span>
                     <span class="daily-row-project">{project}</span>
+                    {scheduled_label.map(|label| view! { <span class="task-card-sched">{"◷ "}{label}</span> })}
+                    {recurrence.map(|rule| view! { <span class="task-card-recur" title="Repeats">{"↻ "}{recurrence_label(rule)}</span> })}
                     {tags.into_iter().take(3).map(|tag| view! { <TagChip tag /> }).collect_view()}
                 </div>
             </div>

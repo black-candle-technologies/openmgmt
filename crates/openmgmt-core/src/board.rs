@@ -27,10 +27,21 @@ pub fn build_board(tasks: Vec<TaskContext>, now: DateTime<Utc>) -> BoardState {
         }
         if matches!(status, TaskStatus::Blocked | TaskStatus::Waiting) {
             board.waiting_blocked.push(scored(context, now));
-        } else if context.task.due_at.is_some_and(|at| at < now) {
+        } else if context.task.due_at.is_some_and(|at| at < now)
+            || context
+                .task
+                .scheduled_end_at
+                .or(context.task.scheduled_start_at)
+                .or(context.task.scheduled_at)
+                .is_some_and(|at| at < now)
+        {
             board.overdue.push(scored(context, now));
         } else if status == TaskStatus::InProgress
-            || context.task.scheduled_at.is_some_and(|at| at <= now)
+            || context
+                .task
+                .scheduled_start_at
+                .or(context.task.scheduled_at)
+                .is_some_and(|at| at <= now)
         {
             board.now.push(scored(context, now));
         } else if context
@@ -41,7 +52,8 @@ pub fn build_board(tasks: Vec<TaskContext>, now: DateTime<Utc>) -> BoardState {
             board.due_soon.push(scored(context, now));
         } else if context
             .task
-            .scheduled_at
+            .scheduled_start_at
+            .or(context.task.scheduled_at)
             .is_some_and(|at| at.date_naive() == now.date_naive())
         {
             board.later_today.push(scored(context, now));
@@ -88,6 +100,14 @@ mod tests {
                 priority: 3,
                 due_at: None,
                 scheduled_at: None,
+                scheduled_start_at: None,
+                scheduled_end_at: None,
+                deadline_at: None,
+                reminder_at: None,
+                recurrence_rule: None,
+                recurrence_anchor_at: None,
+                recurrence_timezone: None,
+                calendar_block_id: None,
                 started_at: None,
                 completed_at: None,
                 estimated_minutes: None,

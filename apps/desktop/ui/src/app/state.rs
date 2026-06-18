@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use leptos::prelude::*;
 use openmgmt_core::{
-    BoardState, Organization, Project, ProjectStatus, ProjectType, Task, TaskStatus,
+    BoardState, Organization, Project, ProjectStatus, ProjectType, RecurrenceRule, Task, TaskStatus,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use wasm_bindgen::prelude::*;
@@ -32,6 +32,7 @@ pub enum Page {
     Project(String),
     Tasks,
     Today,
+    Schedule,
     Board,
     Sync,
     Settings,
@@ -47,6 +48,7 @@ impl Page {
             Page::Project(_) => "Project",
             Page::Tasks => "Tasks",
             Page::Today => "Today",
+            Page::Schedule => "Schedule",
             Page::Board => "Board",
             Page::Sync => "Sync",
             Page::Settings => "Settings",
@@ -376,6 +378,117 @@ pub fn datetime_local_value(value: Option<DateTime<Utc>>) -> String {
         date.get_hours(),
         date.get_minutes()
     )
+}
+
+// ---------------------------------------------------------------------------
+// Local time/date display helpers
+//
+// Stored datetimes are UTC; these render them in the viewer's local timezone via
+// the browser `Date`, mirroring how `datetime_local_value` / `parse_datetime_local`
+// bridge the local `datetime-local` inputs. Shared by the schedule views and the
+// scheduling indicators on task cards so times read consistently everywhere.
+// ---------------------------------------------------------------------------
+
+fn js_date(value: DateTime<Utc>) -> js_sys::Date {
+    js_sys::Date::new(&JsValue::from_f64(value.timestamp_millis() as f64))
+}
+
+/// Local hour-of-day (0–23) for a UTC instant.
+pub fn local_hour(value: DateTime<Utc>) -> u32 {
+    js_date(value).get_hours()
+}
+
+/// Local day-of-week (0 = Sunday … 6 = Saturday) for a UTC instant.
+pub fn local_weekday(value: DateTime<Utc>) -> u32 {
+    js_date(value).get_day()
+}
+
+/// Local `(year, month, day)` for a UTC instant.
+pub fn local_ymd(value: DateTime<Utc>) -> (i32, u32, u32) {
+    let date = js_date(value);
+    (
+        date.get_full_year() as i32,
+        date.get_month() + 1,
+        date.get_date(),
+    )
+}
+
+/// Local `YYYY-MM-DD`, suitable for a `<input type="date">` value.
+pub fn local_date_str(value: DateTime<Utc>) -> String {
+    let (y, mo, d) = local_ymd(value);
+    format!("{y:04}-{mo:02}-{d:02}")
+}
+
+/// Local `HH:MM` (24h), suitable for a `<input type="time">` value.
+pub fn local_time_str(value: DateTime<Utc>) -> String {
+    let date = js_date(value);
+    format!("{:02}:{:02}", date.get_hours(), date.get_minutes())
+}
+
+fn to_12h(hour24: u32) -> (u32, &'static str) {
+    match hour24 % 24 {
+        0 => (12, "AM"),
+        12 => (12, "PM"),
+        h if h < 12 => (h, "AM"),
+        h => (h - 12, "PM"),
+    }
+}
+
+/// Friendly local clock label, e.g. `2 PM` or `2:30 PM`.
+pub fn fmt_time(value: DateTime<Utc>) -> String {
+    let date = js_date(value);
+    let (h12, ap) = to_12h(date.get_hours());
+    let minutes = date.get_minutes();
+    if minutes == 0 {
+        format!("{h12} {ap}")
+    } else {
+        format!("{h12}:{minutes:02} {ap}")
+    }
+}
+
+/// Local time range label, e.g. `2 PM – 3:30 PM`.
+pub fn fmt_time_range(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
+    format!("{} – {}", fmt_time(start), fmt_time(end))
+}
+
+/// Local date + time label, e.g. `Jun 17, 2 PM`.
+pub fn fmt_datetime(value: DateTime<Utc>) -> String {
+    let (_, mo, d) = local_ymd(value);
+    format!("{} {}, {}", month_short(mo), d, fmt_time(value))
+}
+
+/// Label for a whole-hour timeline slot, e.g. `8 AM`.
+pub fn hour_label(hour24: u32) -> String {
+    let (h12, ap) = to_12h(hour24);
+    format!("{h12} {ap}")
+}
+
+/// Three-letter month abbreviation for a 1-based month number.
+pub fn month_short(month: u32) -> &'static str {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    MONTHS
+        .get(month.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or("")
+}
+
+/// Three-letter weekday abbreviation for a 0-based (Sunday) day-of-week.
+pub fn weekday_short(weekday: u32) -> &'static str {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    DAYS.get(weekday as usize).copied().unwrap_or("")
+}
+
+/// Human label for a recurrence rule (`Once` for the `None` rule).
+pub fn recurrence_label(rule: RecurrenceRule) -> &'static str {
+    match rule {
+        RecurrenceRule::None => "Once",
+        RecurrenceRule::Daily => "Daily",
+        RecurrenceRule::Weekdays => "Weekdays",
+        RecurrenceRule::Weekly => "Weekly",
+        RecurrenceRule::Monthly => "Monthly",
+    }
 }
 
 pub fn confirmed(message: &str) -> bool {
