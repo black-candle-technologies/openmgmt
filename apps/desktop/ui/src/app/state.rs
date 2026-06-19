@@ -458,6 +458,54 @@ pub fn fmt_datetime(value: DateTime<Utc>) -> String {
     format!("{} {}, {}", month_short(mo), d, fmt_time(value))
 }
 
+/// Long local date label for the board clock, e.g. `Wednesday, June 19`.
+///
+/// Uses the browser `Date` so it reflects the viewer's system timezone, never
+/// UTC (chrono's `.format()` on a `DateTime<Utc>` would render UTC).
+pub fn fmt_clock_date(value: DateTime<Utc>) -> String {
+    const WEEKDAYS: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    let date = js_date(value);
+    let weekday = WEEKDAYS.get(date.get_day() as usize).copied().unwrap_or("");
+    let month = MONTHS.get(date.get_month() as usize).copied().unwrap_or("");
+    format!("{weekday}, {month} {}", date.get_date())
+}
+
+/// Local wall-clock label with seconds for the board clock, e.g. `2:30:45 PM`.
+///
+/// Renders in the viewer's system timezone via the browser `Date`, matching the
+/// system clock rather than UTC.
+pub fn fmt_clock_time(value: DateTime<Utc>) -> String {
+    let date = js_date(value);
+    let (h12, ap) = to_12h(date.get_hours());
+    format!(
+        "{h12}:{:02}:{:02} {ap}",
+        date.get_minutes(),
+        date.get_seconds()
+    )
+}
+
 /// Label for a whole-hour timeline slot, e.g. `8 AM`.
 pub fn hour_label(hour24: u32) -> String {
     let (h12, ap) = to_12h(hour24);

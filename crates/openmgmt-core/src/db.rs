@@ -3676,7 +3676,17 @@ mod tests {
         let today = scheduling_task(&db, "Today", 2, 30);
         let overdue = scheduling_task(&db, "Overdue", 2, 30);
         let unscheduled = scheduling_task(&db, "Unscheduled", 2, 30);
-        let now = Utc::now();
+        // Anchor to noon of the current UTC day. The queries under test bucket by
+        // the real UTC day, so using the raw `Utc::now()` made this flaky: in the
+        // last ~50 minutes before 00:00 UTC the `today` block (now+20..now+50min)
+        // spilled into the next day and dropped out of `get_schedule_today`.
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            Utc::now()
+                .date_naive()
+                .and_hms_opt(12, 0, 0)
+                .expect("noon is a valid time"),
+            Utc,
+        );
         db.schedule_task(
             &today.id,
             schedule_input(

@@ -12,7 +12,10 @@ use serde_json::json;
 use wasm_bindgen_futures::spawn_local;
 
 use super::components::{PriorityBadge, priority_label};
-use super::state::{AppState, fmt_time_range, humanize, invoke, recurrence_label};
+use super::state::{
+    AppState, fmt_clock_date, fmt_clock_time, fmt_datetime, fmt_time, fmt_time_range, humanize,
+    invoke, recurrence_label,
+};
 use super::tags::TagChip;
 
 /// A scheduled task "starts soon" when its planned start is within this window.
@@ -139,12 +142,12 @@ fn ErRow(item: ScoredTask, tone: &'static str, now: Signal<DateTime<Utc>>) -> im
             .unwrap_or_else(|| "Waiting".into())
     } else if let Some(at) = task.due_at {
         if tone == "overdue" {
-            at.format("%-m/%-d %-I:%M %p").to_string()
+            fmt_datetime(at)
         } else {
-            at.format("%-I:%M %p").to_string()
+            fmt_time(at)
         }
     } else if let Some(at) = task.scheduled_at {
-        at.format("%-I:%M %p").to_string()
+        fmt_time(at)
     } else {
         "—".into()
     };
@@ -210,12 +213,12 @@ fn due_wait_text(task: &Task, tone: &str) -> String {
             .unwrap_or_else(|| "Waiting".into())
     } else if let Some(at) = task.due_at {
         if tone == "overdue" {
-            at.format("%-m/%-d %-I:%M %p").to_string()
+            fmt_datetime(at)
         } else {
-            at.format("%-I:%M %p").to_string()
+            fmt_time(at)
         }
     } else if let Some(at) = task.scheduled_at {
-        at.format("%-I:%M %p").to_string()
+        fmt_time(at)
     } else {
         "—".into()
     }
@@ -429,8 +432,8 @@ pub fn BoardView(
                         <span>"ACTIVE"</span>
                     </span>
                     <div class="tv-clock">
-                        <p>{move || now.get().format("%A, %B %-d").to_string()}</p>
-                        <time>{move || now.get().format("%-I:%M:%S %p").to_string()}</time>
+                        <p>{move || fmt_clock_date(now.get())}</p>
+                        <time>{move || fmt_clock_time(now.get())}</time>
                     </div>
                 </div>
                 <div class="tv-head-actions">
@@ -439,7 +442,7 @@ pub fn BoardView(
                         {move || state
                             .synced_at
                             .get()
-                            .map(|at| format!("Updated {}", at.format("%-I:%M:%S %p")))
+                            .map(|at| format!("Updated {}", fmt_clock_time(at)))
                             .unwrap_or_else(|| "Updating…".into())}
                     </span>
                     <button class="btn btn-ghost" on:click=move |_| state.refresh_board()>"Refresh"</button>
