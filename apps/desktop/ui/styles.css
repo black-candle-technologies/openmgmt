@@ -968,7 +968,8 @@ a { color: inherit; }
 .sched-daynav-label { font-weight: 700; font-size: 14px; color: var(--text-soft); }
 
 /* Explainer: how scheduled tasks flow into the board buckets */
-.sched-explainer {
+.sched-explainer,
+.board-explainer {
   margin: 0 0 14px; padding: 10px 14px;
   border-left: 3px solid var(--green); background: var(--surface-2);
   border-radius: var(--radius-sm); color: var(--text-muted);

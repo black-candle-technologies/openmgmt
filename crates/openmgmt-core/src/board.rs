@@ -25,38 +25,34 @@ pub fn build_board(tasks: Vec<TaskContext>, now: DateTime<Utc>) -> BoardState {
             }
             continue;
         }
+        let scheduled_start = context
+            .task
+            .scheduled_start_at
+            .or(context.task.scheduled_at);
+        let scheduled_end = context.task.scheduled_end_at;
+        let scheduled_block_active = scheduled_start.is_some_and(|start| start <= now)
+            && scheduled_end.is_some_and(|end| now < end);
+        let scheduled_block_elapsed = scheduled_end.is_some_and(|end| end < now);
+        let legacy_schedule_due =
+            scheduled_end.is_none() && scheduled_start.is_some_and(|start| start <= now);
+        let scheduled_later_today = scheduled_start
+            .is_some_and(|start| start > now && start.date_naive() == now.date_naive());
+
         if matches!(status, TaskStatus::Blocked | TaskStatus::Waiting) {
             board.waiting_blocked.push(scored(context, now));
-        } else if context.task.due_at.is_some_and(|at| at < now)
-            || context
-                .task
-                .scheduled_end_at
-                .or(context.task.scheduled_start_at)
-                .or(context.task.scheduled_at)
-                .is_some_and(|at| at < now)
-        {
+        } else if context.task.due_at.is_some_and(|at| at < now) || scheduled_block_elapsed {
             board.overdue.push(scored(context, now));
-        } else if status == TaskStatus::InProgress
-            || context
-                .task
-                .scheduled_start_at
-                .or(context.task.scheduled_at)
-                .is_some_and(|at| at <= now)
+        } else if status == TaskStatus::InProgress || scheduled_block_active || legacy_schedule_due
         {
             board.now.push(scored(context, now));
+        } else if scheduled_later_today {
+            board.later_today.push(scored(context, now));
         } else if context
             .task
             .due_at
             .is_some_and(|at| at - now <= Duration::days(1))
         {
             board.due_soon.push(scored(context, now));
-        } else if context
-            .task
-            .scheduled_start_at
-            .or(context.task.scheduled_at)
-            .is_some_and(|at| at.date_naive() == now.date_naive())
-        {
-            board.later_today.push(scored(context, now));
         } else {
             board.next_up.push(scored(context, now));
         }
@@ -88,6 +84,7 @@ fn scored(context: TaskContext, now: DateTime<Utc>) -> ScoredTask {
 mod tests {
     use super::*;
     use crate::models::{ProjectStatus, ProjectType, Task};
+    use chrono::TimeZone;
 
     fn task(id: &str, status: TaskStatus, now: DateTime<Utc>) -> TaskContext {
         TaskContext {
@@ -168,7 +165,10 @@ mod tests {
     /// elapsed/unfinished → Overdue, completed → Done Today.
     #[test]
     fn scheduled_tasks_group_by_their_time_block() {
-        let now = Utc::now();
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 19, 12, 0, 0)
+            .single()
+            .unwrap();
 
         let mut active = task("active", TaskStatus::Scheduled, now);
         active.task.scheduled_start_at = Some(now - Duration::minutes(5));
@@ -187,7 +187,11 @@ mod tests {
         done.task.scheduled_end_at = Some(now - Duration::hours(1));
         done.task.completed_at = Some(now);
 
-        let board = build_board(vec![active, later, elapsed, done], now);
+        let mut tomorrow = task("tomorrow", TaskStatus::Scheduled, now);
+        tomorrow.task.scheduled_start_at = Some(now + Duration::days(1));
+        tomorrow.task.scheduled_end_at = Some(now + Duration::days(1) + Duration::hours(1));
+
+        let board = build_board(vec![active, later, elapsed, done, tomorrow], now);
         assert!(board.now.iter().any(|t| t.context.task.id == "active"));
         assert!(
             board
@@ -197,6 +201,12 @@ mod tests {
         );
         assert!(board.overdue.iter().any(|t| t.context.task.id == "elapsed"));
         assert!(board.done_today.iter().any(|t| t.context.task.id == "done"));
+        assert!(
+            !board
+                .later_today
+                .iter()
+                .any(|t| t.context.task.id == "tomorrow")
+        );
     }
 
     /// Within a single urgency column (here NOW), a P1 task must outrank a P5 one.

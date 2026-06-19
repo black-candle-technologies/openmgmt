@@ -2109,12 +2109,16 @@ impl Database {
     }
 
     pub fn board_state(&self) -> Result<BoardState> {
+        self.board_state_at(Utc::now())
+    }
+
+    fn board_state_at(&self, now: DateTime<Utc>) -> Result<BoardState> {
         let contexts = self
             .task_context_rows()?
             .into_iter()
             .map(|(context, _, _, _)| context)
             .collect::<Vec<_>>();
-        Ok(build_board(contexts, Utc::now()))
+        Ok(build_board(contexts, now))
     }
 
     #[cfg(test)]
@@ -3783,7 +3787,10 @@ mod tests {
         let current = scheduling_task(&db, "Current", 2, 30);
         let later = scheduling_task(&db, "Later", 2, 30);
         let overdue = scheduling_task(&db, "Elapsed", 2, 30);
-        let now = Utc::now();
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 19, 12, 0, 0)
+            .single()
+            .unwrap();
         db.schedule_task(
             &current.id,
             schedule_input(
@@ -3808,7 +3815,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let board = db.board_state().unwrap();
+        let board = db.board_state_at(now).unwrap();
         assert!(
             board
                 .now
@@ -3927,6 +3934,18 @@ mod tests {
         db.transition_task(&done.id, TaskStatus::Done, None)
             .unwrap();
 
+        let canceled = scheduling_task(&db, "Canceled", 2, 30);
+        db.schedule_task(
+            &canceled.id,
+            schedule_input(
+                now - ChronoDuration::minutes(5),
+                now + ChronoDuration::minutes(25),
+            ),
+        )
+        .unwrap();
+        db.transition_task(&canceled.id, TaskStatus::Canceled, None)
+            .unwrap();
+
         let started = db.auto_start_due_scheduled_tasks().unwrap();
         assert!(started.is_empty());
         assert_eq!(
@@ -3938,6 +3957,10 @@ mod tests {
             TaskStatus::Scheduled
         );
         assert_eq!(db.get_task(&done.id).unwrap().status, TaskStatus::Done);
+        assert_eq!(
+            db.get_task(&canceled.id).unwrap().status,
+            TaskStatus::Canceled
+        );
     }
 
     #[test]
