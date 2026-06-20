@@ -67,9 +67,11 @@ the Trunk dev server with the board query string (`http://127.0.0.1:1420/?board=
 in a packaged build it loads the bundled asset (`tauri://localhost/index.html?board=1`).
 The main app and TV board use the same repository-local `data/openmgmt.sqlite` file.
 
-The left sidebar navigates Dashboard, Organizations, Projects, Tasks, Today, and
-an embedded Board. The top bar exposes the current page title, a status
-indicator, and the Refresh and Open TV Board actions.
+The left sidebar navigates Dashboard, Daily Operations, Tasks, Schedule,
+Projects, Organizations, and an embedded Board. Daily Operations is the daily
+planning page (it replaces the former Today page). The top bar exposes the
+current page title, a status indicator, and the Refresh and Open TV Board
+actions.
 
 ## Supported MVP workflow
 
@@ -78,7 +80,8 @@ indicator, and the Refresh and Open TV Board actions.
 2. Create a project from the **New project** drawer, edit its metadata, or
    archive it. Open a project to see its workspace page and task table.
 3. Create and edit tasks from the **New task** drawer (reachable from the top
-   bar, Tasks, Today, and project pages). Click any task title to edit it.
+   bar, Tasks, Daily Operations, and project pages). Click any task title to
+   edit it.
 4. Start, complete, block, unblock, or cancel a task from its row/card actions.
 5. Use **Refresh** for an explicit reload. Successful mutations also refresh the
    main snapshot immediately.

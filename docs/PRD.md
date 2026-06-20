@@ -12,7 +12,8 @@ urgent, what is blocked, and what should happen next?
 2. Create projects categorized by organization and work type.
 3. Capture, schedule, start, block, unblock, complete, or cancel project tasks.
 4. Track elapsed time for active tasks and display configured time limits.
-5. Review a scored Today view.
+5. Review a scored Daily Operations view (the daily planning page that replaced
+   the former Today page).
 6. Open a dedicated fullscreen board on a television or second monitor.
 7. Let an MCP-capable assistant inspect work and optionally create or update it.
 

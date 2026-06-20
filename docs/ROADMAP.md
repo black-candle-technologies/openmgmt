@@ -19,6 +19,16 @@
 - SQLite backup, restore, and JSON/CSV export
 - Tauri end-to-end tests and accessibility audit
 
+## Scheduling and Calendar Integration
+
+- Internal task scheduling ranges and local calendar blocks
+- Calendar and agenda desktop UI
+- Recurring tasks and recurrence exceptions
+- Local reminder delivery
+- ICS export and import
+- Google Calendar integration after local scheduling stabilizes
+- Outlook and Apple Calendar integration later
+
 ## Later
 
 - Optional encrypted profiles

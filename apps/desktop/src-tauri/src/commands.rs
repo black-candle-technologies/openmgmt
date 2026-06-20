@@ -1,8 +1,10 @@
+use chrono::{DateTime, Utc};
 use openmgmt_core::{
-    AppService, BoardState, NewOrganization, NewProject, NewSavedTaskView, NewTask, Organization,
-    OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch, ScoringSettings,
+    AppService, BoardState, CalendarBlock, NewOrganization, NewProject, NewSavedTaskView, NewTask,
+    Organization, OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch,
+    ScheduleConflict, ScheduleTaskInput, ScheduledBlockCompletion, ScoringSettings,
     ScoringSettingsPatch, SyncSettings, SyncSettingsPatch, SyncStatus, Task, TaskPatch,
-    TaskQueryFilter, TaskSort, TaskTimerSession, TaskWithContext,
+    TaskQueryFilter, TaskSort, TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
 };
 use openmgmt_sync_client::{SyncConnectionTestResult, SyncOnceResult};
 use std::path::{Component, Path, PathBuf};
@@ -199,6 +201,112 @@ pub fn unblock_task(service: State<'_, AppService>, id: String) -> CommandResult
 #[tauri::command]
 pub fn get_board_state(service: State<'_, AppService>) -> CommandResult<BoardState> {
     core(service.get_board_state())
+}
+
+#[tauri::command]
+pub fn get_schedule_today(service: State<'_, AppService>) -> CommandResult<Vec<TaskWithContext>> {
+    core(service.get_schedule_today())
+}
+
+#[tauri::command]
+pub fn get_schedule_week(service: State<'_, AppService>) -> CommandResult<Vec<TaskWithContext>> {
+    core(service.get_schedule_week())
+}
+
+#[tauri::command]
+pub fn get_schedule_for_day(
+    service: State<'_, AppService>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> CommandResult<Vec<TaskWithContext>> {
+    core(service.get_schedule_for_day(start, end))
+}
+
+#[tauri::command]
+pub fn get_unscheduled_tasks(
+    service: State<'_, AppService>,
+) -> CommandResult<Vec<TaskWithContext>> {
+    core(service.get_unscheduled_tasks())
+}
+
+#[tauri::command]
+pub fn get_overdue_tasks(service: State<'_, AppService>) -> CommandResult<Vec<TaskWithContext>> {
+    core(service.get_overdue_tasks())
+}
+
+#[tauri::command]
+pub fn auto_start_due_scheduled_tasks(service: State<'_, AppService>) -> CommandResult<Vec<Task>> {
+    core(service.auto_start_due_scheduled_tasks())
+}
+
+#[tauri::command]
+pub fn schedule_task(
+    service: State<'_, AppService>,
+    task_id: String,
+    input: ScheduleTaskInput,
+) -> CommandResult<CalendarBlock> {
+    core(service.schedule_task(&task_id, input))
+}
+
+#[tauri::command]
+pub fn reschedule_task(
+    service: State<'_, AppService>,
+    task_id: String,
+    input: ScheduleTaskInput,
+) -> CommandResult<CalendarBlock> {
+    core(service.reschedule_task(&task_id, input))
+}
+
+#[tauri::command]
+pub fn clear_task_schedule(service: State<'_, AppService>, task_id: String) -> CommandResult<Task> {
+    core(service.clear_task_schedule(&task_id))
+}
+
+#[tauri::command]
+pub fn list_schedule_conflicts(
+    service: State<'_, AppService>,
+) -> CommandResult<Vec<ScheduleConflict>> {
+    core(service.list_schedule_conflicts())
+}
+
+#[tauri::command]
+pub fn suggest_next_time_block(
+    service: State<'_, AppService>,
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+    duration_minutes: i64,
+) -> CommandResult<Option<TimeBlockSuggestion>> {
+    core(service.suggest_next_time_block(window_start, window_end, duration_minutes))
+}
+
+#[tauri::command]
+pub fn suggest_tasks_for_time_window(
+    service: State<'_, AppService>,
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> CommandResult<Vec<TaskWithContext>> {
+    core(service.suggest_tasks_for_time_window(window_start, window_end))
+}
+
+#[tauri::command]
+pub fn complete_scheduled_block(
+    service: State<'_, AppService>,
+    block_id: String,
+) -> CommandResult<ScheduledBlockCompletion> {
+    core(service.complete_scheduled_block(&block_id))
+}
+
+#[tauri::command]
+pub fn skip_scheduled_block(
+    service: State<'_, AppService>,
+    block_id: String,
+) -> CommandResult<CalendarBlock> {
+    core(service.skip_scheduled_block(&block_id))
+}
+
+#[tauri::command]
+pub fn generate_schedule_ics(service: State<'_, AppService>) -> CommandResult<String> {
+    core(service.generate_schedule_ics())
 }
 
 #[tauri::command]
