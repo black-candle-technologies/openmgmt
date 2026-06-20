@@ -287,6 +287,14 @@ impl Database {
                 )?;
             }
         }
+        if columns.iter().any(|existing| existing == "scheduled_at") {
+            connection.execute(
+                "UPDATE tasks
+                 SET scheduled_start_at = scheduled_at
+                 WHERE scheduled_start_at IS NULL AND scheduled_at IS NOT NULL",
+                [],
+            )?;
+        }
         connection.execute_batch(
             "CREATE INDEX IF NOT EXISTS tasks_scheduled_start_idx ON tasks(scheduled_start_at);
              CREATE INDEX IF NOT EXISTS tasks_scheduled_end_idx ON tasks(scheduled_end_at);
@@ -1457,7 +1465,7 @@ impl Database {
                         .task
                         .scheduled_end_at
                         .or(item.task.scheduled_start_at)
-                        .is_some_and(|value| value < now)
+                        .is_some_and(|value| value <= now)
             })
             .collect())
     }
@@ -3428,6 +3436,7 @@ fn clear_task_schedule_fields(task: &mut Task) {
     task.scheduled_at = None;
     task.scheduled_start_at = None;
     task.scheduled_end_at = None;
+    task.deadline_at = None;
     task.reminder_at = None;
     task.recurrence_rule = None;
     task.recurrence_anchor_at = None;
@@ -3629,18 +3638,75 @@ mod tests {
     }
 
     #[test]
+    fn migration_backfills_legacy_scheduled_at_without_overwriting_start() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY NOT NULL, project_id TEXT NOT NULL, title TEXT NOT NULL,
+                    description TEXT, status TEXT NOT NULL, priority INTEGER NOT NULL,
+                    due_at TEXT, scheduled_at TEXT, scheduled_start_at TEXT,
+                    started_at TEXT, completed_at TEXT,
+                    estimated_minutes INTEGER, time_limit_minutes INTEGER,
+                    pinned INTEGER NOT NULL DEFAULT 0, blocked_reason TEXT,
+                    tags TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO tasks (
+                    id, project_id, title, description, status, priority, due_at,
+                    scheduled_at, scheduled_start_at, started_at, completed_at,
+                    estimated_minutes, time_limit_minutes, pinned, blocked_reason,
+                    tags, created_at, updated_at
+                 ) VALUES
+                 (
+                    'legacy', 'project', 'Legacy', NULL, 'ready', 3, NULL,
+                    '2026-06-19T09:00:00Z', NULL, NULL, NULL,
+                    NULL, NULL, 0, NULL, '[]',
+                    '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z'
+                 ),
+                 (
+                    'explicit', 'project', 'Explicit', NULL, 'ready', 3, NULL,
+                    '2026-06-19T09:00:00Z', '2026-06-19T10:00:00Z', NULL, NULL,
+                    NULL, NULL, 0, NULL, '[]',
+                    '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z'
+                 );",
+            )
+            .unwrap();
+        let db = Database {
+            connection: Arc::new(Mutex::new(connection)),
+        };
+        db.migrate().unwrap();
+        let connection = db.connection().unwrap();
+        let legacy_start: String = connection
+            .query_row(
+                "SELECT scheduled_start_at FROM tasks WHERE id='legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let explicit_start: String = connection
+            .query_row(
+                "SELECT scheduled_start_at FROM tasks WHERE id='explicit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_start, "2026-06-19T09:00:00Z");
+        assert_eq!(explicit_start, "2026-06-19T10:00:00Z");
+    }
+
+    #[test]
     fn schedule_reschedule_and_clear_task() {
         let db = Database::in_memory().unwrap();
         let task = scheduling_task(&db, "Schedule lifecycle", 2, 45);
         let start = Utc::now() + ChronoDuration::hours(1);
-        let first = db
-            .schedule_task(
-                &task.id,
-                schedule_input(start, start + ChronoDuration::minutes(45)),
-            )
-            .unwrap();
+        let deadline = start + ChronoDuration::days(1);
+        let mut first_input = schedule_input(start, start + ChronoDuration::minutes(45));
+        first_input.deadline_at = Some(deadline);
+        let first = db.schedule_task(&task.id, first_input).unwrap();
         let scheduled = db.get_task(&task.id).unwrap();
         assert_eq!(scheduled.scheduled_start_at, Some(start));
+        assert_eq!(scheduled.deadline_at, Some(deadline));
         assert_eq!(
             scheduled.calendar_block_id.as_deref(),
             Some(first.id.as_str())
@@ -3666,6 +3732,7 @@ mod tests {
 
         let cleared = db.clear_task_schedule(&task.id).unwrap();
         assert!(cleared.scheduled_start_at.is_none());
+        assert!(cleared.deadline_at.is_none());
         assert!(cleared.calendar_block_id.is_none());
         assert_eq!(cleared.status, TaskStatus::Ready);
     }
@@ -3695,11 +3762,12 @@ mod tests {
             ),
         )
         .unwrap();
+        let overdue_now = Utc::now();
         db.schedule_task(
             &overdue.id,
             schedule_input(
-                now - ChronoDuration::hours(2),
-                now - ChronoDuration::hours(1),
+                overdue_now - ChronoDuration::hours(2),
+                overdue_now - ChronoDuration::hours(1),
             ),
         )
         .unwrap();

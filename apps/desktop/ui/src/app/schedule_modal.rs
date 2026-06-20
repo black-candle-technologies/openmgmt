@@ -62,6 +62,7 @@ pub fn ScheduleTaskModal(state: AppState, task: Task, on_close: Callback<()>) ->
     let init_reminder = datetime_local_value(task.reminder_at);
     let init_rule = task.recurrence_rule.unwrap_or(RecurrenceRule::None);
     let deadline = task.deadline_at;
+    let recurrence_timezone = task.recurrence_timezone.clone();
 
     let date_ref = NodeRef::<leptos::html::Input>::new();
     let start_ref = NodeRef::<leptos::html::Input>::new();
@@ -112,10 +113,11 @@ pub fn ScheduleTaskModal(state: AppState, task: Task, on_close: Callback<()>) ->
                         deadline_at: deadline,
                         recurrence_rule: Some(rule),
                         recurrence_anchor_at: None,
-                        recurrence_timezone: None,
+                        recurrence_timezone: recurrence_timezone.clone(),
                     };
                     let command = if reschedule { "reschedule_task" } else { "schedule_task" };
                     let id = task_id.clone();
+                    let close = on_close;
                     spawn_local(async move {
                         let result = invoke::<CalendarBlock>(command, json!({ "taskId": id, "input": input })).await;
                         match result {
@@ -124,6 +126,7 @@ pub fn ScheduleTaskModal(state: AppState, task: Task, on_close: Callback<()>) ->
                                     if reschedule { "Task rescheduled." } else { "Task scheduled." }.to_string(),
                                 ));
                                 state.reload().await;
+                                close.run(());
                             }
                             Err(error) => state.fail(
                                 if reschedule { "Reschedule failed" } else { "Schedule failed" },
@@ -131,7 +134,6 @@ pub fn ScheduleTaskModal(state: AppState, task: Task, on_close: Callback<()>) ->
                             ),
                         }
                     });
-                    on_close.run(());
                 }>
                     <FormField label="Date">
                         <input node_ref=date_ref type="date" value=init_date required />

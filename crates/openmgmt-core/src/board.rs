@@ -32,7 +32,7 @@ pub fn build_board(tasks: Vec<TaskContext>, now: DateTime<Utc>) -> BoardState {
         let scheduled_end = context.task.scheduled_end_at;
         let scheduled_block_active = scheduled_start.is_some_and(|start| start <= now)
             && scheduled_end.is_some_and(|end| now < end);
-        let scheduled_block_elapsed = scheduled_end.is_some_and(|end| end < now);
+        let scheduled_block_elapsed = scheduled_end.is_some_and(|end| end <= now);
         let legacy_schedule_due =
             scheduled_end.is_none() && scheduled_start.is_some_and(|start| start <= now);
         let scheduled_later_today = scheduled_start
@@ -182,6 +182,10 @@ mod tests {
         elapsed.task.scheduled_start_at = Some(now - Duration::hours(2));
         elapsed.task.scheduled_end_at = Some(now - Duration::hours(1));
 
+        let mut exact_end = task("exact-end", TaskStatus::Scheduled, now);
+        exact_end.task.scheduled_start_at = Some(now - Duration::hours(1));
+        exact_end.task.scheduled_end_at = Some(now);
+
         let mut done = task("done", TaskStatus::Done, now);
         done.task.scheduled_start_at = Some(now - Duration::hours(2));
         done.task.scheduled_end_at = Some(now - Duration::hours(1));
@@ -191,7 +195,7 @@ mod tests {
         tomorrow.task.scheduled_start_at = Some(now + Duration::days(1));
         tomorrow.task.scheduled_end_at = Some(now + Duration::days(1) + Duration::hours(1));
 
-        let board = build_board(vec![active, later, elapsed, done, tomorrow], now);
+        let board = build_board(vec![active, later, elapsed, exact_end, done, tomorrow], now);
         assert!(board.now.iter().any(|t| t.context.task.id == "active"));
         assert!(
             board
@@ -200,6 +204,12 @@ mod tests {
                 .any(|t| t.context.task.id == "later")
         );
         assert!(board.overdue.iter().any(|t| t.context.task.id == "elapsed"));
+        assert!(
+            board
+                .overdue
+                .iter()
+                .any(|t| t.context.task.id == "exact-end")
+        );
         assert!(board.done_today.iter().any(|t| t.context.task.id == "done"));
         assert!(
             !board

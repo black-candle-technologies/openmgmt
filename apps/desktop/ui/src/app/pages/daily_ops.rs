@@ -308,9 +308,14 @@ fn DailyRow(
     let active = row.active_timer.clone();
     let project = row.project_name.clone();
     // Scheduling indicators surfaced inline so planned/recurring work reads at a glance.
-    let scheduled_label = match (task.scheduled_start_at, task.scheduled_end_at) {
-        (Some(start), Some(end)) => Some(fmt_time_range(start, end)),
-        (Some(start), None) => Some(fmt_time(start)),
+    let scheduled_label = match (
+        task.scheduled_start_at,
+        task.scheduled_end_at,
+        task.scheduled_at,
+    ) {
+        (Some(start), Some(end), _) => Some(fmt_time_range(start, end)),
+        (Some(start), None, _) => Some(fmt_time(start)),
+        (None, None, Some(at)) => Some(fmt_time(at)),
         _ => None,
     };
     let recurrence = task

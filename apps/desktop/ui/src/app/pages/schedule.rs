@@ -176,6 +176,16 @@ impl Sched {
     /// Schedule or reschedule a task, then refresh and surface a conflict warning
     /// if the resulting block overlaps another planned block.
     fn run(self, task_id: String, input: ScheduleTaskInput, reschedule: bool) {
+        self.run_with_success(task_id, input, reschedule, None);
+    }
+
+    fn run_with_success(
+        self,
+        task_id: String,
+        input: ScheduleTaskInput,
+        reschedule: bool,
+        on_success: Option<Callback<()>>,
+    ) {
         spawn_local(async move {
             let command = if reschedule {
                 "reschedule_task"
@@ -198,8 +208,10 @@ impl Sched {
                         }
                         .to_string(),
                     ));
-                    self.reload();
                     self.state.refresh();
+                    if let Some(on_success) = on_success {
+                        on_success.run(());
+                    }
                     match invoke_schedule::<Vec<ScheduleConflict>>(
                         "list_schedule_conflicts",
                         json!({}),
@@ -241,7 +253,6 @@ impl Sched {
             {
                 Ok(_) => {
                     self.state.notice.set(Some("Schedule cleared.".to_string()));
-                    self.reload();
                     self.state.refresh();
                 }
                 Err(error) => self.state.fail("Clear schedule failed", error),
@@ -266,7 +277,6 @@ impl Sched {
                         }
                         .to_string(),
                     ));
-                    self.reload();
                     self.state.refresh();
                 }
                 Err(error) => self.state.fail("Complete block failed", error),
@@ -284,7 +294,6 @@ impl Sched {
             {
                 Ok(_) => {
                     self.state.notice.set(Some("Block skipped.".to_string()));
-                    self.reload();
                     self.state.refresh();
                 }
                 Err(error) => self.state.fail("Skip block failed", error),
@@ -297,7 +306,6 @@ impl Sched {
             match invoke_schedule::<Task>("complete_task", json!({ "id": task_id })).await {
                 Ok(_) => {
                     self.state.notice.set(Some("Task completed.".to_string()));
-                    self.reload();
                     self.state.refresh();
                 }
                 Err(error) => self.state.fail("Complete task failed", error),
@@ -1353,6 +1361,7 @@ fn ScheduleModal(ctx: Sched) -> impl IntoView {
             let init_reminder = datetime_local_value(task.reminder_at);
             let init_rule = task.recurrence_rule.unwrap_or(RecurrenceRule::None);
             let deadline = task.deadline_at;
+            let recurrence_timezone = task.recurrence_timezone.clone();
 
             let date_ref = NodeRef::<leptos::html::Input>::new();
             let start_ref = NodeRef::<leptos::html::Input>::new();
@@ -1403,10 +1412,10 @@ fn ScheduleModal(ctx: Sched) -> impl IntoView {
                                 deadline_at: deadline,
                                 recurrence_rule: Some(rule),
                                 recurrence_anchor_at: None,
-                                recurrence_timezone: None,
+                                recurrence_timezone: recurrence_timezone.clone(),
                             };
-                            ctx.run(task_id.clone(), input, reschedule);
-                            ctx.modal.set(None);
+                            let close_modal = Callback::new(move |_| ctx.modal.set(None));
+                            ctx.run_with_success(task_id.clone(), input, reschedule, Some(close_modal));
                         }>
                             <FormField label="Date">
                                 <input node_ref=date_ref type="date" value=init_date required />

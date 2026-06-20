@@ -27,7 +27,9 @@ pub fn generate_schedule_ics(blocks: &[CalendarBlock]) -> String {
     for block in blocks.iter().filter(|block| {
         !matches!(
             block.status,
-            CalendarBlockStatus::Canceled | CalendarBlockStatus::Skipped
+            CalendarBlockStatus::Canceled
+                | CalendarBlockStatus::Skipped
+                | CalendarBlockStatus::Moved
         )
     }) {
         output.push_str("BEGIN:VEVENT\r\n");
@@ -57,6 +59,8 @@ pub fn generate_schedule_ics(blocks: &[CalendarBlock]) -> String {
 
 fn ics_escape(value: &str) -> String {
     value
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
         .replace('\\', "\\\\")
         .replace('\n', "\\n")
         .replace(',', "\\,")
@@ -74,7 +78,28 @@ fn ics_status(status: CalendarBlockStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::CalendarBlockSource;
     use chrono::{TimeZone, Timelike};
+
+    fn block(id: &str, title: &str, status: CalendarBlockStatus) -> CalendarBlock {
+        let start = Utc.with_ymd_and_hms(2026, 6, 19, 9, 0, 0).unwrap();
+        CalendarBlock {
+            id: id.into(),
+            task_id: None,
+            project_id: None,
+            organization_id: None,
+            title: title.into(),
+            description: None,
+            start_at: start,
+            end_at: start + Duration::hours(1),
+            timezone: None,
+            source: CalendarBlockSource::OpenMgmt,
+            external_id: None,
+            status,
+            created_at: start,
+            updated_at: start,
+        }
+    }
 
     #[test]
     fn recurrence_supports_daily_weekly_monthly_and_weekdays() {
@@ -95,5 +120,61 @@ mod tests {
         let monthly = next_recurrence_at(RecurrenceRule::Monthly, january).unwrap();
         assert_eq!(monthly.month(), 2);
         assert_eq!(monthly.day(), 15);
+    }
+
+    #[test]
+    fn monthly_recurrence_clamps_month_end_dates() {
+        let jan_31_2025 = Utc.with_ymd_and_hms(2025, 1, 31, 9, 30, 0).unwrap();
+        let feb_2025 = next_recurrence_at(RecurrenceRule::Monthly, jan_31_2025).unwrap();
+        assert_eq!(
+            feb_2025,
+            Utc.with_ymd_and_hms(2025, 2, 28, 9, 30, 0).unwrap()
+        );
+
+        let jan_31_2024 = Utc.with_ymd_and_hms(2024, 1, 31, 9, 30, 0).unwrap();
+        let feb_2024 = next_recurrence_at(RecurrenceRule::Monthly, jan_31_2024).unwrap();
+        assert_eq!(
+            feb_2024,
+            Utc.with_ymd_and_hms(2024, 2, 29, 9, 30, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn ics_export_excludes_inactive_blocks() {
+        let planned = block("planned", "Planned Block", CalendarBlockStatus::Planned);
+        let moved = block("moved", "Moved Block", CalendarBlockStatus::Moved);
+        let skipped = block("skipped", "Skipped Block", CalendarBlockStatus::Skipped);
+        let canceled = block("canceled", "Canceled Block", CalendarBlockStatus::Canceled);
+
+        let ics = generate_schedule_ics(&[planned, moved, skipped, canceled]);
+        assert!(ics.contains("Planned Block"));
+        assert!(!ics.contains("Moved Block"));
+        assert!(!ics.contains("Skipped Block"));
+        assert!(!ics.contains("Canceled Block"));
+    }
+
+    #[test]
+    fn ics_export_escapes_carriage_returns() {
+        let mut block = block(
+            "escaped",
+            "Title\r\nCRLF\rCR\nLF,semi;slash\\",
+            CalendarBlockStatus::Planned,
+        );
+        block.description = Some("Description\r\nCRLF\rCR\nLF".into());
+
+        let ics = generate_schedule_ics(&[block]);
+        let summary = ics
+            .split("\r\n")
+            .find(|line| line.starts_with("SUMMARY:"))
+            .unwrap();
+        let description = ics
+            .split("\r\n")
+            .find(|line| line.starts_with("DESCRIPTION:"))
+            .unwrap();
+
+        assert!(summary.contains("Title\\nCRLF\\nCR\\nLF\\,semi\\;slash\\\\"));
+        assert!(description.contains("Description\\nCRLF\\nCR\\nLF"));
+        assert!(!summary.contains('\r'));
+        assert!(!description.contains('\r'));
     }
 }

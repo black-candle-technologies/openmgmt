@@ -23,8 +23,14 @@ const STARTS_SOON: Duration = Duration::minutes(30);
 
 /// Local time-range label for a task's scheduled block, when it has one.
 fn scheduled_range(task: &Task) -> Option<String> {
-    match (task.scheduled_start_at, task.scheduled_end_at) {
-        (Some(start), Some(end)) => Some(fmt_time_range(start, end)),
+    match (
+        task.scheduled_start_at,
+        task.scheduled_end_at,
+        task.scheduled_at,
+    ) {
+        (Some(start), Some(end), _) => Some(fmt_time_range(start, end)),
+        (Some(start), None, _) => Some(fmt_time(start)),
+        (None, None, Some(at)) => Some(fmt_time(at)),
         _ => None,
     }
 }
@@ -146,8 +152,8 @@ fn ErRow(item: ScoredTask, tone: &'static str, now: Signal<DateTime<Utc>>) -> im
         } else {
             fmt_time(at)
         }
-    } else if let Some(at) = task.scheduled_at {
-        fmt_time(at)
+    } else if let Some(label) = scheduled_range(&task) {
+        label
     } else {
         "—".into()
     };
@@ -217,8 +223,8 @@ fn due_wait_text(task: &Task, tone: &str) -> String {
         } else {
             fmt_time(at)
         }
-    } else if let Some(at) = task.scheduled_at {
-        fmt_time(at)
+    } else if let Some(label) = scheduled_range(task) {
+        label
     } else {
         "—".into()
     }
@@ -262,7 +268,7 @@ fn BoardCard(
     // "starts soon" / "overdue" cue derived from the card's tone + the clock.
     let sched_range = scheduled_range(&task);
     let recurrence = recurrence_of(&task);
-    let sched_start = task.scheduled_start_at;
+    let sched_start = task.scheduled_start_at.or(task.scheduled_at);
     let starts_soon = move || {
         tone == "later"
             && sched_start.is_some_and(|start| {
@@ -270,7 +276,7 @@ fn BoardCard(
                 start > n && start - n <= STARTS_SOON
             })
     };
-    let overdue_sched = tone == "overdue" && task.scheduled_end_at.is_some();
+    let overdue_sched = tone == "overdue" && sched_start.is_some();
 
     let timer = move || {
         started_at.map(|at| {

@@ -82,8 +82,10 @@ provider integrations.
 
 - `get_schedule_today`
 - `get_schedule_week`
+- `get_schedule_for_day`
 - `get_unscheduled_tasks`
 - `get_overdue_tasks`
+- `auto_start_due_scheduled_tasks`
 - `schedule_task`
 - `reschedule_task`
 - `clear_task_schedule`
@@ -93,6 +95,9 @@ provider integrations.
 - `complete_scheduled_block`
 - `skip_scheduled_block`
 - `generate_schedule_ics`
+
+`auto_start_due_scheduled_tasks` is the backend polling hook for starting
+scheduled blocks when the current time enters their planned range.
 
 No desktop calendar UI is included in this phase.
 
@@ -111,7 +116,7 @@ P1 remains the highest priority.
 ## ICS Export
 
 `generate_schedule_ics` returns an RFC 5545-style `VCALENDAR` string containing
-local scheduled blocks. Canceled and skipped blocks are omitted. The command
+local scheduled blocks. Canceled, skipped, and moved blocks are omitted. The command
 returns text and does not write to the filesystem.
 
 ## Future Integrations
