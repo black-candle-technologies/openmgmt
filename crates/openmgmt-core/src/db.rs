@@ -3,12 +3,15 @@ use crate::models::{ProjectStatus, ProjectType};
 use crate::{
     board::build_board,
     models::{
-        ActiveTimerInfo, BoardState, GptActionLog, NewGptActionLog, NewOrganization, NewProject,
-        NewSavedTaskView, NewTask, Organization, OrganizationPatch, Project, ProjectPatch,
-        SavedTaskView, SavedTaskViewPatch, ScoringSettings, ScoringSettingsPatch, Task,
-        TaskContext, TaskPatch, TaskQueryFilter, TaskSort, TaskSortField, TaskStatus,
-        TaskTimerSession, TaskWithContext,
+        ActiveTimerInfo, BoardState, CalendarBlock, CalendarBlockSource, CalendarBlockStatus,
+        GptActionLog, NewGptActionLog, NewOrganization, NewProject, NewSavedTaskView, NewTask,
+        Organization, OrganizationPatch, Project, ProjectPatch, RecurrenceRule, SavedTaskView,
+        SavedTaskViewPatch, ScheduleConflict, ScheduleTaskInput, ScheduledBlockCompletion,
+        ScoringSettings, ScoringSettingsPatch, Task, TaskContext, TaskPatch, TaskQueryFilter,
+        TaskSort, TaskSortField, TaskStatus, TaskTimerSession, TaskWithContext,
+        TimeBlockSuggestion,
     },
+    scheduling::{generate_schedule_ics, next_recurrence_at},
     scoring::{ScoringWeights, score_task},
     sync::{
         DEFAULT_DEVICE_NAME, LOCAL_DEVICE_ID_KEY, RemoteApplyBatchResult, RemoteApplyResult,
@@ -20,7 +23,7 @@ use crate::{
 };
 #[cfg(test)]
 use chrono::Duration;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::{
     cmp::Ordering,
@@ -134,7 +137,9 @@ impl Database {
             CREATE TABLE IF NOT EXISTS tasks (
               id TEXT PRIMARY KEY NOT NULL, project_id TEXT NOT NULL REFERENCES projects(id),
               title TEXT NOT NULL, description TEXT, status TEXT NOT NULL, priority INTEGER NOT NULL,
-              due_at TEXT, scheduled_at TEXT, started_at TEXT, completed_at TEXT,
+              due_at TEXT, scheduled_at TEXT, scheduled_start_at TEXT, scheduled_end_at TEXT,
+              deadline_at TEXT, reminder_at TEXT, recurrence_rule TEXT, recurrence_anchor_at TEXT,
+              recurrence_timezone TEXT, calendar_block_id TEXT, started_at TEXT, completed_at TEXT,
               estimated_minutes INTEGER, time_limit_minutes INTEGER, pinned INTEGER NOT NULL DEFAULT 0,
               blocked_reason TEXT, tags TEXT NOT NULL DEFAULT '[]',
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -142,6 +147,28 @@ impl Database {
             CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks(project_id);
             CREATE INDEX IF NOT EXISTS tasks_status_idx ON tasks(status);
             CREATE INDEX IF NOT EXISTS tasks_due_idx ON tasks(due_at);
+            CREATE TABLE IF NOT EXISTS calendar_blocks (
+              id TEXT PRIMARY KEY NOT NULL,
+              task_id TEXT REFERENCES tasks(id),
+              project_id TEXT REFERENCES projects(id),
+              organization_id TEXT REFERENCES organizations(id),
+              title TEXT NOT NULL,
+              description TEXT,
+              start_at TEXT NOT NULL,
+              end_at TEXT NOT NULL,
+              timezone TEXT,
+              source TEXT NOT NULL,
+              external_id TEXT,
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS calendar_blocks_start_idx ON calendar_blocks(start_at);
+            CREATE INDEX IF NOT EXISTS calendar_blocks_end_idx ON calendar_blocks(end_at);
+            CREATE INDEX IF NOT EXISTS calendar_blocks_task_idx ON calendar_blocks(task_id);
+            CREATE INDEX IF NOT EXISTS calendar_blocks_project_idx ON calendar_blocks(project_id);
+            CREATE INDEX IF NOT EXISTS calendar_blocks_organization_idx
+              ON calendar_blocks(organization_id);
             CREATE TABLE IF NOT EXISTS task_timer_sessions (
               id TEXT PRIMARY KEY NOT NULL,
               task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -247,9 +274,49 @@ impl Database {
               ON applied_remote_events(device_id, sequence);
             "#,
         )?;
+        self.ensure_task_scheduling_columns()?;
         self.ensure_sync_event_ownership_columns()?;
         self.seed_system_saved_task_views()?;
         self.ensure_default_scoring_settings()?;
+        Ok(())
+    }
+
+    fn ensure_task_scheduling_columns(&self) -> Result<()> {
+        let connection = self.connection()?;
+        let columns = connection
+            .prepare("PRAGMA table_info(tasks)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (column, definition) in [
+            ("scheduled_start_at", "TEXT"),
+            ("scheduled_end_at", "TEXT"),
+            ("deadline_at", "TEXT"),
+            ("reminder_at", "TEXT"),
+            ("recurrence_rule", "TEXT"),
+            ("recurrence_anchor_at", "TEXT"),
+            ("recurrence_timezone", "TEXT"),
+            ("calendar_block_id", "TEXT"),
+        ] {
+            if !columns.iter().any(|existing| existing == column) {
+                connection.execute(
+                    &format!("ALTER TABLE tasks ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        if columns.iter().any(|existing| existing == "scheduled_at") {
+            connection.execute(
+                "UPDATE tasks
+                 SET scheduled_start_at = scheduled_at
+                 WHERE scheduled_start_at IS NULL AND scheduled_at IS NOT NULL",
+                [],
+            )?;
+        }
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS tasks_scheduled_start_idx ON tasks(scheduled_start_at);
+             CREATE INDEX IF NOT EXISTS tasks_scheduled_end_idx ON tasks(scheduled_end_at);
+             CREATE INDEX IF NOT EXISTS tasks_reminder_idx ON tasks(reminder_at);",
+        )?;
         Ok(())
     }
 
@@ -346,7 +413,9 @@ impl Database {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT t.id,t.project_id,t.title,t.description,t.status,t.priority,t.due_at,
-              t.scheduled_at,t.started_at,t.completed_at,t.estimated_minutes,t.time_limit_minutes,
+              t.scheduled_at,t.scheduled_start_at,t.scheduled_end_at,t.deadline_at,t.reminder_at,
+              t.recurrence_rule,t.recurrence_anchor_at,t.recurrence_timezone,t.calendar_block_id,
+              t.started_at,t.completed_at,t.estimated_minutes,t.time_limit_minutes,
               t.pinned,t.blocked_reason,t.tags,t.created_at,t.updated_at,
               p.id,p.name,p.type,p.status,p.priority,o.id,o.name,o.color,o.icon
              FROM tasks t JOIN projects p ON p.id=t.project_id
@@ -356,15 +425,15 @@ impl Database {
         Ok(statement
             .query_map([], |row| {
                 let task = map_task(row)?;
-                let project_id: String = row.get(17)?;
-                let project_name: String = row.get(18)?;
-                let project_type = parse_enum(row.get::<_, String>(19)?)?;
-                let project_status = parse_enum(row.get::<_, String>(20)?)?;
-                let project_priority = row.get(21)?;
-                let organization_id: String = row.get(22)?;
-                let organization_name: String = row.get(23)?;
-                let organization_color = row.get(24)?;
-                let organization_icon = row.get(25)?;
+                let project_id: String = row.get(25)?;
+                let project_name: String = row.get(26)?;
+                let project_type = parse_enum(row.get::<_, String>(27)?)?;
+                let project_status = parse_enum(row.get::<_, String>(28)?)?;
+                let project_priority = row.get(29)?;
+                let organization_id: String = row.get(30)?;
+                let organization_name: String = row.get(31)?;
+                let organization_color = row.get(32)?;
+                let organization_icon = row.get(33)?;
                 Ok((
                     TaskContext {
                         task,
@@ -990,7 +1059,9 @@ impl Database {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT t.id,t.project_id,t.title,t.description,t.status,t.priority,t.due_at,
-                    t.scheduled_at,t.started_at,t.completed_at,t.estimated_minutes,
+                    t.scheduled_at,t.scheduled_start_at,t.scheduled_end_at,t.deadline_at,
+                    t.reminder_at,t.recurrence_rule,t.recurrence_anchor_at,t.recurrence_timezone,
+                    t.calendar_block_id,t.started_at,t.completed_at,t.estimated_minutes,
                     t.time_limit_minutes,t.pinned,t.blocked_reason,t.tags,t.created_at,t.updated_at
              FROM tasks t JOIN projects p ON p.id=t.project_id
              JOIN organizations o ON o.id=p.organization_id
@@ -1025,6 +1096,18 @@ impl Database {
             priority: input.priority,
             due_at: input.due_at,
             scheduled_at: input.scheduled_at,
+            scheduled_start_at: input.scheduled_at,
+            scheduled_end_at: input.scheduled_at.and_then(|start| {
+                input
+                    .estimated_minutes
+                    .map(|minutes| start + ChronoDuration::minutes(minutes.into()))
+            }),
+            deadline_at: None,
+            reminder_at: None,
+            recurrence_rule: None,
+            recurrence_anchor_at: None,
+            recurrence_timezone: None,
+            calendar_block_id: None,
             started_at: (input.status == TaskStatus::InProgress).then_some(now),
             completed_at: None,
             estimated_minutes: input.estimated_minutes,
@@ -1037,7 +1120,6 @@ impl Database {
         };
         let status = task.status.to_string();
         let due_at = task.due_at.map(timestamp);
-        let scheduled_at = task.scheduled_at.map(timestamp);
         let started_at = task.started_at.map(timestamp);
         let completed_at = task.completed_at.map(timestamp);
         let tags = serde_json::to_string(&task.tags).unwrap_or_else(|_| "[]".into());
@@ -1047,7 +1129,15 @@ impl Database {
         let transaction = connection.transaction()?;
         get_project_with_connection(&transaction, &task.project_id)?;
         transaction.execute(
-            "INSERT INTO tasks VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            "INSERT INTO tasks (
+                id,project_id,title,description,status,priority,due_at,scheduled_at,
+                scheduled_start_at,scheduled_end_at,deadline_at,reminder_at,recurrence_rule,
+                recurrence_anchor_at,recurrence_timezone,calendar_block_id,started_at,completed_at,
+                estimated_minutes,time_limit_minutes,pinned,blocked_reason,tags,created_at,updated_at
+             ) VALUES (
+                ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
+                ?19,?20,?21,?22,?23,?24,?25
+             )",
             params![
                 task.id,
                 task.project_id,
@@ -1056,7 +1146,15 @@ impl Database {
                 status,
                 task.priority,
                 due_at,
-                scheduled_at,
+                task.scheduled_at.map(timestamp),
+                task.scheduled_start_at.map(timestamp),
+                task.scheduled_end_at.map(timestamp),
+                task.deadline_at.map(timestamp),
+                task.reminder_at.map(timestamp),
+                task.recurrence_rule.map(|value| value.to_string()),
+                task.recurrence_anchor_at.map(timestamp),
+                task.recurrence_timezone,
+                task.calendar_block_id,
                 started_at,
                 completed_at,
                 task.estimated_minutes,
@@ -1111,9 +1209,18 @@ impl Database {
         }
         if let Some(value) = patch.scheduled_at {
             task.scheduled_at = value;
+            task.scheduled_start_at = value;
+            task.scheduled_end_at = value.and_then(|start| {
+                task.estimated_minutes
+                    .map(|minutes| start + ChronoDuration::minutes(minutes.into()))
+            });
         }
         if let Some(value) = patch.estimated_minutes {
             task.estimated_minutes = value;
+            if let Some(start) = task.scheduled_start_at {
+                task.scheduled_end_at =
+                    value.map(|minutes| start + ChronoDuration::minutes(minutes.into()));
+            }
         }
         if let Some(value) = patch.time_limit_minutes {
             task.time_limit_minutes = value;
@@ -1323,6 +1430,454 @@ impl Database {
     pub fn get_active_timer_session(&self, task_id: &str) -> Result<Option<TaskTimerSession>> {
         let connection = self.connection()?;
         get_active_timer_session_with_connection(&connection, task_id)
+    }
+
+    pub fn get_schedule_today(&self) -> Result<Vec<TaskWithContext>> {
+        let now = Utc::now();
+        let start = Utc.from_utc_datetime(
+            &now.date_naive()
+                .and_hms_opt(0, 0, 0)
+                .expect("valid midnight"),
+        );
+        self.scheduled_tasks_between(start, start + ChronoDuration::days(1))
+    }
+
+    pub fn get_schedule_week(&self) -> Result<Vec<TaskWithContext>> {
+        let now = Utc::now();
+        let today = now.date_naive();
+        let monday = today - ChronoDuration::days(today.weekday().num_days_from_monday().into());
+        let start = Utc.from_utc_datetime(&monday.and_hms_opt(0, 0, 0).expect("valid midnight"));
+        self.scheduled_tasks_between(start, start + ChronoDuration::days(7))
+    }
+
+    /// Scheduled tasks whose start falls within an explicit `[start, end)` window.
+    ///
+    /// Backs the Schedule page's day navigation: the UI computes the selected
+    /// local day's (or week's) UTC window and asks for exactly that range, so the
+    /// timeline is no longer pinned to the real "today".
+    pub fn get_schedule_for_day(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<TaskWithContext>> {
+        self.scheduled_tasks_between(start, end)
+    }
+
+    pub fn get_unscheduled_tasks(&self) -> Result<Vec<TaskWithContext>> {
+        Ok(self
+            .query_tasks(TaskQueryFilter::default(), Some(TaskSort::default()))?
+            .into_iter()
+            .filter(|item| item.task.scheduled_start_at.is_none())
+            .collect())
+    }
+
+    pub fn get_overdue_tasks(&self) -> Result<Vec<TaskWithContext>> {
+        let now = Utc::now();
+        Ok(self
+            .query_tasks(TaskQueryFilter::default(), Some(TaskSort::default()))?
+            .into_iter()
+            .filter(|item| {
+                item.task.due_at.is_some_and(|value| value < now)
+                    || item
+                        .task
+                        .scheduled_end_at
+                        .or(item.task.scheduled_start_at)
+                        .is_some_and(|value| value <= now)
+            })
+            .collect())
+    }
+
+    /// Start any scheduled task whose time block is currently active.
+    ///
+    /// "Active" means `scheduled_start_at <= now < scheduled_end_at`. A task is
+    /// only started when it is in a plannable state (not done, canceled, already
+    /// in progress, blocked, or waiting) and has no active timer session, so this
+    /// is idempotent: once a task is started it has an active timer and is skipped
+    /// on every subsequent call. Reuses [`start_task_timer`] so the task moves to
+    /// `InProgress` and a timer session is opened exactly as a manual start would.
+    /// Returns the tasks that were auto-started this call (empty when none are due).
+    pub fn auto_start_due_scheduled_tasks(&self) -> Result<Vec<Task>> {
+        let now = Utc::now();
+        let due: Vec<String> = self
+            .list_tasks()?
+            .into_iter()
+            .filter(|task| {
+                matches!(
+                    (task.scheduled_start_at, task.scheduled_end_at),
+                    (Some(start), Some(end)) if start <= now && now < end
+                ) && !matches!(
+                    task.status,
+                    TaskStatus::Done
+                        | TaskStatus::Canceled
+                        | TaskStatus::InProgress
+                        | TaskStatus::Blocked
+                        | TaskStatus::Waiting
+                )
+            })
+            .map(|task| task.id)
+            .collect();
+
+        let mut started = Vec::new();
+        for task_id in due {
+            // Skip anything already being timed; `start_task_timer` would also
+            // reject it, but checking first keeps this loop free of spurious errors.
+            if self.get_active_timer_session(&task_id)?.is_some() {
+                continue;
+            }
+            self.start_task_timer(&task_id)?;
+            started.push(self.get_task(&task_id)?);
+        }
+        Ok(started)
+    }
+
+    pub fn schedule_task(&self, task_id: &str, input: ScheduleTaskInput) -> Result<CalendarBlock> {
+        self.schedule_task_internal(task_id, input, false)
+    }
+
+    pub fn reschedule_task(
+        &self,
+        task_id: &str,
+        input: ScheduleTaskInput,
+    ) -> Result<CalendarBlock> {
+        self.schedule_task_internal(task_id, input, true)
+    }
+
+    fn schedule_task_internal(
+        &self,
+        task_id: &str,
+        input: ScheduleTaskInput,
+        preserve_moved_block: bool,
+    ) -> Result<CalendarBlock> {
+        validate_schedule_range(input.start_at, input.end_at)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut task = get_task_with_connection(&transaction, task_id)?;
+        if matches!(task.status, TaskStatus::Done | TaskStatus::Canceled) {
+            return Err(CoreError::Validation(
+                "done or canceled tasks cannot be scheduled".into(),
+            ));
+        }
+        let project = get_project_with_connection(&transaction, &task.project_id)?;
+        let now = Utc::now();
+        if let Some(block_id) = task.calendar_block_id.as_deref() {
+            if preserve_moved_block {
+                transaction.execute(
+                    "UPDATE calendar_blocks SET status='moved',updated_at=?2 WHERE id=?1",
+                    params![block_id, timestamp(now)],
+                )?;
+            } else {
+                transaction.execute("DELETE FROM calendar_blocks WHERE id=?1", [block_id])?;
+            }
+        }
+        let block = CalendarBlock {
+            id: Uuid::new_v4().to_string(),
+            task_id: Some(task.id.clone()),
+            project_id: Some(project.id),
+            organization_id: Some(project.organization_id),
+            title: task.title.clone(),
+            description: task.description.clone(),
+            start_at: input.start_at,
+            end_at: input.end_at,
+            timezone: clean_optional_string(input.timezone),
+            source: CalendarBlockSource::OpenMgmt,
+            external_id: None,
+            status: CalendarBlockStatus::Planned,
+            created_at: now,
+            updated_at: now,
+        };
+        insert_calendar_block_with_connection(&transaction, &block)?;
+        task.scheduled_at = Some(input.start_at);
+        task.scheduled_start_at = Some(input.start_at);
+        task.scheduled_end_at = Some(input.end_at);
+        task.deadline_at = input.deadline_at;
+        task.reminder_at = input.reminder_at;
+        task.recurrence_rule = input
+            .recurrence_rule
+            .filter(|rule| *rule != RecurrenceRule::None);
+        task.recurrence_anchor_at = input.recurrence_anchor_at.or(Some(input.start_at));
+        task.recurrence_timezone = clean_optional_string(input.recurrence_timezone);
+        task.calendar_block_id = Some(block.id.clone());
+        if matches!(
+            task.status,
+            TaskStatus::Inbox | TaskStatus::Backlog | TaskStatus::Ready
+        ) {
+            task.status = TaskStatus::Scheduled;
+        }
+        task.updated_at = now;
+        save_task_with_connection(&transaction, &task)?;
+        append_sync_event_with_connection(
+            &transaction,
+            SyncEntityType::Task,
+            &task.id,
+            SyncOperation::Updated,
+            serde_json::json!({ "entity": &task }),
+        )?;
+        transaction.commit()?;
+        Ok(block)
+    }
+
+    pub fn clear_task_schedule(&self, task_id: &str) -> Result<Task> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut task = get_task_with_connection(&transaction, task_id)?;
+        if let Some(block_id) = task.calendar_block_id.as_deref() {
+            transaction.execute(
+                "UPDATE calendar_blocks SET status='canceled',updated_at=?2 WHERE id=?1",
+                params![block_id, timestamp(Utc::now())],
+            )?;
+        }
+        clear_task_schedule_fields(&mut task);
+        if task.status == TaskStatus::Scheduled {
+            task.status = TaskStatus::Ready;
+        }
+        task.updated_at = Utc::now();
+        save_task_with_connection(&transaction, &task)?;
+        append_sync_event_with_connection(
+            &transaction,
+            SyncEntityType::Task,
+            &task.id,
+            SyncOperation::Updated,
+            serde_json::json!({ "entity": &task }),
+        )?;
+        transaction.commit()?;
+        Ok(task)
+    }
+
+    pub fn list_schedule_conflicts(&self) -> Result<Vec<ScheduleConflict>> {
+        let blocks = self
+            .list_calendar_blocks()?
+            .into_iter()
+            .filter(|block| block.status == CalendarBlockStatus::Planned)
+            .collect::<Vec<_>>();
+        let mut conflicts = Vec::new();
+        for (index, first) in blocks.iter().enumerate() {
+            for second in blocks.iter().skip(index + 1) {
+                if first.start_at < second.end_at && second.start_at < first.end_at {
+                    conflicts.push(ScheduleConflict {
+                        first: first.clone(),
+                        second: second.clone(),
+                    });
+                }
+            }
+        }
+        Ok(conflicts)
+    }
+
+    pub fn suggest_next_time_block(
+        &self,
+        window_start: DateTime<Utc>,
+        window_end: DateTime<Utc>,
+        duration_minutes: i64,
+    ) -> Result<Option<TimeBlockSuggestion>> {
+        if duration_minutes <= 0 {
+            return Err(CoreError::Validation(
+                "duration_minutes must be greater than zero".into(),
+            ));
+        }
+        validate_schedule_range(window_start, window_end)?;
+        let duration = ChronoDuration::minutes(duration_minutes);
+        let mut cursor = window_start;
+        let mut blocks = self
+            .list_calendar_blocks()?
+            .into_iter()
+            .filter(|block| {
+                block.status == CalendarBlockStatus::Planned
+                    && block.end_at > window_start
+                    && block.start_at < window_end
+            })
+            .collect::<Vec<_>>();
+        blocks.sort_by_key(|block| block.start_at);
+        for block in blocks {
+            if cursor + duration <= block.start_at {
+                return Ok(Some(TimeBlockSuggestion {
+                    start_at: cursor,
+                    end_at: cursor + duration,
+                    duration_minutes,
+                }));
+            }
+            if block.end_at > cursor {
+                cursor = block.end_at;
+            }
+        }
+        Ok(
+            (cursor + duration <= window_end).then_some(TimeBlockSuggestion {
+                start_at: cursor,
+                end_at: cursor + duration,
+                duration_minutes,
+            }),
+        )
+    }
+
+    pub fn suggest_tasks_for_time_window(
+        &self,
+        window_start: DateTime<Utc>,
+        window_end: DateTime<Utc>,
+    ) -> Result<Vec<TaskWithContext>> {
+        validate_schedule_range(window_start, window_end)?;
+        let available_minutes = (window_end - window_start).num_minutes();
+        Ok(self
+            .get_unscheduled_tasks()?
+            .into_iter()
+            .filter(|item| {
+                item.task.estimated_minutes.unwrap_or(30).clamp(1, i32::MAX) as i64
+                    <= available_minutes
+            })
+            .collect())
+    }
+
+    pub fn complete_scheduled_block(&self, block_id: &str) -> Result<ScheduledBlockCompletion> {
+        let mut block = self.get_calendar_block(block_id)?;
+        block.status = CalendarBlockStatus::Completed;
+        block.updated_at = Utc::now();
+        self.save_calendar_block(&block)?;
+        let mut task = None;
+        let mut next_occurrence_task = None;
+        if let Some(task_id) = block.task_id.as_deref() {
+            let completed = self.complete_task_with_timer(task_id)?;
+            if let Some(rule) = completed.recurrence_rule
+                && let Some(next_start) = next_recurrence_at(rule, block.start_at)
+            {
+                let duration = block.end_at - block.start_at;
+                let next = self.create_task(NewTask {
+                    project_id: completed.project_id.clone(),
+                    title: completed.title.clone(),
+                    description: completed.description.clone(),
+                    status: TaskStatus::Scheduled,
+                    priority: completed.priority,
+                    due_at: completed
+                        .due_at
+                        .map(|due| due + (next_start - block.start_at)),
+                    scheduled_at: Some(next_start),
+                    estimated_minutes: completed.estimated_minutes,
+                    time_limit_minutes: completed.time_limit_minutes,
+                    pinned: completed.pinned,
+                    tags: completed.tags.clone(),
+                })?;
+                self.schedule_task(
+                    &next.id,
+                    ScheduleTaskInput {
+                        start_at: next_start,
+                        end_at: next_start + duration,
+                        timezone: block.timezone.clone(),
+                        reminder_at: completed
+                            .reminder_at
+                            .map(|reminder| reminder + (next_start - block.start_at)),
+                        deadline_at: completed
+                            .deadline_at
+                            .map(|deadline| deadline + (next_start - block.start_at)),
+                        recurrence_rule: Some(rule),
+                        recurrence_anchor_at: Some(next_start),
+                        recurrence_timezone: completed.recurrence_timezone.clone(),
+                    },
+                )?;
+                next_occurrence_task = Some(self.get_task(&next.id)?);
+            }
+            task = Some(completed);
+        }
+        Ok(ScheduledBlockCompletion {
+            block,
+            task,
+            next_occurrence_task,
+        })
+    }
+
+    pub fn skip_scheduled_block(&self, block_id: &str) -> Result<CalendarBlock> {
+        let mut block = self.get_calendar_block(block_id)?;
+        block.status = CalendarBlockStatus::Skipped;
+        block.updated_at = Utc::now();
+        self.save_calendar_block(&block)?;
+        if let Some(task_id) = block.task_id.as_deref() {
+            let mut connection = self.connection()?;
+            let transaction = connection.transaction()?;
+            let mut task = get_task_with_connection(&transaction, task_id)?;
+            clear_task_schedule_fields(&mut task);
+            if task.status == TaskStatus::Scheduled {
+                task.status = TaskStatus::Ready;
+            }
+            task.updated_at = Utc::now();
+            save_task_with_connection(&transaction, &task)?;
+            append_sync_event_with_connection(
+                &transaction,
+                SyncEntityType::Task,
+                &task.id,
+                SyncOperation::Updated,
+                serde_json::json!({ "entity": &task }),
+            )?;
+            transaction.commit()?;
+        }
+        Ok(block)
+    }
+
+    pub fn generate_schedule_ics(&self) -> Result<String> {
+        Ok(generate_schedule_ics(&self.list_calendar_blocks()?))
+    }
+
+    pub fn list_calendar_blocks(&self) -> Result<Vec<CalendarBlock>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,task_id,project_id,organization_id,title,description,start_at,end_at,
+                    timezone,source,external_id,status,created_at,updated_at
+             FROM calendar_blocks ORDER BY start_at",
+        )?;
+        Ok(statement
+            .query_map([], map_calendar_block)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn get_calendar_block(&self, block_id: &str) -> Result<CalendarBlock> {
+        self.connection()?
+            .query_row(
+                "SELECT id,task_id,project_id,organization_id,title,description,start_at,end_at,
+                        timezone,source,external_id,status,created_at,updated_at
+                 FROM calendar_blocks WHERE id=?1",
+                [block_id],
+                map_calendar_block,
+            )
+            .optional()?
+            .ok_or(CoreError::NotFound("calendar block"))
+    }
+
+    fn save_calendar_block(&self, block: &CalendarBlock) -> Result<()> {
+        changed(
+            self.connection()?.execute(
+                "UPDATE calendar_blocks SET task_id=?2,project_id=?3,organization_id=?4,title=?5,
+                 description=?6,start_at=?7,end_at=?8,timezone=?9,source=?10,external_id=?11,
+                 status=?12,created_at=?13,updated_at=?14 WHERE id=?1",
+                params![
+                    block.id,
+                    block.task_id,
+                    block.project_id,
+                    block.organization_id,
+                    block.title,
+                    block.description,
+                    timestamp(block.start_at),
+                    timestamp(block.end_at),
+                    block.timezone,
+                    block.source.to_string(),
+                    block.external_id,
+                    block.status.to_string(),
+                    timestamp(block.created_at),
+                    timestamp(block.updated_at),
+                ],
+            )?,
+            "calendar block",
+        )
+    }
+
+    fn scheduled_tasks_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<TaskWithContext>> {
+        Ok(self
+            .query_tasks(TaskQueryFilter::default(), Some(TaskSort::default()))?
+            .into_iter()
+            .filter(|item| {
+                item.task
+                    .scheduled_start_at
+                    .is_some_and(|scheduled| scheduled >= start && scheduled < end)
+            })
+            .collect())
     }
 
     pub fn list_saved_task_views(&self) -> Result<Vec<SavedTaskView>> {
@@ -1626,12 +2181,16 @@ impl Database {
     }
 
     pub fn board_state(&self) -> Result<BoardState> {
+        self.board_state_at(Utc::now())
+    }
+
+    fn board_state_at(&self, now: DateTime<Utc>) -> Result<BoardState> {
         let contexts = self
             .task_context_rows()?
             .into_iter()
             .map(|(context, _, _, _)| context)
             .collect::<Vec<_>>();
-        Ok(build_board(contexts, Utc::now()))
+        Ok(build_board(contexts, now))
     }
 
     #[cfg(test)]
@@ -1800,8 +2359,9 @@ impl Database {
 }
 
 const TASK_SELECT: &str = "SELECT id,project_id,title,description,status,priority,due_at,
- scheduled_at,started_at,completed_at,estimated_minutes,time_limit_minutes,pinned,blocked_reason,
- tags,created_at,updated_at FROM tasks";
+ scheduled_at,scheduled_start_at,scheduled_end_at,deadline_at,reminder_at,recurrence_rule,
+ recurrence_anchor_at,recurrence_timezone,calendar_block_id,started_at,completed_at,
+ estimated_minutes,time_limit_minutes,pinned,blocked_reason,tags,created_at,updated_at FROM tasks";
 
 fn get_or_create_device_id_with_connection(connection: &Connection) -> Result<String> {
     let now = timestamp(Utc::now());
@@ -2204,14 +2764,23 @@ fn upsert_task_from_remote(connection: &Connection, task: &Task) -> Result<()> {
         .map_err(|error| CoreError::Validation(format!("invalid remote task tags: {error}")))?;
     connection.execute(
         "INSERT INTO tasks (
-            id,project_id,title,description,status,priority,due_at,scheduled_at,started_at,
-            completed_at,estimated_minutes,time_limit_minutes,pinned,blocked_reason,tags,
-            created_at,updated_at
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+            id,project_id,title,description,status,priority,due_at,scheduled_at,
+            scheduled_start_at,scheduled_end_at,deadline_at,reminder_at,recurrence_rule,
+            recurrence_anchor_at,recurrence_timezone,calendar_block_id,started_at,completed_at,
+            estimated_minutes,time_limit_minutes,pinned,blocked_reason,tags,created_at,updated_at
+         ) VALUES (
+            ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
+            ?19,?20,?21,?22,?23,?24,?25
+         )
          ON CONFLICT(id) DO UPDATE SET
             project_id=excluded.project_id,title=excluded.title,description=excluded.description,
             status=excluded.status,priority=excluded.priority,due_at=excluded.due_at,
-            scheduled_at=excluded.scheduled_at,started_at=excluded.started_at,
+            scheduled_at=excluded.scheduled_at,scheduled_start_at=excluded.scheduled_start_at,
+            scheduled_end_at=excluded.scheduled_end_at,deadline_at=excluded.deadline_at,
+            reminder_at=excluded.reminder_at,recurrence_rule=excluded.recurrence_rule,
+            recurrence_anchor_at=excluded.recurrence_anchor_at,
+            recurrence_timezone=excluded.recurrence_timezone,
+            calendar_block_id=excluded.calendar_block_id,started_at=excluded.started_at,
             completed_at=excluded.completed_at,estimated_minutes=excluded.estimated_minutes,
             time_limit_minutes=excluded.time_limit_minutes,pinned=excluded.pinned,
             blocked_reason=excluded.blocked_reason,tags=excluded.tags,
@@ -2225,6 +2794,14 @@ fn upsert_task_from_remote(connection: &Connection, task: &Task) -> Result<()> {
             task.priority,
             task.due_at.map(timestamp),
             task.scheduled_at.map(timestamp),
+            task.scheduled_start_at.map(timestamp),
+            task.scheduled_end_at.map(timestamp),
+            task.deadline_at.map(timestamp),
+            task.reminder_at.map(timestamp),
+            task.recurrence_rule.map(|value| value.to_string()),
+            task.recurrence_anchor_at.map(timestamp),
+            task.recurrence_timezone,
+            task.calendar_block_id,
             task.started_at.map(timestamp),
             task.completed_at.map(timestamp),
             task.estimated_minutes,
@@ -2350,19 +2927,15 @@ fn timer_elapsed_seconds(session: &TaskTimerSession, now: DateTime<Utc>) -> i64 
 
 fn save_task_with_connection(connection: &Connection, task: &Task) -> Result<()> {
     let status = task.status.to_string();
-    let due_at = task.due_at.map(timestamp);
-    let scheduled_at = task.scheduled_at.map(timestamp);
-    let started_at = task.started_at.map(timestamp);
-    let completed_at = task.completed_at.map(timestamp);
     let tags = serde_json::to_string(&task.tags).unwrap_or_else(|_| "[]".into());
-    let created_at = timestamp(task.created_at);
-    let updated_at = timestamp(task.updated_at);
     changed(
         connection.execute(
             "UPDATE tasks SET project_id=?2,title=?3,description=?4,status=?5,priority=?6,due_at=?7,
-             scheduled_at=?8,started_at=?9,completed_at=?10,estimated_minutes=?11,
-             time_limit_minutes=?12,pinned=?13,blocked_reason=?14,tags=?15,created_at=?16,
-             updated_at=?17 WHERE id=?1",
+             scheduled_at=?8,scheduled_start_at=?9,scheduled_end_at=?10,deadline_at=?11,
+             reminder_at=?12,recurrence_rule=?13,recurrence_anchor_at=?14,
+             recurrence_timezone=?15,calendar_block_id=?16,started_at=?17,completed_at=?18,
+             estimated_minutes=?19,time_limit_minutes=?20,pinned=?21,blocked_reason=?22,
+             tags=?23,created_at=?24,updated_at=?25 WHERE id=?1",
             params![
                 task.id,
                 task.project_id,
@@ -2370,17 +2943,25 @@ fn save_task_with_connection(connection: &Connection, task: &Task) -> Result<()>
                 task.description,
                 status,
                 task.priority,
-                due_at,
-                scheduled_at,
-                started_at,
-                completed_at,
+                task.due_at.map(timestamp),
+                task.scheduled_at.map(timestamp),
+                task.scheduled_start_at.map(timestamp),
+                task.scheduled_end_at.map(timestamp),
+                task.deadline_at.map(timestamp),
+                task.reminder_at.map(timestamp),
+                task.recurrence_rule.map(|value| value.to_string()),
+                task.recurrence_anchor_at.map(timestamp),
+                task.recurrence_timezone,
+                task.calendar_block_id,
+                task.started_at.map(timestamp),
+                task.completed_at.map(timestamp),
                 task.estimated_minutes,
                 task.time_limit_minutes,
                 task.pinned,
                 task.blocked_reason,
                 tags,
-                created_at,
-                updated_at
+                timestamp(task.created_at),
+                timestamp(task.updated_at)
             ],
         )?,
         "task",
@@ -2421,7 +3002,7 @@ fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
 }
 
 fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
-    let tags: String = row.get(14)?;
+    let tags: String = row.get(22)?;
     Ok(Task {
         id: row.get(0)?,
         project_id: row.get(1)?,
@@ -2431,15 +3012,26 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         priority: row.get(5)?,
         due_at: parse_optional_time(row.get(6)?)?,
         scheduled_at: parse_optional_time(row.get(7)?)?,
-        started_at: parse_optional_time(row.get(8)?)?,
-        completed_at: parse_optional_time(row.get(9)?)?,
-        estimated_minutes: row.get(10)?,
-        time_limit_minutes: row.get(11)?,
-        pinned: row.get(12)?,
-        blocked_reason: row.get(13)?,
+        scheduled_start_at: parse_optional_time(row.get(8)?)?,
+        scheduled_end_at: parse_optional_time(row.get(9)?)?,
+        deadline_at: parse_optional_time(row.get(10)?)?,
+        reminder_at: parse_optional_time(row.get(11)?)?,
+        recurrence_rule: row
+            .get::<_, Option<String>>(12)?
+            .map(parse_enum)
+            .transpose()?,
+        recurrence_anchor_at: parse_optional_time(row.get(13)?)?,
+        recurrence_timezone: row.get(14)?,
+        calendar_block_id: row.get(15)?,
+        started_at: parse_optional_time(row.get(16)?)?,
+        completed_at: parse_optional_time(row.get(17)?)?,
+        estimated_minutes: row.get(18)?,
+        time_limit_minutes: row.get(19)?,
+        pinned: row.get(20)?,
+        blocked_reason: row.get(21)?,
         tags: serde_json::from_str(&tags).unwrap_or_default(),
-        created_at: parse_time(row.get(15)?)?,
-        updated_at: parse_time(row.get(16)?)?,
+        created_at: parse_time(row.get(23)?)?,
+        updated_at: parse_time(row.get(24)?)?,
     })
 }
 
@@ -2457,6 +3049,54 @@ fn map_timer_session(row: &Row<'_>) -> rusqlite::Result<TaskTimerSession> {
         created_at: parse_time(row.get(9)?)?,
         updated_at: parse_time(row.get(10)?)?,
     })
+}
+
+fn map_calendar_block(row: &Row<'_>) -> rusqlite::Result<CalendarBlock> {
+    Ok(CalendarBlock {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        project_id: row.get(2)?,
+        organization_id: row.get(3)?,
+        title: row.get(4)?,
+        description: row.get(5)?,
+        start_at: parse_time(row.get(6)?)?,
+        end_at: parse_time(row.get(7)?)?,
+        timezone: row.get(8)?,
+        source: parse_enum(row.get::<_, String>(9)?)?,
+        external_id: row.get(10)?,
+        status: parse_enum(row.get::<_, String>(11)?)?,
+        created_at: parse_time(row.get(12)?)?,
+        updated_at: parse_time(row.get(13)?)?,
+    })
+}
+
+fn insert_calendar_block_with_connection(
+    connection: &Connection,
+    block: &CalendarBlock,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO calendar_blocks (
+            id,task_id,project_id,organization_id,title,description,start_at,end_at,timezone,
+            source,external_id,status,created_at,updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        params![
+            block.id,
+            block.task_id,
+            block.project_id,
+            block.organization_id,
+            block.title,
+            block.description,
+            timestamp(block.start_at),
+            timestamp(block.end_at),
+            block.timezone,
+            block.source.to_string(),
+            block.external_id,
+            block.status.to_string(),
+            timestamp(block.created_at),
+            timestamp(block.updated_at),
+        ],
+    )?;
+    Ok(())
 }
 
 fn map_saved_task_view(row: &Row<'_>) -> rusqlite::Result<SavedTaskView> {
@@ -2691,12 +3331,18 @@ fn task_matches_filter(
         return false;
     }
     if let Some(from) = filter.scheduled_from
-        && !task.scheduled_at.is_some_and(|value| value >= from)
+        && !task
+            .scheduled_start_at
+            .or(task.scheduled_at)
+            .is_some_and(|value| value >= from)
     {
         return false;
     }
     if let Some(to) = filter.scheduled_to
-        && !task.scheduled_at.is_some_and(|value| value <= to)
+        && !task
+            .scheduled_start_at
+            .or(task.scheduled_at)
+            .is_some_and(|value| value <= to)
     {
         return false;
     }
@@ -2855,6 +3501,34 @@ fn require_name(value: &str) -> Result<()> {
     }
 }
 
+fn validate_schedule_range(start_at: DateTime<Utc>, end_at: DateTime<Utc>) -> Result<()> {
+    if end_at <= start_at {
+        Err(CoreError::Validation(
+            "scheduled end must be after scheduled start".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn clear_task_schedule_fields(task: &mut Task) {
+    task.scheduled_at = None;
+    task.scheduled_start_at = None;
+    task.scheduled_end_at = None;
+    task.deadline_at = None;
+    task.reminder_at = None;
+    task.recurrence_rule = None;
+    task.recurrence_anchor_at = None;
+    task.recurrence_timezone = None;
+    task.calendar_block_id = None;
+}
+
+fn clean_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn validate_priority(value: i32) -> Result<()> {
     if (1..=5).contains(&value) {
         Ok(())
@@ -2884,6 +3558,71 @@ mod tests {
         let db = Database::in_memory().unwrap();
         db.seed().unwrap();
         db
+    }
+
+    fn scheduling_task(db: &Database, title: &str, priority: i32, minutes: i32) -> Task {
+        let organization = db
+            .list_organizations()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                db.create_organization(NewOrganization {
+                    name: "Scheduling Org".into(),
+                    slug: None,
+                    description: None,
+                    color: None,
+                    icon: None,
+                })
+                .unwrap()
+            });
+        let project = db
+            .list_projects()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                db.create_project(NewProject {
+                    organization_id: organization.id,
+                    name: "Scheduling Project".into(),
+                    slug: None,
+                    description: None,
+                    project_type: ProjectType::Operations,
+                    status: ProjectStatus::Active,
+                    priority: 3,
+                    deadline: None,
+                    repo_url: None,
+                    notes: None,
+                })
+                .unwrap()
+            });
+        db.create_task(NewTask {
+            project_id: project.id,
+            title: title.into(),
+            description: None,
+            status: TaskStatus::Ready,
+            priority,
+            due_at: None,
+            scheduled_at: None,
+            estimated_minutes: Some(minutes),
+            time_limit_minutes: None,
+            pinned: false,
+            tags: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn schedule_input(start_at: DateTime<Utc>, end_at: DateTime<Utc>) -> ScheduleTaskInput {
+        ScheduleTaskInput {
+            start_at,
+            end_at,
+            timezone: Some("America/Chicago".into()),
+            reminder_at: None,
+            deadline_at: None,
+            recurrence_rule: None,
+            recurrence_anchor_at: None,
+            recurrence_timezone: None,
+        }
     }
 
     #[test]
@@ -2924,6 +3663,485 @@ mod tests {
         assert_eq!(value["organizations"].as_array().unwrap().len(), 0);
         assert_eq!(value["projects"].as_array().unwrap().len(), 0);
         assert_eq!(value["tasks"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn migration_adds_scheduling_columns_and_calendar_blocks() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY NOT NULL, project_id TEXT NOT NULL, title TEXT NOT NULL,
+                    description TEXT, status TEXT NOT NULL, priority INTEGER NOT NULL,
+                    due_at TEXT, scheduled_at TEXT, started_at TEXT, completed_at TEXT,
+                    estimated_minutes INTEGER, time_limit_minutes INTEGER,
+                    pinned INTEGER NOT NULL DEFAULT 0, blocked_reason TEXT,
+                    tags TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        let db = Database {
+            connection: Arc::new(Mutex::new(connection)),
+        };
+        db.migrate().unwrap();
+        let connection = db.connection().unwrap();
+        let columns = connection
+            .prepare("PRAGMA table_info(tasks)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for column in [
+            "scheduled_start_at",
+            "scheduled_end_at",
+            "deadline_at",
+            "reminder_at",
+            "recurrence_rule",
+            "recurrence_anchor_at",
+            "recurrence_timezone",
+            "calendar_block_id",
+        ] {
+            assert!(columns.iter().any(|existing| existing == column));
+        }
+        let calendar_blocks_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table'
+                 AND name='calendar_blocks')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(calendar_blocks_exists);
+    }
+
+    #[test]
+    fn migration_backfills_legacy_scheduled_at_without_overwriting_start() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY NOT NULL, project_id TEXT NOT NULL, title TEXT NOT NULL,
+                    description TEXT, status TEXT NOT NULL, priority INTEGER NOT NULL,
+                    due_at TEXT, scheduled_at TEXT, scheduled_start_at TEXT,
+                    started_at TEXT, completed_at TEXT,
+                    estimated_minutes INTEGER, time_limit_minutes INTEGER,
+                    pinned INTEGER NOT NULL DEFAULT 0, blocked_reason TEXT,
+                    tags TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO tasks (
+                    id, project_id, title, description, status, priority, due_at,
+                    scheduled_at, scheduled_start_at, started_at, completed_at,
+                    estimated_minutes, time_limit_minutes, pinned, blocked_reason,
+                    tags, created_at, updated_at
+                 ) VALUES
+                 (
+                    'legacy', 'project', 'Legacy', NULL, 'ready', 3, NULL,
+                    '2026-06-19T09:00:00Z', NULL, NULL, NULL,
+                    NULL, NULL, 0, NULL, '[]',
+                    '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z'
+                 ),
+                 (
+                    'explicit', 'project', 'Explicit', NULL, 'ready', 3, NULL,
+                    '2026-06-19T09:00:00Z', '2026-06-19T10:00:00Z', NULL, NULL,
+                    NULL, NULL, 0, NULL, '[]',
+                    '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z'
+                 );",
+            )
+            .unwrap();
+        let db = Database {
+            connection: Arc::new(Mutex::new(connection)),
+        };
+        db.migrate().unwrap();
+        let connection = db.connection().unwrap();
+        let legacy_start: String = connection
+            .query_row(
+                "SELECT scheduled_start_at FROM tasks WHERE id='legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let explicit_start: String = connection
+            .query_row(
+                "SELECT scheduled_start_at FROM tasks WHERE id='explicit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_start, "2026-06-19T09:00:00Z");
+        assert_eq!(explicit_start, "2026-06-19T10:00:00Z");
+    }
+
+    #[test]
+    fn schedule_reschedule_and_clear_task() {
+        let db = Database::in_memory().unwrap();
+        let task = scheduling_task(&db, "Schedule lifecycle", 2, 45);
+        let start = Utc::now() + ChronoDuration::hours(1);
+        let deadline = start + ChronoDuration::days(1);
+        let mut first_input = schedule_input(start, start + ChronoDuration::minutes(45));
+        first_input.deadline_at = Some(deadline);
+        let first = db.schedule_task(&task.id, first_input).unwrap();
+        let scheduled = db.get_task(&task.id).unwrap();
+        assert_eq!(scheduled.scheduled_start_at, Some(start));
+        assert_eq!(scheduled.deadline_at, Some(deadline));
+        assert_eq!(
+            scheduled.calendar_block_id.as_deref(),
+            Some(first.id.as_str())
+        );
+
+        let moved_start = start + ChronoDuration::hours(2);
+        let second = db
+            .reschedule_task(
+                &task.id,
+                schedule_input(moved_start, moved_start + ChronoDuration::minutes(45)),
+            )
+            .unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(
+            db.list_calendar_blocks()
+                .unwrap()
+                .into_iter()
+                .find(|block| block.id == first.id)
+                .unwrap()
+                .status,
+            CalendarBlockStatus::Moved
+        );
+
+        let cleared = db.clear_task_schedule(&task.id).unwrap();
+        assert!(cleared.scheduled_start_at.is_none());
+        assert!(cleared.deadline_at.is_none());
+        assert!(cleared.calendar_block_id.is_none());
+        assert_eq!(cleared.status, TaskStatus::Ready);
+    }
+
+    #[test]
+    fn today_week_unscheduled_and_overdue_queries_work() {
+        let db = Database::in_memory().unwrap();
+        let today = scheduling_task(&db, "Today", 2, 30);
+        let overdue = scheduling_task(&db, "Overdue", 2, 30);
+        let unscheduled = scheduling_task(&db, "Unscheduled", 2, 30);
+        // Anchor to noon of the current UTC day. The queries under test bucket by
+        // the real UTC day, so using the raw `Utc::now()` made this flaky: in the
+        // last ~50 minutes before 00:00 UTC the `today` block (now+20..now+50min)
+        // spilled into the next day and dropped out of `get_schedule_today`.
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            Utc::now()
+                .date_naive()
+                .and_hms_opt(12, 0, 0)
+                .expect("noon is a valid time"),
+            Utc,
+        );
+        db.schedule_task(
+            &today.id,
+            schedule_input(
+                now + ChronoDuration::minutes(20),
+                now + ChronoDuration::minutes(50),
+            ),
+        )
+        .unwrap();
+        let overdue_now = Utc::now();
+        db.schedule_task(
+            &overdue.id,
+            schedule_input(
+                overdue_now - ChronoDuration::hours(2),
+                overdue_now - ChronoDuration::hours(1),
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            db.get_schedule_today()
+                .unwrap()
+                .iter()
+                .any(|item| item.task.id == today.id)
+        );
+        assert!(
+            db.get_schedule_week()
+                .unwrap()
+                .iter()
+                .any(|item| item.task.id == today.id)
+        );
+        assert!(
+            db.get_unscheduled_tasks()
+                .unwrap()
+                .iter()
+                .any(|item| item.task.id == unscheduled.id)
+        );
+        assert!(
+            db.get_overdue_tasks()
+                .unwrap()
+                .iter()
+                .any(|item| item.task.id == overdue.id)
+        );
+    }
+
+    #[test]
+    fn conflicts_and_next_available_block_are_reported() {
+        let db = Database::in_memory().unwrap();
+        let first = scheduling_task(&db, "First", 2, 60);
+        let second = scheduling_task(&db, "Second", 3, 60);
+        let start = Utc::now() + ChronoDuration::hours(1);
+        db.schedule_task(
+            &first.id,
+            schedule_input(start, start + ChronoDuration::hours(1)),
+        )
+        .unwrap();
+        db.schedule_task(
+            &second.id,
+            schedule_input(
+                start + ChronoDuration::minutes(30),
+                start + ChronoDuration::minutes(90),
+            ),
+        )
+        .unwrap();
+        assert_eq!(db.list_schedule_conflicts().unwrap().len(), 1);
+
+        let suggestion = db
+            .suggest_next_time_block(start, start + ChronoDuration::hours(3), 30)
+            .unwrap()
+            .unwrap();
+        assert_eq!(suggestion.start_at, start + ChronoDuration::minutes(90));
+    }
+
+    #[test]
+    fn task_fit_suggestions_preserve_p1_ordering() {
+        let db = Database::in_memory().unwrap();
+        let p5 = scheduling_task(&db, "P5", 5, 30);
+        let p1 = scheduling_task(&db, "P1", 1, 30);
+        scheduling_task(&db, "Too long", 2, 180);
+        let start = Utc::now();
+        let suggestions = db
+            .suggest_tasks_for_time_window(start, start + ChronoDuration::minutes(60))
+            .unwrap();
+        assert_eq!(suggestions[0].task.id, p1.id);
+        assert!(suggestions.iter().any(|item| item.task.id == p5.id));
+        assert!(!suggestions.iter().any(|item| item.task.title == "Too long"));
+    }
+
+    #[test]
+    fn recurring_completion_creates_next_occurrence() {
+        let db = Database::in_memory().unwrap();
+        let task = scheduling_task(&db, "Daily recurring", 2, 30);
+        let start = Utc::now() + ChronoDuration::minutes(10);
+        let mut input = schedule_input(start, start + ChronoDuration::minutes(30));
+        input.recurrence_rule = Some(RecurrenceRule::Daily);
+        let block = db.schedule_task(&task.id, input).unwrap();
+        let completion = db.complete_scheduled_block(&block.id).unwrap();
+        assert_eq!(completion.task.unwrap().status, TaskStatus::Done);
+        let next = completion.next_occurrence_task.unwrap();
+        assert_eq!(next.recurrence_rule, Some(RecurrenceRule::Daily));
+        assert_eq!(
+            next.scheduled_start_at,
+            Some(start + ChronoDuration::days(1))
+        );
+    }
+
+    #[test]
+    fn board_respects_current_later_and_overdue_scheduled_tasks() {
+        let db = Database::in_memory().unwrap();
+        let current = scheduling_task(&db, "Current", 2, 30);
+        let later = scheduling_task(&db, "Later", 2, 30);
+        let overdue = scheduling_task(&db, "Elapsed", 2, 30);
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 19, 12, 0, 0)
+            .single()
+            .unwrap();
+        db.schedule_task(
+            &current.id,
+            schedule_input(
+                now - ChronoDuration::minutes(5),
+                now + ChronoDuration::minutes(25),
+            ),
+        )
+        .unwrap();
+        db.schedule_task(
+            &later.id,
+            schedule_input(
+                now + ChronoDuration::hours(1),
+                now + ChronoDuration::minutes(90),
+            ),
+        )
+        .unwrap();
+        db.schedule_task(
+            &overdue.id,
+            schedule_input(
+                now - ChronoDuration::hours(2),
+                now - ChronoDuration::hours(1),
+            ),
+        )
+        .unwrap();
+        let board = db.board_state_at(now).unwrap();
+        assert!(
+            board
+                .now
+                .iter()
+                .any(|item| item.context.task.id == current.id)
+        );
+        assert!(
+            board
+                .later_today
+                .iter()
+                .any(|item| item.context.task.id == later.id)
+        );
+        assert!(
+            board
+                .overdue
+                .iter()
+                .any(|item| item.context.task.id == overdue.id)
+        );
+    }
+
+    #[test]
+    fn schedule_for_day_window_filters_by_start() {
+        let db = Database::in_memory().unwrap();
+        let inside = scheduling_task(&db, "Inside", 2, 30);
+        let outside = scheduling_task(&db, "Outside", 2, 30);
+        let day_start = Utc::now() + ChronoDuration::days(3);
+        let window_start = Utc.from_utc_datetime(
+            &day_start
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight"),
+        );
+        let window_end = window_start + ChronoDuration::days(1);
+        db.schedule_task(
+            &inside.id,
+            schedule_input(
+                window_start + ChronoDuration::hours(9),
+                window_start + ChronoDuration::hours(10),
+            ),
+        )
+        .unwrap();
+        db.schedule_task(
+            &outside.id,
+            schedule_input(
+                window_end + ChronoDuration::hours(9),
+                window_end + ChronoDuration::hours(10),
+            ),
+        )
+        .unwrap();
+
+        let rows = db.get_schedule_for_day(window_start, window_end).unwrap();
+        assert!(rows.iter().any(|item| item.task.id == inside.id));
+        assert!(!rows.iter().any(|item| item.task.id == outside.id));
+    }
+
+    #[test]
+    fn auto_start_starts_active_block_and_is_idempotent() {
+        let db = Database::in_memory().unwrap();
+        let active = scheduling_task(&db, "Active now", 2, 30);
+        let now = Utc::now();
+        db.schedule_task(
+            &active.id,
+            schedule_input(
+                now - ChronoDuration::minutes(5),
+                now + ChronoDuration::minutes(25),
+            ),
+        )
+        .unwrap();
+
+        let started = db.auto_start_due_scheduled_tasks().unwrap();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].id, active.id);
+        assert_eq!(started[0].status, TaskStatus::InProgress);
+        assert!(db.get_active_timer_session(&active.id).unwrap().is_some());
+
+        // Idempotent: the task already has an active timer, so a second tick
+        // must not start it again.
+        let second = db.auto_start_due_scheduled_tasks().unwrap();
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn auto_start_skips_future_elapsed_and_terminal_tasks() {
+        let db = Database::in_memory().unwrap();
+        let now = Utc::now();
+
+        let future = scheduling_task(&db, "Future", 2, 30);
+        db.schedule_task(
+            &future.id,
+            schedule_input(
+                now + ChronoDuration::hours(1),
+                now + ChronoDuration::minutes(90),
+            ),
+        )
+        .unwrap();
+
+        let elapsed = scheduling_task(&db, "Elapsed", 2, 30);
+        db.schedule_task(
+            &elapsed.id,
+            schedule_input(
+                now - ChronoDuration::hours(2),
+                now - ChronoDuration::hours(1),
+            ),
+        )
+        .unwrap();
+
+        let done = scheduling_task(&db, "Done", 2, 30);
+        db.schedule_task(
+            &done.id,
+            schedule_input(
+                now - ChronoDuration::minutes(5),
+                now + ChronoDuration::minutes(25),
+            ),
+        )
+        .unwrap();
+        db.transition_task(&done.id, TaskStatus::Done, None)
+            .unwrap();
+
+        let canceled = scheduling_task(&db, "Canceled", 2, 30);
+        db.schedule_task(
+            &canceled.id,
+            schedule_input(
+                now - ChronoDuration::minutes(5),
+                now + ChronoDuration::minutes(25),
+            ),
+        )
+        .unwrap();
+        db.transition_task(&canceled.id, TaskStatus::Canceled, None)
+            .unwrap();
+
+        let started = db.auto_start_due_scheduled_tasks().unwrap();
+        assert!(started.is_empty());
+        assert_eq!(
+            db.get_task(&future.id).unwrap().status,
+            TaskStatus::Scheduled
+        );
+        assert_eq!(
+            db.get_task(&elapsed.id).unwrap().status,
+            TaskStatus::Scheduled
+        );
+        assert_eq!(db.get_task(&done.id).unwrap().status, TaskStatus::Done);
+        assert_eq!(
+            db.get_task(&canceled.id).unwrap().status,
+            TaskStatus::Canceled
+        );
+    }
+
+    #[test]
+    fn auto_start_with_no_scheduled_tasks_is_noop() {
+        let db = Database::in_memory().unwrap();
+        scheduling_task(&db, "Unscheduled", 2, 30);
+        assert!(db.auto_start_due_scheduled_tasks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn schedule_ics_contains_basic_calendar_event() {
+        let db = Database::in_memory().unwrap();
+        let task = scheduling_task(&db, "ICS task", 2, 30);
+        let start = Utc::now() + ChronoDuration::hours(1);
+        db.schedule_task(
+            &task.id,
+            schedule_input(start, start + ChronoDuration::minutes(30)),
+        )
+        .unwrap();
+        let ics = db.generate_schedule_ics().unwrap();
+        assert!(ics.starts_with("BEGIN:VCALENDAR\r\n"));
+        assert!(ics.contains("BEGIN:VEVENT\r\n"));
+        assert!(ics.contains("SUMMARY:ICS task\r\n"));
+        assert!(ics.ends_with("END:VCALENDAR\r\n"));
     }
 
     fn remote_event(
@@ -2995,6 +4213,14 @@ mod tests {
             priority: 3,
             due_at: None,
             scheduled_at: None,
+            scheduled_start_at: None,
+            scheduled_end_at: None,
+            deadline_at: None,
+            reminder_at: None,
+            recurrence_rule: None,
+            recurrence_anchor_at: None,
+            recurrence_timezone: None,
+            calendar_block_id: None,
             started_at: None,
             completed_at: None,
             estimated_minutes: None,

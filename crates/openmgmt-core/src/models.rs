@@ -70,6 +70,29 @@ string_enum!(TaskSortField {
     Tag => "tag",
 });
 
+string_enum!(RecurrenceRule {
+    None => "none",
+    Daily => "daily",
+    Weekdays => "weekdays",
+    Weekly => "weekly",
+    Monthly => "monthly",
+});
+
+string_enum!(CalendarBlockSource {
+    OpenMgmt => "openmgmt",
+    ImportedIcs => "imported_ics",
+    GoogleCalendarFuture => "google_calendar_future",
+    OutlookFuture => "outlook_future",
+});
+
+string_enum!(CalendarBlockStatus {
+    Planned => "planned",
+    Completed => "completed",
+    Skipped => "skipped",
+    Moved => "moved",
+    Canceled => "canceled",
+});
+
 string_enum!(AiProviderKind {
     OpenAi => "openai",
     Anthropic => "anthropic",
@@ -177,6 +200,22 @@ pub struct Task {
     pub priority: i32,
     pub due_at: Option<DateTime<Utc>>,
     pub scheduled_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub scheduled_start_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub scheduled_end_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub deadline_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub reminder_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub recurrence_rule: Option<RecurrenceRule>,
+    #[serde(default)]
+    pub recurrence_anchor_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub recurrence_timezone: Option<String>,
+    #[serde(default)]
+    pub calendar_block_id: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub estimated_minutes: Option<i32>,
@@ -186,6 +225,56 @@ pub struct Task {
     pub tags: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalendarBlock {
+    pub id: String,
+    pub task_id: Option<String>,
+    pub project_id: Option<String>,
+    pub organization_id: Option<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub start_at: DateTime<Utc>,
+    pub end_at: DateTime<Utc>,
+    pub timezone: Option<String>,
+    pub source: CalendarBlockSource,
+    pub external_id: Option<String>,
+    pub status: CalendarBlockStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleTaskInput {
+    pub start_at: DateTime<Utc>,
+    pub end_at: DateTime<Utc>,
+    pub timezone: Option<String>,
+    pub reminder_at: Option<DateTime<Utc>>,
+    pub deadline_at: Option<DateTime<Utc>>,
+    pub recurrence_rule: Option<RecurrenceRule>,
+    pub recurrence_anchor_at: Option<DateTime<Utc>>,
+    pub recurrence_timezone: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleConflict {
+    pub first: CalendarBlock,
+    pub second: CalendarBlock,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeBlockSuggestion {
+    pub start_at: DateTime<Utc>,
+    pub end_at: DateTime<Utc>,
+    pub duration_minutes: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledBlockCompletion {
+    pub block: CalendarBlock,
+    pub task: Option<Task>,
+    pub next_occurrence_task: Option<Task>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

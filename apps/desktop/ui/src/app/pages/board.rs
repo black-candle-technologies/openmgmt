@@ -28,11 +28,15 @@ pub fn BoardPage(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoView
             })>"Open TV Board"</Button>
         </PageHeader>
 
+        <p class="board-explainer">
+            "Scheduled tasks move to NOW during their time block, Later Today before their block, and Overdue if the block passes unfinished. Tasks auto-start when their scheduled time arrives while the app is open."
+        </p>
+
         <div class="board-surface">
             {move || (board_task_count(&board.get()) == 0).then(|| view! {
                 <div class="tv-empty tv-empty-inline">
                     <h2>"No active board tasks"</h2>
-                    <p>"Create an active task or seed the database to populate the board."</p>
+                    <p>"Create an organization, project, and task — then start or schedule one — to populate the board."</p>
                 </div>
             })}
             <ErBoard board now />

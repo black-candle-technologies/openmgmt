@@ -237,7 +237,7 @@ fn backup(state: AppState) {
         return;
     }
     spawn_local(async move {
-        match invoke::<()>("backup_sqlite_database", json!({ "target_path": path })).await {
+        match invoke::<()>("backup_sqlite_database", json!({ "targetPath": path })).await {
             Ok(()) => state.notice.set(Some("Database backup written.".into())),
             Err(error) => state.fail("Backup failed", error),
         }
