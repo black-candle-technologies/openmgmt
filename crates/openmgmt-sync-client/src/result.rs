@@ -36,6 +36,8 @@ pub struct SyncOnceResult {
     pub rejected_event_count: usize,
     pub pulled_event_count: usize,
     pub applied_event_count: usize,
+    pub conflict_count: usize,
+    pub auto_resolved_conflict_count: usize,
     pub server_checkpoint: Option<String>,
     pub phases: Vec<SyncPhaseResult>,
 }

@@ -15,6 +15,10 @@ pub use db::{Database, default_database_path};
 pub use models::*;
 pub use scoring::{ScoringWeights, score_task};
 pub use sync::{
-    RemoteApplyBatchResult, RemoteApplyResult, RemoteApplyStatus, SyncConnectionState,
-    SyncEntityType, SyncEvent, SyncOperation, SyncSettings, SyncSettingsPatch, SyncStatus,
+    ArchiveConflictStrategy, ConflictPolicy, EntityConflictPolicy, FieldMergeStrategy,
+    RemoteApplyBatchResult, RemoteApplyResult, RemoteApplyStatus, RestoreConflictStrategy,
+    StatusConflictStrategy, SyncConflict, SyncConflictKind, SyncConflictPolicyAction,
+    SyncConflictResolutionStatus, SyncConnectionState, SyncEntityType, SyncEvent, SyncOperation,
+    SyncSettings, SyncSettingsPatch, SyncStatus, TaskConflictPolicy,
+    TerminalStatusConflictStrategy,
 };

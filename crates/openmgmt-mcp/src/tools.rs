@@ -9,6 +9,7 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
+use std::cmp::Reverse;
 
 #[derive(Clone)]
 pub struct OpenMgmtMcp {
@@ -172,7 +173,7 @@ impl OpenMgmtMcp {
                 .chain(&board.next_up)
                 .cloned()
                 .collect::<Vec<_>>();
-            focus.sort_by(|a, b| b.urgency_score.cmp(&a.urgency_score));
+            focus.sort_by_key(|task| Reverse(task.urgency_score));
             focus.truncate(8);
             serde_json::json!({ "generated_at": board.generated_at, "focus": focus, "board": board })
         }))

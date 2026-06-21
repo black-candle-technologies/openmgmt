@@ -66,14 +66,14 @@ impl OpenMgmtSyncClient {
         let result = self
             .sync_after_attempt(database, settings, server_url, device_id)
             .await;
-        if let Err(error) = &result {
-            if let Err(status_error) = database.record_sync_error(&error.to_string()) {
-                tracing::error!(
-                    error = %status_error,
-                    sync_error = %error,
-                    "failed to record sync error"
-                );
-            }
+        if let Err(error) = &result
+            && let Err(status_error) = database.record_sync_error(&error.to_string())
+        {
+            tracing::error!(
+                error = %status_error,
+                sync_error = %error,
+                "failed to record sync error"
+            );
         }
         result
     }
@@ -201,10 +201,11 @@ impl OpenMgmtSyncClient {
         phases.push(SyncPhaseResult::ok(
             SyncPhase::RemoteApply,
             Some(format!(
-                "Applied {}; already applied {}; skipped local echoes {}.",
+                "Applied {}; already applied {}; skipped local echoes {}; conflicts recorded {}.",
                 applied.applied_count,
                 applied.already_applied_count,
-                applied.skipped_local_echo_count
+                applied.skipped_local_echo_count,
+                applied.conflict_count
             )),
         ));
         database.record_sync_success()?;
@@ -219,11 +220,25 @@ impl OpenMgmtSyncClient {
             rejected_event_count,
             pulled_event_count,
             applied_event_count: applied.applied_count,
+            conflict_count: applied.conflict_count,
+            auto_resolved_conflict_count: applied.auto_resolved_conflict_count,
             server_checkpoint: (!pull.server_checkpoint.is_empty())
                 .then_some(pull.server_checkpoint),
             phases,
         })
     }
+}
+
+pub async fn sync_once(database: &Database) -> SyncClientResult<SyncOnceResult> {
+    OpenMgmtSyncClient::new(SyncClientConfig::default())
+        .sync_once(database)
+        .await
+}
+
+pub async fn test_connection(database: &Database) -> SyncClientResult<SyncConnectionTestResult> {
+    OpenMgmtSyncClient::new(SyncClientConfig::default())
+        .test_connection(database)
+        .await
 }
 
 #[cfg(test)]
@@ -233,7 +248,7 @@ mod tests {
     use axum::{Json, Router, extract::State, routing::post};
     use openmgmt_core::{
         Database, Organization, Project, ProjectStatus, ProjectType, SyncEntityType, SyncOperation,
-        SyncSettingsPatch,
+        SyncSettingsPatch, Task, TaskStatus,
     };
     use openmgmt_protocol::{
         DeviceRegistrationRequest, DeviceRegistrationResponse, PROTOCOL_VERSION, SyncEvent,
@@ -250,6 +265,7 @@ mod tests {
         checkpoint: String,
         pushed_event_ids: Arc<Mutex<Vec<String>>>,
         duplicate_accepted_ids: bool,
+        accept_pushed_events: bool,
     }
 
     async fn hello(Json(_): Json<SyncHelloRequest>) -> Json<SyncHelloResponse> {
@@ -278,11 +294,15 @@ mod tests {
         State(state): State<TestServerState>,
         Json(request): Json<SyncPushRequest>,
     ) -> Json<SyncPushResponse> {
-        let mut accepted_event_ids = request
-            .events
-            .iter()
-            .map(|event| event.event_id.clone())
-            .collect::<Vec<_>>();
+        let mut accepted_event_ids = if state.accept_pushed_events {
+            request
+                .events
+                .iter()
+                .map(|event| event.event_id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         if state.duplicate_accepted_ids {
             accepted_event_ids.extend(accepted_event_ids.clone());
         }
@@ -311,12 +331,21 @@ mod tests {
         pulled_events: Vec<SyncEvent>,
         duplicate_accepted_ids: bool,
     ) -> (String, Arc<Mutex<Vec<String>>>) {
+        test_server_with_push_acceptance(pulled_events, duplicate_accepted_ids, true).await
+    }
+
+    async fn test_server_with_push_acceptance(
+        pulled_events: Vec<SyncEvent>,
+        duplicate_accepted_ids: bool,
+        accept_pushed_events: bool,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
         let pushed_event_ids = Arc::new(Mutex::new(Vec::new()));
         let state = TestServerState {
             pulled_events,
             checkpoint: "checkpoint-1".into(),
             pushed_event_ids: pushed_event_ids.clone(),
             duplicate_accepted_ids,
+            accept_pushed_events,
         };
         let app = Router::new()
             .route("/omgp/v1/hello", post(hello))
@@ -590,7 +619,10 @@ mod tests {
             database.get_sync_state(CHECKPOINT_KEY).unwrap().as_deref(),
             Some("checkpoint-1")
         );
-        assert_eq!(database.get_task("remote-task").unwrap().title, "Remote Task");
+        assert_eq!(
+            database.get_task("remote-task").unwrap().title,
+            "Remote Task"
+        );
     }
 
     #[tokio::test]
@@ -746,16 +778,64 @@ mod tests {
             Some("checkpoint-1")
         );
     }
-}
 
-pub async fn sync_once(database: &Database) -> SyncClientResult<SyncOnceResult> {
-    OpenMgmtSyncClient::new(SyncClientConfig::default())
-        .sync_once(database)
-        .await
-}
+    #[tokio::test]
+    async fn sync_pull_with_policy_conflict_succeeds_and_reports_conflict_count() {
+        let mut organization = remote_organization_event("remote-org-create");
+        let (server_url, _) = test_server(vec![organization.clone()], false).await;
+        let database = configured_database(Some(server_url));
+        OpenMgmtSyncClient::new(SyncClientConfig::default())
+            .sync_once(&database)
+            .await
+            .unwrap();
+        database
+            .update_organization(
+                "remote-org",
+                openmgmt_core::OrganizationPatch {
+                    description: Some(Some("local unsynced".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
-pub async fn test_connection(database: &Database) -> SyncClientResult<SyncConnectionTestResult> {
-    OpenMgmtSyncClient::new(SyncClientConfig::default())
-        .test_connection(database)
-        .await
+        organization.event_id = "remote-org-conflict-update".into();
+        organization.operation = SyncOperation::Updated;
+        if let Some(entity) = organization.payload_json.get_mut("entity") {
+            entity["name"] = serde_json::json!("Remote conflict name");
+        }
+        let (server_url, _) =
+            test_server_with_push_acceptance(vec![organization], false, false).await;
+        database
+            .update_sync_settings(SyncSettingsPatch {
+                server_url: Some(Some(server_url)),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let result = OpenMgmtSyncClient::new(SyncClientConfig::default())
+            .sync_once(&database)
+            .await
+            .unwrap();
+
+        assert_eq!(result.conflict_count, 1);
+        assert_eq!(result.auto_resolved_conflict_count, 0);
+        assert_eq!(database.list_open_sync_conflicts().unwrap().len(), 1);
+        assert_eq!(
+            database.get_sync_state(CHECKPOINT_KEY).unwrap().as_deref(),
+            Some("checkpoint-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn same_device_local_echo_does_not_create_conflicts() {
+        let database = configured_database(None);
+        let device_id = database.get_or_create_device_id().unwrap();
+        let mut event = remote_organization_event("local-echo-conflict-free");
+        event.device_id = device_id;
+
+        let applied = database.apply_remote_sync_event(&event).unwrap();
+
+        assert!(applied.conflict_ids.is_empty());
+        assert!(database.list_sync_conflicts().unwrap().is_empty());
+    }
 }

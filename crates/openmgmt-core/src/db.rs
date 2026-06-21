@@ -5,11 +5,13 @@ use crate::{
         ProjectPatch, ProjectStatus, ProjectType, Task, TaskContext, TaskPatch, TaskStatus,
     },
     sync::{
-        DEFAULT_DEVICE_NAME, LOCAL_DEVICE_ID_KEY, RemoteApplyBatchResult, RemoteApplyResult,
-        RemoteApplyStatus, SYNC_ACCOUNT_ID_KEY, SYNC_DEVICE_NAME_KEY, SYNC_DEVICE_TOKEN_KEY,
-        SYNC_ENABLED_KEY, SYNC_LAST_ATTEMPTED_AT_KEY, SYNC_LAST_ERROR_KEY,
-        SYNC_LAST_SUCCESSFUL_AT_KEY, SYNC_SERVER_URL_KEY, SYNC_USER_ID_KEY, SyncConnectionState,
-        SyncEntityType, SyncEvent, SyncOperation, SyncSettings, SyncSettingsPatch, SyncStatus,
+        ConflictPolicy, DEFAULT_DEVICE_NAME, LOCAL_DEVICE_ID_KEY, RemoteApplyBatchResult,
+        RemoteApplyResult, RemoteApplyStatus, SYNC_ACCOUNT_ID_KEY, SYNC_DEVICE_NAME_KEY,
+        SYNC_DEVICE_TOKEN_KEY, SYNC_ENABLED_KEY, SYNC_LAST_ATTEMPTED_AT_KEY, SYNC_LAST_ERROR_KEY,
+        SYNC_LAST_SUCCESSFUL_AT_KEY, SYNC_SERVER_URL_KEY, SYNC_USER_ID_KEY, SyncConflict,
+        SyncConflictKind, SyncConflictPolicyAction, SyncConflictResolutionStatus,
+        SyncConnectionState, SyncEntityType, SyncEvent, SyncOperation, SyncSettings,
+        SyncSettingsPatch, SyncStatus,
     },
 };
 use chrono::{DateTime, Duration, Utc};
@@ -175,6 +177,26 @@ impl Database {
               ON applied_remote_events(entity_type, entity_id);
             CREATE INDEX IF NOT EXISTS applied_remote_events_device_sequence_idx
               ON applied_remote_events(device_id, sequence);
+            CREATE TABLE IF NOT EXISTS sync_conflicts (
+              conflict_id TEXT PRIMARY KEY NOT NULL,
+              remote_event_id TEXT NOT NULL,
+              local_device_id TEXT NOT NULL,
+              entity_type TEXT NOT NULL,
+              entity_id TEXT NOT NULL,
+              conflict_kind TEXT NOT NULL,
+              policy_action TEXT NOT NULL,
+              local_snapshot_json TEXT,
+              remote_snapshot_json TEXT,
+              resolution_status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              resolved_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS sync_conflicts_entity_idx
+              ON sync_conflicts(entity_type, entity_id);
+            CREATE INDEX IF NOT EXISTS sync_conflicts_status_idx
+              ON sync_conflicts(resolution_status, created_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS sync_conflicts_remote_event_idx
+              ON sync_conflicts(remote_event_id);
             "#,
         )?;
         self.ensure_sync_event_ownership_columns()?;
@@ -263,40 +285,101 @@ impl Database {
         )?)
     }
 
+    pub fn list_sync_conflicts(&self) -> Result<Vec<SyncConflict>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT conflict_id,remote_event_id,local_device_id,entity_type,entity_id,
+                    conflict_kind,policy_action,local_snapshot_json,remote_snapshot_json,
+                    resolution_status,created_at,resolved_at
+             FROM sync_conflicts ORDER BY created_at DESC",
+        )?;
+        Ok(statement
+            .query_map([], map_sync_conflict)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn list_open_sync_conflicts(&self) -> Result<Vec<SyncConflict>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT conflict_id,remote_event_id,local_device_id,entity_type,entity_id,
+                    conflict_kind,policy_action,local_snapshot_json,remote_snapshot_json,
+                    resolution_status,created_at,resolved_at
+             FROM sync_conflicts WHERE resolution_status='open' ORDER BY created_at DESC",
+        )?;
+        Ok(statement
+            .query_map([], map_sync_conflict)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn mark_sync_conflict_ignored(&self, conflict_id: &str) -> Result<SyncConflict> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        changed(
+            transaction.execute(
+                "UPDATE sync_conflicts
+                 SET resolution_status='ignored',resolved_at=?2
+                 WHERE conflict_id=?1",
+                params![conflict_id, timestamp(Utc::now())],
+            )?,
+            "sync conflict",
+        )?;
+        let conflict = get_sync_conflict_with_connection(&transaction, conflict_id)?;
+        transaction.commit()?;
+        Ok(conflict)
+    }
+
     pub fn apply_remote_sync_event(&self, event: &SyncEvent) -> Result<RemoteApplyResult> {
+        self.apply_remote_sync_event_with_policy(event, &ConflictPolicy::default())
+    }
+
+    pub fn apply_remote_sync_event_with_policy(
+        &self,
+        event: &SyncEvent,
+        policy: &ConflictPolicy,
+    ) -> Result<RemoteApplyResult> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         let local_device_id = get_or_create_device_id_with_connection(&transaction)?;
-        let status = if event.device_id == local_device_id {
-            RemoteApplyStatus::SkippedLocalEcho
-        } else if transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM applied_remote_events WHERE event_id=?1)",
-            [&event.event_id],
-            |row| row.get::<_, bool>(0),
-        )? {
-            RemoteApplyStatus::AlreadyApplied
-        } else {
-            apply_remote_domain_change(&transaction, event)?;
-            transaction.execute(
-                "INSERT INTO applied_remote_events (
+        let (status, conflict_ids, auto_resolved_conflict_count) =
+            if event.device_id == local_device_id {
+                (RemoteApplyStatus::SkippedLocalEcho, Vec::new(), 0)
+            } else if transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM applied_remote_events WHERE event_id=?1)",
+                [&event.event_id],
+                |row| row.get::<_, bool>(0),
+            )? {
+                (RemoteApplyStatus::AlreadyApplied, Vec::new(), 0)
+            } else {
+                let conflict_outcome = apply_remote_domain_change_with_policy(
+                    &transaction,
+                    event,
+                    policy,
+                    &local_device_id,
+                )?;
+                transaction.execute(
+                    "INSERT INTO applied_remote_events (
                     event_id,device_id,actor_user_id,target_user_id,workspace_id,sequence,
                     entity_type,entity_id,operation,applied_at
                  ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                params![
-                    event.event_id,
-                    event.device_id,
-                    event.actor_user_id,
-                    event.target_user_id,
-                    event.workspace_id,
-                    event.sequence,
-                    event.entity_type.to_string(),
-                    event.entity_id,
-                    event.operation.to_string(),
-                    timestamp(Utc::now()),
-                ],
-            )?;
-            RemoteApplyStatus::Applied
-        };
+                    params![
+                        event.event_id,
+                        event.device_id,
+                        event.actor_user_id,
+                        event.target_user_id,
+                        event.workspace_id,
+                        event.sequence,
+                        event.entity_type.to_string(),
+                        event.entity_id,
+                        event.operation.to_string(),
+                        timestamp(Utc::now()),
+                    ],
+                )?;
+                (
+                    RemoteApplyStatus::Applied,
+                    conflict_outcome.conflict_ids,
+                    conflict_outcome.auto_resolved_conflict_count,
+                )
+            };
         transaction.commit()?;
         Ok(RemoteApplyResult {
             event_id: event.event_id.clone(),
@@ -304,25 +387,39 @@ impl Database {
             entity_id: event.entity_id.clone(),
             operation: event.operation,
             status,
+            conflict_ids,
+            auto_resolved_conflict_count,
         })
     }
 
     pub fn apply_remote_sync_events(&self, events: &[SyncEvent]) -> Result<RemoteApplyBatchResult> {
+        self.apply_remote_sync_events_with_policy(events, &ConflictPolicy::default())
+    }
+
+    pub fn apply_remote_sync_events_with_policy(
+        &self,
+        events: &[SyncEvent],
+        policy: &ConflictPolicy,
+    ) -> Result<RemoteApplyBatchResult> {
         let mut result = RemoteApplyBatchResult {
             applied_count: 0,
             already_applied_count: 0,
             skipped_local_echo_count: 0,
+            conflict_count: 0,
+            auto_resolved_conflict_count: 0,
             results: Vec::with_capacity(events.len()),
         };
         let mut ordered_events = events.iter().collect::<Vec<_>>();
         ordered_events.sort_by_key(|event| remote_apply_dependency_rank(event.entity_type));
         for event in ordered_events {
-            let applied = self.apply_remote_sync_event(event)?;
+            let applied = self.apply_remote_sync_event_with_policy(event, policy)?;
             match applied.status {
                 RemoteApplyStatus::Applied => result.applied_count += 1,
                 RemoteApplyStatus::AlreadyApplied => result.already_applied_count += 1,
                 RemoteApplyStatus::SkippedLocalEcho => result.skipped_local_echo_count += 1,
             }
+            result.conflict_count += applied.conflict_ids.len();
+            result.auto_resolved_conflict_count += applied.auto_resolved_conflict_count;
             result.results.push(applied);
         }
         Ok(result)
@@ -1388,6 +1485,204 @@ struct RemoteArchivePayload {
     archived_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Default)]
+struct RemoteConflictOutcome {
+    conflict_ids: Vec<String>,
+    auto_resolved_conflict_count: usize,
+}
+
+struct RemoteConflictDecision {
+    apply_remote: bool,
+    conflict_kind: SyncConflictKind,
+    policy_action: SyncConflictPolicyAction,
+    resolution_status: SyncConflictResolutionStatus,
+    local_snapshot_json: Option<serde_json::Value>,
+    remote_snapshot_json: Option<serde_json::Value>,
+}
+
+struct PendingSyncConflict<'a> {
+    event: &'a SyncEvent,
+    local_device_id: &'a str,
+    conflict_kind: SyncConflictKind,
+    policy_action: SyncConflictPolicyAction,
+    local_snapshot_json: Option<serde_json::Value>,
+    remote_snapshot_json: Option<serde_json::Value>,
+    resolution_status: SyncConflictResolutionStatus,
+}
+
+fn apply_remote_domain_change_with_policy(
+    connection: &Connection,
+    event: &SyncEvent,
+    policy: &ConflictPolicy,
+    local_device_id: &str,
+) -> Result<RemoteConflictOutcome> {
+    let decision = remote_conflict_decision(connection, event, policy)?;
+    let mut outcome = RemoteConflictOutcome::default();
+    if let Some(decision) = &decision {
+        let conflict = record_sync_conflict_with_connection(
+            connection,
+            PendingSyncConflict {
+                event,
+                local_device_id,
+                conflict_kind: decision.conflict_kind,
+                policy_action: decision.policy_action,
+                local_snapshot_json: decision.local_snapshot_json.clone(),
+                remote_snapshot_json: decision.remote_snapshot_json.clone(),
+                resolution_status: decision.resolution_status,
+            },
+        )?;
+        if conflict.resolution_status == SyncConflictResolutionStatus::AutoResolved {
+            outcome.auto_resolved_conflict_count += 1;
+        }
+        outcome.conflict_ids.push(conflict.conflict_id);
+    }
+    if decision
+        .as_ref()
+        .is_none_or(|decision| decision.apply_remote)
+    {
+        apply_remote_domain_change(connection, event)?;
+    }
+    Ok(outcome)
+}
+
+fn remote_conflict_decision(
+    connection: &Connection,
+    event: &SyncEvent,
+    policy: &ConflictPolicy,
+) -> Result<Option<RemoteConflictDecision>> {
+    let local_snapshot_json =
+        entity_snapshot_json(connection, event.entity_type, &event.entity_id)?;
+    let remote_snapshot_json = remote_snapshot_json(event)?;
+    let has_unsynced_local =
+        has_unsynced_local_events_for_entity(connection, event.entity_type, &event.entity_id)?;
+
+    if event.operation == SyncOperation::Archived {
+        remote_archive(event)?;
+        return Ok(has_unsynced_local.then_some(RemoteConflictDecision {
+            apply_remote: true,
+            conflict_kind: SyncConflictKind::ArchiveVsUpdate,
+            policy_action: SyncConflictPolicyAction::AppliedRemote,
+            resolution_status: SyncConflictResolutionStatus::Open,
+            local_snapshot_json,
+            remote_snapshot_json,
+        }));
+    }
+
+    match (event.entity_type, event.operation) {
+        (SyncEntityType::Organization, SyncOperation::Created | SyncOperation::Updated) => {
+            let remote: Organization = remote_entity(event)?;
+            ensure_event_entity_id(event, &remote.id)?;
+            if local_snapshot_json
+                .as_ref()
+                .and_then(|value| serde_json::from_value::<Organization>(value.clone()).ok())
+                .is_some_and(|local| local.archived_at.is_some() && remote.archived_at.is_none())
+                && policy.organization.archive_vs_update
+                    == crate::sync::ArchiveConflictStrategy::ArchiveWins
+            {
+                return Ok(Some(RemoteConflictDecision {
+                    apply_remote: false,
+                    conflict_kind: SyncConflictKind::ArchiveVsUpdate,
+                    policy_action: SyncConflictPolicyAction::KeptLocal,
+                    resolution_status: SyncConflictResolutionStatus::Open,
+                    local_snapshot_json,
+                    remote_snapshot_json,
+                }));
+            }
+        }
+        (SyncEntityType::Project, SyncOperation::Created | SyncOperation::Updated) => {
+            let remote: Project = remote_entity(event)?;
+            ensure_event_entity_id(event, &remote.id)?;
+            if local_snapshot_json
+                .as_ref()
+                .and_then(|value| serde_json::from_value::<Project>(value.clone()).ok())
+                .is_some_and(|local| {
+                    (local.archived_at.is_some() || local.status == ProjectStatus::Archived)
+                        && remote.archived_at.is_none()
+                        && remote.status != ProjectStatus::Archived
+                })
+                && policy.project.archive_vs_update
+                    == crate::sync::ArchiveConflictStrategy::ArchiveWins
+            {
+                return Ok(Some(RemoteConflictDecision {
+                    apply_remote: false,
+                    conflict_kind: SyncConflictKind::ArchiveVsUpdate,
+                    policy_action: SyncConflictPolicyAction::KeptLocal,
+                    resolution_status: SyncConflictResolutionStatus::Open,
+                    local_snapshot_json,
+                    remote_snapshot_json,
+                }));
+            }
+        }
+        (SyncEntityType::Task, SyncOperation::Created | SyncOperation::Updated) => {
+            let remote: Task = remote_entity(event)?;
+            ensure_event_entity_id(event, &remote.id)?;
+            if event.operation == SyncOperation::Updated
+                && policy.task.terminal_status_behavior
+                    == crate::sync::TerminalStatusConflictStrategy::ProtectDoneCanceledArchived
+                && local_snapshot_json
+                    .as_ref()
+                    .and_then(|value| serde_json::from_value::<Task>(value.clone()).ok())
+                    .is_some_and(|local| {
+                        is_terminal_task_status(local.status)
+                            && !is_terminal_task_status(remote.status)
+                    })
+            {
+                return Ok(Some(RemoteConflictDecision {
+                    apply_remote: false,
+                    conflict_kind: SyncConflictKind::TerminalStatusProtected,
+                    policy_action: SyncConflictPolicyAction::KeptLocal,
+                    resolution_status: SyncConflictResolutionStatus::Open,
+                    local_snapshot_json,
+                    remote_snapshot_json,
+                }));
+            }
+        }
+        (SyncEntityType::Task, SyncOperation::Transitioned) => {
+            let remote: Task = remote_entity(event)?;
+            ensure_event_entity_id(event, &remote.id)?;
+        }
+        _ => {}
+    }
+
+    Ok(has_unsynced_local.then_some(RemoteConflictDecision {
+        apply_remote: match event.entity_type {
+            SyncEntityType::Organization => {
+                policy.organization.normal_update != crate::sync::FieldMergeStrategy::RecordConflict
+            }
+            SyncEntityType::Project => {
+                policy.project.normal_update != crate::sync::FieldMergeStrategy::RecordConflict
+            }
+            SyncEntityType::Task => {
+                policy.task.normal_update != crate::sync::FieldMergeStrategy::RecordConflict
+            }
+        },
+        conflict_kind: SyncConflictKind::LocalUnsyncedChangeVsRemoteUpdate,
+        policy_action: match event.entity_type {
+            SyncEntityType::Organization
+                if policy.organization.normal_update
+                    == crate::sync::FieldMergeStrategy::RecordConflict =>
+            {
+                SyncConflictPolicyAction::RecordedOnly
+            }
+            SyncEntityType::Project
+                if policy.project.normal_update
+                    == crate::sync::FieldMergeStrategy::RecordConflict =>
+            {
+                SyncConflictPolicyAction::RecordedOnly
+            }
+            SyncEntityType::Task
+                if policy.task.normal_update == crate::sync::FieldMergeStrategy::RecordConflict =>
+            {
+                SyncConflictPolicyAction::RecordedOnly
+            }
+            _ => SyncConflictPolicyAction::AppliedRemote,
+        },
+        resolution_status: SyncConflictResolutionStatus::Open,
+        local_snapshot_json,
+        remote_snapshot_json,
+    }))
+}
+
 fn apply_remote_domain_change(connection: &Connection, event: &SyncEvent) -> Result<()> {
     match (event.entity_type, event.operation) {
         (SyncEntityType::Organization, SyncOperation::Created | SyncOperation::Updated) => {
@@ -1481,6 +1776,171 @@ fn ensure_event_entity_id(event: &SyncEvent, payload_id: &str) -> Result<()> {
             event.entity_id
         )))
     }
+}
+
+fn has_unsynced_local_events_for_entity(
+    connection: &Connection,
+    entity_type: SyncEntityType,
+    entity_id: &str,
+) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sync_events
+            WHERE entity_type=?1 AND entity_id=?2 AND synced_at IS NULL
+        )",
+        params![entity_type.to_string(), entity_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn entity_snapshot_json(
+    connection: &Connection,
+    entity_type: SyncEntityType,
+    entity_id: &str,
+) -> Result<Option<serde_json::Value>> {
+    let value = match entity_type {
+        SyncEntityType::Organization => {
+            optional_snapshot(get_organization_with_connection(connection, entity_id))?
+        }
+        SyncEntityType::Project => {
+            optional_snapshot(get_project_with_connection(connection, entity_id))?
+        }
+        SyncEntityType::Task => optional_snapshot(get_task_with_connection(connection, entity_id))?,
+    };
+    Ok(value)
+}
+
+fn optional_snapshot<T: serde::Serialize>(result: Result<T>) -> Result<Option<serde_json::Value>> {
+    match result {
+        Ok(value) => serde_json::to_value(value)
+            .map(Some)
+            .map_err(|error| CoreError::Validation(format!("invalid conflict snapshot: {error}"))),
+        Err(CoreError::NotFound(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn remote_snapshot_json(event: &SyncEvent) -> Result<Option<serde_json::Value>> {
+    match event.operation {
+        SyncOperation::Created | SyncOperation::Updated | SyncOperation::Transitioned => Ok(Some(
+            event.payload_json.get("entity").cloned().ok_or_else(|| {
+                CoreError::Validation(format!(
+                    "remote {} event payload is missing entity",
+                    event.entity_type
+                ))
+            })?,
+        )),
+        SyncOperation::Archived => {
+            remote_archive(event)?;
+            Ok(Some(event.payload_json.clone()))
+        }
+    }
+}
+
+fn record_sync_conflict_with_connection(
+    connection: &Connection,
+    conflict: PendingSyncConflict<'_>,
+) -> Result<SyncConflict> {
+    let conflict_id = Uuid::new_v4().to_string();
+    let now = timestamp(Utc::now());
+    connection.execute(
+        "INSERT OR IGNORE INTO sync_conflicts (
+            conflict_id,remote_event_id,local_device_id,entity_type,entity_id,conflict_kind,
+            policy_action,local_snapshot_json,remote_snapshot_json,resolution_status,created_at,
+            resolved_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL)",
+        params![
+            conflict_id,
+            conflict.event.event_id,
+            conflict.local_device_id,
+            conflict.event.entity_type.to_string(),
+            conflict.event.entity_id,
+            conflict.conflict_kind.to_string(),
+            conflict.policy_action.to_string(),
+            conflict
+                .local_snapshot_json
+                .as_ref()
+                .map(serde_json::Value::to_string),
+            conflict
+                .remote_snapshot_json
+                .as_ref()
+                .map(serde_json::Value::to_string),
+            conflict.resolution_status.to_string(),
+            now,
+        ],
+    )?;
+    get_sync_conflict_by_remote_event_with_connection(connection, &conflict.event.event_id)
+}
+
+fn get_sync_conflict_by_remote_event_with_connection(
+    connection: &Connection,
+    remote_event_id: &str,
+) -> Result<SyncConflict> {
+    connection
+        .query_row(
+            "SELECT conflict_id,remote_event_id,local_device_id,entity_type,entity_id,
+                    conflict_kind,policy_action,local_snapshot_json,remote_snapshot_json,
+                    resolution_status,created_at,resolved_at
+             FROM sync_conflicts WHERE remote_event_id=?1",
+            [remote_event_id],
+            map_sync_conflict,
+        )
+        .optional()?
+        .ok_or(CoreError::NotFound("sync conflict"))
+}
+
+fn get_sync_conflict_with_connection(
+    connection: &Connection,
+    conflict_id: &str,
+) -> Result<SyncConflict> {
+    connection
+        .query_row(
+            "SELECT conflict_id,remote_event_id,local_device_id,entity_type,entity_id,
+                    conflict_kind,policy_action,local_snapshot_json,remote_snapshot_json,
+                    resolution_status,created_at,resolved_at
+             FROM sync_conflicts WHERE conflict_id=?1",
+            [conflict_id],
+            map_sync_conflict,
+        )
+        .optional()?
+        .ok_or(CoreError::NotFound("sync conflict"))
+}
+
+fn map_sync_conflict(row: &Row<'_>) -> rusqlite::Result<SyncConflict> {
+    let local_snapshot_json: Option<String> = row.get(7)?;
+    let remote_snapshot_json: Option<String> = row.get(8)?;
+    Ok(SyncConflict {
+        conflict_id: row.get(0)?,
+        remote_event_id: row.get(1)?,
+        local_device_id: row.get(2)?,
+        entity_type: parse_enum(row.get::<_, String>(3)?)?,
+        entity_id: row.get(4)?,
+        conflict_kind: parse_enum(row.get::<_, String>(5)?)?,
+        policy_action: parse_enum(row.get::<_, String>(6)?)?,
+        local_snapshot_json: parse_optional_json(local_snapshot_json)?,
+        remote_snapshot_json: parse_optional_json(remote_snapshot_json)?,
+        resolution_status: parse_enum(row.get::<_, String>(9)?)?,
+        created_at: parse_time(row.get(10)?)?,
+        resolved_at: parse_optional_time(row.get(11)?)?,
+    })
+}
+
+fn parse_optional_json(value: Option<String>) -> rusqlite::Result<Option<serde_json::Value>> {
+    value
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn is_terminal_task_status(status: TaskStatus) -> bool {
+    matches!(status, TaskStatus::Done | TaskStatus::Canceled)
 }
 
 fn entity_exists(connection: &Connection, table: &str, id: &str) -> Result<bool> {
@@ -1826,7 +2286,11 @@ fn changed(rows: usize, entity: &'static str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::sync::{
-        RemoteApplyStatus, SyncConnectionState, SyncEntityType, SyncOperation, SyncSettingsPatch,
+        ArchiveConflictStrategy, ConflictPolicy, FieldMergeStrategy, RemoteApplyStatus,
+        RestoreConflictStrategy, StatusConflictStrategy, SyncConflictKind,
+        SyncConflictPolicyAction, SyncConflictResolutionStatus, SyncConnectionState,
+        SyncEntityType, SyncOperation, SyncSettingsPatch, TaskConflictPolicy,
+        TerminalStatusConflictStrategy,
     };
 
     fn seeded_database() -> Database {
@@ -1934,6 +2398,7 @@ mod tests {
             "sync_state",
             "sync_devices",
             "applied_remote_events",
+            "sync_conflicts",
         ] {
             let exists: bool = connection
                 .query_row(
@@ -1959,6 +2424,46 @@ mod tests {
                 "missing column {column}"
             );
         }
+    }
+
+    #[test]
+    fn default_conflict_policy_is_deterministic_and_serializable() {
+        let policy = ConflictPolicy::default();
+
+        assert_eq!(
+            policy.organization.normal_update,
+            FieldMergeStrategy::LastWriteWinsWholeEntity
+        );
+        assert_eq!(
+            policy.organization.archive_vs_update,
+            ArchiveConflictStrategy::ArchiveWins
+        );
+        assert_eq!(
+            policy.organization.restore_behavior,
+            RestoreConflictStrategy::ExplicitRestoreOnly
+        );
+        assert_eq!(
+            policy.project.normal_update,
+            FieldMergeStrategy::LastWriteWinsWholeEntity
+        );
+        assert_eq!(
+            policy.task,
+            TaskConflictPolicy {
+                normal_update: FieldMergeStrategy::LastWriteWinsWholeEntity,
+                status_update: StatusConflictStrategy::ServerOrderWins,
+                terminal_status_behavior:
+                    TerminalStatusConflictStrategy::ProtectDoneCanceledArchived,
+                archive_vs_update: ArchiveConflictStrategy::ArchiveWins,
+                restore_behavior: RestoreConflictStrategy::ExplicitRestoreOnly,
+            }
+        );
+
+        let encoded = serde_json::to_string(&policy).unwrap();
+        assert!(encoded.contains("last_write_wins_whole_entity"));
+        assert_eq!(
+            serde_json::from_str::<ConflictPolicy>(&encoded).unwrap(),
+            policy
+        );
     }
 
     #[test]
@@ -1997,6 +2502,64 @@ mod tests {
             Err(CoreError::Validation(_))
         ));
         assert!(!db.has_applied_remote_event("event-bad").unwrap());
+    }
+
+    #[test]
+    fn list_and_ignore_sync_conflicts() {
+        let db = Database::in_memory().unwrap();
+        let mut organization = remote_organization("org-conflict");
+        db.apply_remote_sync_event(&remote_event(
+            "event-create-conflict-org",
+            SyncEntityType::Organization,
+            &organization.id,
+            SyncOperation::Created,
+            serde_json::json!({"entity": organization.clone()}),
+        ))
+        .unwrap();
+        db.update_organization(
+            &organization.id,
+            OrganizationPatch {
+                description: Some(Some("local unsynced".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        organization.name = "Remote conflict update".into();
+        db.apply_remote_sync_event(&remote_event(
+            "event-conflict-org",
+            SyncEntityType::Organization,
+            &organization.id,
+            SyncOperation::Updated,
+            serde_json::json!({"entity": organization}),
+        ))
+        .unwrap();
+
+        let conflicts = db.list_open_sync_conflicts().unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            conflicts[0].conflict_kind,
+            SyncConflictKind::LocalUnsyncedChangeVsRemoteUpdate
+        );
+        assert_eq!(
+            conflicts[0].policy_action,
+            SyncConflictPolicyAction::AppliedRemote
+        );
+        assert_eq!(
+            conflicts[0].resolution_status,
+            SyncConflictResolutionStatus::Open
+        );
+        assert!(conflicts[0].local_snapshot_json.is_some());
+        assert!(conflicts[0].remote_snapshot_json.is_some());
+
+        let ignored = db
+            .mark_sync_conflict_ignored(&conflicts[0].conflict_id)
+            .unwrap();
+        assert_eq!(
+            ignored.resolution_status,
+            SyncConflictResolutionStatus::Ignored
+        );
+        assert!(ignored.resolved_at.is_some());
+        assert!(db.list_open_sync_conflicts().unwrap().is_empty());
     }
 
     #[test]
@@ -2171,6 +2734,324 @@ mod tests {
         );
         assert!(db.get_organization("org-1").unwrap().archived_at.is_some());
         assert!(db.list_unsynced_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_unsynced_task_update_records_conflict_and_remote_apply_succeeds() {
+        let db = Database::in_memory().unwrap();
+        let organization = remote_organization("org-1");
+        let project = remote_project("project-1", &organization.id);
+        let task = remote_task("task-1", &project.id);
+        db.apply_remote_sync_events(&[
+            remote_event(
+                "event-conflict-org-1",
+                SyncEntityType::Organization,
+                &organization.id,
+                SyncOperation::Created,
+                serde_json::json!({"entity": organization}),
+            ),
+            remote_event(
+                "event-conflict-project-1",
+                SyncEntityType::Project,
+                &project.id,
+                SyncOperation::Created,
+                serde_json::json!({"entity": project}),
+            ),
+            remote_event(
+                "event-conflict-task-1",
+                SyncEntityType::Task,
+                &task.id,
+                SyncOperation::Created,
+                serde_json::json!({"entity": task}),
+            ),
+        ])
+        .unwrap();
+
+        db.update_task(
+            "task-1",
+            TaskPatch {
+                title: Some("Local unsynced title".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut remote = db.get_task("task-1").unwrap();
+        remote.title = "Remote title".into();
+        let result = db
+            .apply_remote_sync_event(&remote_event(
+                "event-conflict-task-update",
+                SyncEntityType::Task,
+                "task-1",
+                SyncOperation::Updated,
+                serde_json::json!({"entity": remote}),
+            ))
+            .unwrap();
+
+        assert_eq!(result.status, RemoteApplyStatus::Applied);
+        assert_eq!(result.conflict_ids.len(), 1);
+        assert_eq!(db.get_task("task-1").unwrap().title, "Remote title");
+        assert_eq!(db.list_open_sync_conflicts().unwrap().len(), 1);
+        assert!(
+            db.has_applied_remote_event("event-conflict-task-update")
+                .unwrap()
+        );
+        assert_eq!(db.list_unsynced_events().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn local_archived_organization_is_not_restored_by_remote_normal_update() {
+        let db = Database::in_memory().unwrap();
+        let organization = remote_organization("org-archive");
+        db.apply_remote_sync_event(&remote_event(
+            "event-archive-org-create",
+            SyncEntityType::Organization,
+            &organization.id,
+            SyncOperation::Created,
+            serde_json::json!({"entity": organization.clone()}),
+        ))
+        .unwrap();
+        db.archive_organization(&organization.id).unwrap();
+
+        let mut remote = organization;
+        remote.name = "Remote normal update".into();
+        remote.archived_at = None;
+        let result = db
+            .apply_remote_sync_event(&remote_event(
+                "event-archive-org-update",
+                SyncEntityType::Organization,
+                &remote.id,
+                SyncOperation::Updated,
+                serde_json::json!({"entity": remote}),
+            ))
+            .unwrap();
+
+        assert_eq!(result.conflict_ids.len(), 1);
+        assert!(
+            db.get_organization("org-archive")
+                .unwrap()
+                .archived_at
+                .is_some()
+        );
+        let conflict = db.list_open_sync_conflicts().unwrap().remove(0);
+        assert_eq!(conflict.conflict_kind, SyncConflictKind::ArchiveVsUpdate);
+        assert_eq!(conflict.policy_action, SyncConflictPolicyAction::KeptLocal);
+        assert!(
+            db.has_applied_remote_event("event-archive-org-update")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn remote_archive_wins_over_local_unsynced_project_update() {
+        let db = Database::in_memory().unwrap();
+        let organization = remote_organization("org-archive-win");
+        let project = remote_project("project-archive-win", &organization.id);
+        db.apply_remote_sync_events(&[
+            remote_event(
+                "event-archive-win-org",
+                SyncEntityType::Organization,
+                &organization.id,
+                SyncOperation::Created,
+                serde_json::json!({"entity": organization}),
+            ),
+            remote_event(
+                "event-archive-win-project",
+                SyncEntityType::Project,
+                &project.id,
+                SyncOperation::Created,
+                serde_json::json!({"entity": project.clone()}),
+            ),
+        ])
+        .unwrap();
+        db.update_project(
+            &project.id,
+            ProjectPatch {
+                name: Some("Local project update".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let archived_at = Utc::now();
+        let result = db
+            .apply_remote_sync_event(&remote_event(
+                "event-archive-win-project-archive",
+                SyncEntityType::Project,
+                &project.id,
+                SyncOperation::Archived,
+                serde_json::json!({"id": project.id, "archived_at": archived_at}),
+            ))
+            .unwrap();
+
+        assert_eq!(result.conflict_ids.len(), 1);
+        assert_eq!(
+            db.get_project("project-archive-win").unwrap().status,
+            ProjectStatus::Archived
+        );
+        let conflict = db.list_open_sync_conflicts().unwrap().remove(0);
+        assert_eq!(conflict.conflict_kind, SyncConflictKind::ArchiveVsUpdate);
+        assert_eq!(
+            conflict.policy_action,
+            SyncConflictPolicyAction::AppliedRemote
+        );
+    }
+
+    #[test]
+    fn local_terminal_task_is_not_reverted_by_remote_normal_update() {
+        let db = Database::in_memory().unwrap();
+        let organization = remote_organization("org-terminal");
+        let project = remote_project("project-terminal", &organization.id);
+        let task = remote_task("task-terminal", &project.id);
+        db.apply_remote_sync_events(&[
+            remote_event(
+                "event-terminal-org",
+                SyncEntityType::Organization,
+                &organization.id,
+                SyncOperation::Created,
+                serde_json::json!({"entity": organization}),
+            ),
+            remote_event(
+                "event-terminal-project",
+                SyncEntityType::Project,
+                &project.id,
+                SyncOperation::Created,
+                serde_json::json!({"entity": project}),
+            ),
+            remote_event(
+                "event-terminal-task",
+                SyncEntityType::Task,
+                &task.id,
+                SyncOperation::Created,
+                serde_json::json!({"entity": task}),
+            ),
+        ])
+        .unwrap();
+        db.transition_task("task-terminal", TaskStatus::Done, None)
+            .unwrap();
+
+        let mut remote = db.get_task("task-terminal").unwrap();
+        remote.status = TaskStatus::Ready;
+        remote.completed_at = None;
+        remote.title = "Stale remote update".into();
+        let result = db
+            .apply_remote_sync_event(&remote_event(
+                "event-terminal-task-update",
+                SyncEntityType::Task,
+                "task-terminal",
+                SyncOperation::Updated,
+                serde_json::json!({"entity": remote}),
+            ))
+            .unwrap();
+
+        assert_eq!(result.conflict_ids.len(), 1);
+        let task = db.get_task("task-terminal").unwrap();
+        assert_eq!(task.status, TaskStatus::Done);
+        assert_ne!(task.title, "Stale remote update");
+        let conflict = db.list_open_sync_conflicts().unwrap().remove(0);
+        assert_eq!(
+            conflict.conflict_kind,
+            SyncConflictKind::TerminalStatusProtected
+        );
+        assert_eq!(conflict.policy_action, SyncConflictPolicyAction::KeptLocal);
+    }
+
+    #[test]
+    fn explicit_remote_task_transition_uses_server_order_over_terminal_local_state() {
+        let db = Database::in_memory().unwrap();
+        let organization = remote_organization("org-transition");
+        let project = remote_project("project-transition", &organization.id);
+        let task = remote_task("task-transition", &project.id);
+        db.apply_remote_sync_events(&[
+            remote_event(
+                "event-transition-org",
+                SyncEntityType::Organization,
+                &organization.id,
+                SyncOperation::Created,
+                serde_json::json!({"entity": organization}),
+            ),
+            remote_event(
+                "event-transition-project",
+                SyncEntityType::Project,
+                &project.id,
+                SyncOperation::Created,
+                serde_json::json!({"entity": project}),
+            ),
+            remote_event(
+                "event-transition-task",
+                SyncEntityType::Task,
+                &task.id,
+                SyncOperation::Created,
+                serde_json::json!({"entity": task}),
+            ),
+        ])
+        .unwrap();
+        db.transition_task("task-transition", TaskStatus::Done, None)
+            .unwrap();
+
+        let mut remote = db.get_task("task-transition").unwrap();
+        remote.status = TaskStatus::Ready;
+        remote.completed_at = None;
+        let result = db
+            .apply_remote_sync_event(&remote_event(
+                "event-transition-task-ready",
+                SyncEntityType::Task,
+                "task-transition",
+                SyncOperation::Transitioned,
+                serde_json::json!({"entity": remote}),
+            ))
+            .unwrap();
+
+        assert_eq!(result.conflict_ids.len(), 1);
+        assert_eq!(
+            db.get_task("task-transition").unwrap().status,
+            TaskStatus::Ready
+        );
+        let conflict = db.list_open_sync_conflicts().unwrap().remove(0);
+        assert_eq!(
+            conflict.conflict_kind,
+            SyncConflictKind::LocalUnsyncedChangeVsRemoteUpdate
+        );
+        assert_eq!(
+            conflict.policy_action,
+            SyncConflictPolicyAction::AppliedRemote
+        );
+    }
+
+    #[test]
+    fn duplicate_remote_conflict_record_is_idempotent() {
+        let db = Database::in_memory().unwrap();
+        let mut organization = remote_organization("org-idempotent-conflict");
+        db.apply_remote_sync_event(&remote_event(
+            "event-idempotent-conflict-create",
+            SyncEntityType::Organization,
+            &organization.id,
+            SyncOperation::Created,
+            serde_json::json!({"entity": organization.clone()}),
+        ))
+        .unwrap();
+        db.update_organization(
+            &organization.id,
+            OrganizationPatch {
+                name: Some("Local unsynced name".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        organization.name = "Remote idempotent name".into();
+        let event = remote_event(
+            "event-idempotent-conflict-update",
+            SyncEntityType::Organization,
+            &organization.id,
+            SyncOperation::Updated,
+            serde_json::json!({"entity": organization}),
+        );
+
+        let first = db.apply_remote_sync_event(&event).unwrap();
+        let second = db.apply_remote_sync_event(&event).unwrap();
+
+        assert_eq!(first.conflict_ids.len(), 1);
+        assert!(second.conflict_ids.is_empty());
+        assert_eq!(db.list_sync_conflicts().unwrap().len(), 1);
     }
 
     #[test]

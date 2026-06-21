@@ -1,10 +1,14 @@
+use crate::sync_runtime::{
+    SYNC_ALREADY_RUNNING_ERROR, SyncReadiness, SyncRuntime, patch_changes_server_url,
+    sync_readiness,
+};
 use openmgmt_core::{
     AppService, BoardState, NewOrganization, NewProject, NewTask, Organization, OrganizationPatch,
-    Project, ProjectPatch, SyncSettings, SyncSettingsPatch, SyncStatus, Task, TaskPatch,
+    Project, ProjectPatch, SyncConflict, SyncSettings, SyncSettingsPatch, SyncStatus, Task,
+    TaskPatch,
 };
-use openmgmt_sync_client::{SyncConnectionTestResult, SyncOnceResult};
+use openmgmt_sync_client::{SyncClientError, SyncConnectionTestResult, SyncOnceResult};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
-use tokio::sync::{Mutex, MutexGuard};
 
 type CommandResult<T> = Result<T, String>;
 
@@ -15,16 +19,21 @@ fn core<T>(result: openmgmt_core::db::Result<T>) -> CommandResult<T> {
     })
 }
 
-#[derive(Default)]
-pub struct SyncRuntimeState {
-    syncing: Mutex<()>,
+fn core_mutation<T>(
+    result: openmgmt_core::db::Result<T>,
+    runtime: &SyncRuntime,
+) -> CommandResult<T> {
+    let value = core(result)?;
+    runtime.trigger_mutation_sync();
+    Ok(value)
 }
 
-impl SyncRuntimeState {
-    fn try_start(&self) -> CommandResult<MutexGuard<'_, ()>> {
-        self.syncing
-            .try_lock()
-            .map_err(|_| "sync is already running".into())
+fn map_sync_error(error: SyncClientError) -> String {
+    if matches!(&error, SyncClientError::Other(message) if message == SYNC_ALREADY_RUNNING_ERROR) {
+        SYNC_ALREADY_RUNNING_ERROR.into()
+    } else {
+        tracing::error!(%error, "manual sync failed");
+        error.to_string()
     }
 }
 
@@ -36,23 +45,29 @@ pub fn list_organizations(service: State<'_, AppService>) -> CommandResult<Vec<O
 #[tauri::command]
 pub fn create_organization(
     service: State<'_, AppService>,
+    runtime: State<'_, SyncRuntime>,
     input: NewOrganization,
 ) -> CommandResult<Organization> {
-    core(service.create_organization(input))
+    core_mutation(service.create_organization(input), &runtime)
 }
 
 #[tauri::command]
 pub fn update_organization(
     service: State<'_, AppService>,
+    runtime: State<'_, SyncRuntime>,
     id: String,
     patch: OrganizationPatch,
 ) -> CommandResult<Organization> {
-    core(service.update_organization(&id, patch))
+    core_mutation(service.update_organization(&id, patch), &runtime)
 }
 
 #[tauri::command]
-pub fn archive_organization(service: State<'_, AppService>, id: String) -> CommandResult<()> {
-    core(service.archive_organization(&id))
+pub fn archive_organization(
+    service: State<'_, AppService>,
+    runtime: State<'_, SyncRuntime>,
+    id: String,
+) -> CommandResult<()> {
+    core_mutation(service.archive_organization(&id), &runtime)
 }
 
 #[tauri::command]
@@ -61,8 +76,12 @@ pub fn list_projects(service: State<'_, AppService>) -> CommandResult<Vec<Projec
 }
 
 #[tauri::command]
-pub fn create_project(service: State<'_, AppService>, input: NewProject) -> CommandResult<Project> {
-    core(service.create_project(input))
+pub fn create_project(
+    service: State<'_, AppService>,
+    runtime: State<'_, SyncRuntime>,
+    input: NewProject,
+) -> CommandResult<Project> {
+    core_mutation(service.create_project(input), &runtime)
 }
 
 #[tauri::command]
@@ -73,15 +92,20 @@ pub fn get_project(service: State<'_, AppService>, id: String) -> CommandResult<
 #[tauri::command]
 pub fn update_project(
     service: State<'_, AppService>,
+    runtime: State<'_, SyncRuntime>,
     id: String,
     patch: ProjectPatch,
 ) -> CommandResult<Project> {
-    core(service.update_project(&id, patch))
+    core_mutation(service.update_project(&id, patch), &runtime)
 }
 
 #[tauri::command]
-pub fn archive_project(service: State<'_, AppService>, id: String) -> CommandResult<()> {
-    core(service.archive_project(&id))
+pub fn archive_project(
+    service: State<'_, AppService>,
+    runtime: State<'_, SyncRuntime>,
+    id: String,
+) -> CommandResult<()> {
+    core_mutation(service.archive_project(&id), &runtime)
 }
 
 #[tauri::command]
@@ -90,8 +114,12 @@ pub fn list_tasks(service: State<'_, AppService>) -> CommandResult<Vec<Task>> {
 }
 
 #[tauri::command]
-pub fn create_task(service: State<'_, AppService>, input: NewTask) -> CommandResult<Task> {
-    core(service.create_task(input))
+pub fn create_task(
+    service: State<'_, AppService>,
+    runtime: State<'_, SyncRuntime>,
+    input: NewTask,
+) -> CommandResult<Task> {
+    core_mutation(service.create_task(input), &runtime)
 }
 
 #[tauri::command]
@@ -102,39 +130,57 @@ pub fn get_task(service: State<'_, AppService>, id: String) -> CommandResult<Tas
 #[tauri::command]
 pub fn update_task(
     service: State<'_, AppService>,
+    runtime: State<'_, SyncRuntime>,
     id: String,
     patch: TaskPatch,
 ) -> CommandResult<Task> {
-    core(service.update_task(&id, patch))
+    core_mutation(service.update_task(&id, patch), &runtime)
 }
 
 #[tauri::command]
-pub fn cancel_task(service: State<'_, AppService>, id: String) -> CommandResult<Task> {
-    core(service.cancel_task(&id))
+pub fn cancel_task(
+    service: State<'_, AppService>,
+    runtime: State<'_, SyncRuntime>,
+    id: String,
+) -> CommandResult<Task> {
+    core_mutation(service.cancel_task(&id), &runtime)
 }
 
 #[tauri::command]
-pub fn start_task(service: State<'_, AppService>, id: String) -> CommandResult<Task> {
-    core(service.start_task(&id))
+pub fn start_task(
+    service: State<'_, AppService>,
+    runtime: State<'_, SyncRuntime>,
+    id: String,
+) -> CommandResult<Task> {
+    core_mutation(service.start_task(&id), &runtime)
 }
 
 #[tauri::command]
-pub fn complete_task(service: State<'_, AppService>, id: String) -> CommandResult<Task> {
-    core(service.complete_task(&id))
+pub fn complete_task(
+    service: State<'_, AppService>,
+    runtime: State<'_, SyncRuntime>,
+    id: String,
+) -> CommandResult<Task> {
+    core_mutation(service.complete_task(&id), &runtime)
 }
 
 #[tauri::command]
 pub fn block_task(
     service: State<'_, AppService>,
+    runtime: State<'_, SyncRuntime>,
     id: String,
     reason: String,
 ) -> CommandResult<Task> {
-    core(service.block_task(&id, reason))
+    core_mutation(service.block_task(&id, reason), &runtime)
 }
 
 #[tauri::command]
-pub fn unblock_task(service: State<'_, AppService>, id: String) -> CommandResult<Task> {
-    core(service.unblock_task(&id))
+pub fn unblock_task(
+    service: State<'_, AppService>,
+    runtime: State<'_, SyncRuntime>,
+    id: String,
+) -> CommandResult<Task> {
+    core_mutation(service.unblock_task(&id), &runtime)
 }
 
 #[tauri::command]
@@ -150,29 +196,36 @@ pub fn get_sync_settings(service: State<'_, AppService>) -> CommandResult<SyncSe
 #[tauri::command]
 pub fn update_sync_settings(
     service: State<'_, AppService>,
+    runtime: State<'_, SyncRuntime>,
     patch: SyncSettingsPatch,
 ) -> CommandResult<SyncSettings> {
-    core(service.update_sync_settings(patch))
+    let previous_server_url = if patch_changes_server_url(&patch) {
+        Some(core(service.get_sync_settings())?.server_url)
+    } else {
+        None
+    };
+    let settings = core(service.update_sync_settings(patch))?;
+    if previous_server_url.is_some_and(|previous| previous != settings.server_url) {
+        runtime.reset_backoff();
+    }
+    if sync_readiness(&settings) == SyncReadiness::Ready {
+        runtime.trigger_settings_sync();
+    }
+    Ok(settings)
 }
 
 #[tauri::command]
-pub fn get_sync_status(service: State<'_, AppService>) -> CommandResult<SyncStatus> {
-    core(service.get_sync_status())
-}
-
-#[tauri::command]
-pub async fn sync_now(
+pub fn get_sync_status(
     service: State<'_, AppService>,
-    runtime: State<'_, SyncRuntimeState>,
-) -> CommandResult<SyncOnceResult> {
-    let _guard = runtime.try_start()?;
-    let database = service.database();
-    openmgmt_sync_client::sync_once(&database)
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "manual sync failed");
-            error.to_string()
-        })
+    runtime: State<'_, SyncRuntime>,
+) -> CommandResult<SyncStatus> {
+    let status = core(service.get_sync_status())?;
+    Ok(runtime.with_runtime_status(status))
+}
+
+#[tauri::command]
+pub async fn sync_now(runtime: State<'_, SyncRuntime>) -> CommandResult<SyncOnceResult> {
+    runtime.sync_now().await.map_err(map_sync_error)
 }
 
 #[tauri::command]
@@ -191,6 +244,24 @@ pub async fn test_sync_connection(
 #[tauri::command]
 pub fn clear_sync_error(service: State<'_, AppService>) -> CommandResult<SyncStatus> {
     core(service.clear_sync_error())
+}
+
+#[tauri::command]
+pub fn get_sync_conflicts(service: State<'_, AppService>) -> CommandResult<Vec<SyncConflict>> {
+    core(service.list_sync_conflicts())
+}
+
+#[tauri::command]
+pub fn get_open_sync_conflicts(service: State<'_, AppService>) -> CommandResult<Vec<SyncConflict>> {
+    core(service.list_open_sync_conflicts())
+}
+
+#[tauri::command]
+pub fn ignore_sync_conflict(
+    service: State<'_, AppService>,
+    conflict_id: String,
+) -> CommandResult<SyncConflict> {
+    core(service.mark_sync_conflict_ignored(&conflict_id))
 }
 
 #[tauri::command]
@@ -214,10 +285,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sync_runtime_rejects_overlapping_attempts() {
-        let runtime = SyncRuntimeState::default();
-        let _guard = runtime.try_start().expect("first sync should start");
+    fn sync_runtime_error_string_for_overlap_is_stable() {
+        let error = map_sync_error(SyncClientError::Other(SYNC_ALREADY_RUNNING_ERROR.into()));
 
-        assert_eq!(runtime.try_start().unwrap_err(), "sync is already running");
+        assert_eq!(error, SYNC_ALREADY_RUNNING_ERROR);
     }
 }

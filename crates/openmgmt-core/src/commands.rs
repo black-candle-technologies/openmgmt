@@ -1,4 +1,5 @@
 use crate::{
+    SyncConflict,
     db::{Database, Result},
     models::{
         BoardState, NewOrganization, NewProject, NewTask, Organization, OrganizationPatch, Project,
@@ -104,5 +105,14 @@ impl AppService {
     }
     pub fn clear_sync_error(&self) -> Result<SyncStatus> {
         self.database.clear_sync_error()
+    }
+    pub fn list_sync_conflicts(&self) -> Result<Vec<SyncConflict>> {
+        self.database.list_sync_conflicts()
+    }
+    pub fn list_open_sync_conflicts(&self) -> Result<Vec<SyncConflict>> {
+        self.database.list_open_sync_conflicts()
+    }
+    pub fn mark_sync_conflict_ignored(&self, conflict_id: &str) -> Result<SyncConflict> {
+        self.database.mark_sync_conflict_ignored(conflict_id)
     }
 }

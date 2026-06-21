@@ -141,18 +141,21 @@ pub struct BoardState {
     pub done_today: Vec<ScoredTask>,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for ProjectType {
     fn default() -> Self {
         Self::Other
     }
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for ProjectStatus {
     fn default() -> Self {
         Self::Active
     }
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for TaskStatus {
     fn default() -> Self {
         Self::Inbox

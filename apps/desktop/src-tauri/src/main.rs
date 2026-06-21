@@ -1,6 +1,8 @@
 mod commands;
+mod sync_runtime;
 
 use openmgmt_core::{AppService, Database, default_database_path};
+use tauri::Manager;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -10,10 +12,27 @@ fn main() {
 
     let database =
         Database::open(default_database_path()).expect("failed to open OpenMgmt database");
+    let service = AppService::new(database);
+    let sync_runtime = sync_runtime::SyncRuntime::new(service.database());
 
     tauri::Builder::default()
-        .manage(AppService::new(database))
-        .manage(commands::SyncRuntimeState::default())
+        .manage(service)
+        .manage(sync_runtime)
+        .setup(|app| {
+            app.state::<sync_runtime::SyncRuntime>()
+                .trigger_startup_sync();
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. })
+                && window.label() == "main"
+            {
+                window
+                    .app_handle()
+                    .state::<sync_runtime::SyncRuntime>()
+                    .shutdown();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::list_organizations,
             commands::create_organization,
@@ -40,6 +59,9 @@ fn main() {
             commands::sync_now,
             commands::test_sync_connection,
             commands::clear_sync_error,
+            commands::get_sync_conflicts,
+            commands::get_open_sync_conflicts,
+            commands::ignore_sync_conflict,
             commands::open_tv_board_window,
         ])
         .run(tauri::generate_context!())

@@ -3,6 +3,7 @@ use crate::{
     scoring::{ScoringWeights, score_task},
 };
 use chrono::{DateTime, Duration, Utc};
+use std::cmp::Reverse;
 
 pub fn build_board(tasks: Vec<TaskContext>, now: DateTime<Utc>) -> BoardState {
     let mut board = BoardState {
@@ -59,7 +60,7 @@ pub fn build_board(tasks: Vec<TaskContext>, now: DateTime<Utc>) -> BoardState {
         &mut board.overdue,
         &mut board.done_today,
     ] {
-        column.sort_by(|a, b| b.urgency_score.cmp(&a.urgency_score));
+        column.sort_by_key(|task| Reverse(task.urgency_score));
     }
     board
 }

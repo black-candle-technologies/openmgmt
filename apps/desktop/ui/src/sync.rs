@@ -38,6 +38,8 @@ pub struct SyncOnceResult {
     pub rejected_event_count: usize,
     pub pulled_event_count: usize,
     pub applied_event_count: usize,
+    pub conflict_count: usize,
+    pub auto_resolved_conflict_count: usize,
     pub server_checkpoint: Option<String>,
     pub phases: Vec<SyncPhaseResult>,
 }
@@ -71,12 +73,13 @@ pub fn sync_result_summary(result: &SyncOnceResult) -> String {
         .map(|value| format!(" Checkpoint: {value}."))
         .unwrap_or_default();
     format!(
-        "Pushed {}, accepted {}, rejected {}, pulled {}, applied {}.{}",
+        "Pushed {}, accepted {}, rejected {}, pulled {}, applied {}, conflicts {}.{}",
         result.pushed_event_count,
         result.accepted_event_count,
         result.rejected_event_count,
         result.pulled_event_count,
         result.applied_event_count,
+        result.conflict_count,
         checkpoint
     )
 }
@@ -116,13 +119,15 @@ mod tests {
             rejected_event_count: 1,
             pulled_event_count: 3,
             applied_event_count: 2,
+            conflict_count: 1,
+            auto_resolved_conflict_count: 0,
             server_checkpoint: Some("checkpoint-7".into()),
             phases: vec![],
         };
 
         assert_eq!(
             sync_result_summary(&result),
-            "Pushed 5, accepted 4, rejected 1, pulled 3, applied 2. Checkpoint: checkpoint-7."
+            "Pushed 5, accepted 4, rejected 1, pulled 3, applied 2, conflicts 1. Checkpoint: checkpoint-7."
         );
     }
 }

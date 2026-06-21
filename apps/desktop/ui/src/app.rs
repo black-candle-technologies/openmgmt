@@ -610,6 +610,7 @@ fn SyncView() -> impl IntoView {
                     <div><span>"Rejected"</span><strong>{result.rejected_event_count}</strong></div>
                     <div><span>"Pulled"</span><strong>{result.pulled_event_count}</strong></div>
                     <div><span>"Applied"</span><strong>{result.applied_event_count}</strong></div>
+                    <div><span>"Conflicts"</span><strong>{result.conflict_count}</strong></div>
                 </div>
                 {result.server_checkpoint.map(|checkpoint| view! {
                     <p class="checkpoint"><span>"Checkpoint"</span><code>{checkpoint}</code></p>
