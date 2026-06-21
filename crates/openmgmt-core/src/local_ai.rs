@@ -2,8 +2,8 @@ use crate::{
     db::{CoreError, Result},
     models::{
         BoardState, LocalAiChatMessage, LocalAiChatResponse, LocalAiConnectionResult, LocalAiModel,
-        LocalAiModelListResult, LocalAiSettings, LocalAiWorkflowResponse, Project, Task,
-        TaskWithContext,
+        LocalAiModelListResult, LocalAiSettings, LocalAiToolDefinition, LocalAiWorkflowResponse,
+        Project, Task, TaskWithContext,
     },
 };
 use chrono::{DateTime, Utc};
@@ -15,6 +15,7 @@ use std::{net::Ipv4Addr, time::Duration};
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3:1.7b";
 pub const DEFAULT_OLLAMA_KEEP_ALIVE: &str = "5m";
+pub const LOCAL_AI_SYSTEM_PROMPT: &str = "You are OpenMgmt's local command assistant. P1 is highest priority. Use OpenMgmt context. Be concise and operational. Never claim to have changed data unless a tool was executed. For writes, propose an action instead of pretending to perform it. Prefer known tool names.";
 
 pub struct OllamaClient {
     base_url: String,
@@ -222,13 +223,161 @@ pub fn prompt_messages(prompt: String) -> Vec<LocalAiChatMessage> {
     vec![
         LocalAiChatMessage {
             role: "system".into(),
-            content: "You are OpenMgmt's local planning assistant. P1 is highest priority. Be concise and operational. Do not invent tasks not present in context unless asked. Prefer Schedule, Daily Operations, Board, Overdue, Blocked, and Due Soon.".into(),
+            content: LOCAL_AI_SYSTEM_PROMPT.into(),
         },
         LocalAiChatMessage {
             role: "user".into(),
             content: prompt,
         },
     ]
+}
+
+pub fn chat_prompt_messages(context: String, user_message: String) -> Vec<LocalAiChatMessage> {
+    vec![
+        LocalAiChatMessage {
+            role: "system".into(),
+            content: LOCAL_AI_SYSTEM_PROMPT.into(),
+        },
+        LocalAiChatMessage {
+            role: "user".into(),
+            content: format!("{context}\n\nUser:\n{user_message}"),
+        },
+    ]
+}
+
+pub fn local_ai_tool_registry() -> Vec<LocalAiToolDefinition> {
+    [
+        read_tool("get_summary", "Get compact OpenMgmt workspace summary"),
+        read_tool("get_board", "Get current board state"),
+        read_tool(
+            "get_daily_operations",
+            "Get current daily operations context",
+        ),
+        read_tool("get_schedule_day", "Get schedule for a day"),
+        read_tool("get_schedule_week", "Get schedule for this week"),
+        read_tool("list_tasks", "List active tasks"),
+        read_tool("list_projects", "List active projects"),
+        read_tool("list_organizations", "List active organizations"),
+        read_tool("get_task", "Get a task by id"),
+        read_tool("get_project", "Get a project by id"),
+        write_tool("create_organization", "Create an organization"),
+        write_tool("create_project", "Create a project"),
+        write_tool("create_task", "Create a task"),
+        write_tool("update_task", "Update a task"),
+        write_tool("schedule_task", "Schedule a task"),
+        write_tool("reschedule_task", "Reschedule a task"),
+        write_tool("start_task", "Start a task"),
+        write_tool("block_task", "Block a task"),
+        write_tool("complete_task", "Complete a task"),
+    ]
+    .into_iter()
+    .collect()
+}
+
+pub fn local_ai_tool(name: &str) -> Option<LocalAiToolDefinition> {
+    local_ai_tool_registry()
+        .into_iter()
+        .find(|tool| tool.name == name)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashCommand {
+    Help,
+    Plan,
+    Board,
+    Tasks(Option<String>),
+    ScheduleToday,
+    ScheduleWeek,
+    Unscheduled,
+    Models,
+    UseModel(String),
+    CreateTask(String),
+    CompleteTask(String),
+    StartTask(String),
+}
+
+pub fn parse_slash_command(input: &str) -> Result<Option<SlashCommand>> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('/') {
+        return Ok(None);
+    }
+    let without_slash = trimmed.trim_start_matches('/').trim();
+    if without_slash.is_empty() {
+        return Ok(Some(SlashCommand::Help));
+    }
+    let mut parts = without_slash.split_whitespace();
+    let command = parts.next().unwrap_or_default();
+    let rest = parts.collect::<Vec<_>>().join(" ");
+    let parsed = match command {
+        "help" => SlashCommand::Help,
+        "plan" => SlashCommand::Plan,
+        "board" => SlashCommand::Board,
+        "tasks" => SlashCommand::Tasks((!rest.is_empty()).then_some(rest)),
+        "schedule" if rest == "today" => SlashCommand::ScheduleToday,
+        "schedule" if rest == "week" => SlashCommand::ScheduleWeek,
+        "unscheduled" => SlashCommand::Unscheduled,
+        "models" => SlashCommand::Models,
+        "use" if !rest.is_empty() => SlashCommand::UseModel(rest),
+        "create" if rest.strip_prefix("task ").is_some() => {
+            let title = rest.trim_start_matches("task ").trim();
+            if title.is_empty() {
+                return Err(CoreError::Validation("task title is required".into()));
+            }
+            SlashCommand::CreateTask(title.into())
+        }
+        "complete" if rest.strip_prefix("task ").is_some() => {
+            SlashCommand::CompleteTask(rest.trim_start_matches("task ").trim().into())
+        }
+        "start" if rest.strip_prefix("task ").is_some() => {
+            SlashCommand::StartTask(rest.trim_start_matches("task ").trim().into())
+        }
+        _ => {
+            return Err(CoreError::Validation(format!(
+                "unknown local AI slash command: /{without_slash}"
+            )));
+        }
+    };
+    Ok(Some(parsed))
+}
+
+pub fn slash_help() -> String {
+    [
+        "Available commands:",
+        "/help",
+        "/plan",
+        "/board",
+        "/tasks",
+        "/tasks blocked",
+        "/tasks overdue",
+        "/schedule today",
+        "/schedule week",
+        "/unscheduled",
+        "/models",
+        "/use <model>",
+        "/create task <title>",
+        "/complete task <id>",
+        "/start task <id>",
+    ]
+    .join("\n")
+}
+
+pub fn compact_task_lines(tasks: &[TaskWithContext], limit: usize) -> String {
+    tasks
+        .iter()
+        .take(limit)
+        .map(|item| {
+            format!(
+                "- {} P{} score {} [{}] {} / {}",
+                item.task.id,
+                item.task.priority,
+                item.urgency_score,
+                item.task.status,
+                item.project_name,
+                item.task.title
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn plan_day_prompt(board: &BoardState, schedule: &[TaskWithContext]) -> String {
@@ -327,6 +476,22 @@ fn disconnected(error: String) -> LocalAiConnectionResult {
         connected: false,
         version: None,
         error: Some(error),
+    }
+}
+
+fn read_tool(name: &str, description: &str) -> LocalAiToolDefinition {
+    LocalAiToolDefinition {
+        name: name.into(),
+        description: description.into(),
+        write: false,
+    }
+}
+
+fn write_tool(name: &str, description: &str) -> LocalAiToolDefinition {
+    LocalAiToolDefinition {
+        name: name.into(),
+        description: description.into(),
+        write: true,
     }
 }
 
@@ -443,6 +608,58 @@ mod tests {
     fn prompt_building_includes_p1_instruction() {
         let messages = prompt_messages("Plan.".into());
         assert!(messages[0].content.contains("P1 is highest priority"));
+    }
+
+    #[test]
+    fn slash_parser_handles_supported_commands() {
+        assert!(matches!(
+            parse_slash_command("/help").unwrap(),
+            Some(SlashCommand::Help)
+        ));
+        assert!(matches!(
+            parse_slash_command("/board").unwrap(),
+            Some(SlashCommand::Board)
+        ));
+        assert_eq!(
+            parse_slash_command("/tasks blocked").unwrap(),
+            Some(SlashCommand::Tasks(Some("blocked".into())))
+        );
+        assert_eq!(
+            parse_slash_command("/use llama3.2:3b").unwrap(),
+            Some(SlashCommand::UseModel("llama3.2:3b".into()))
+        );
+        assert_eq!(
+            parse_slash_command("/create task Draft brief").unwrap(),
+            Some(SlashCommand::CreateTask("Draft brief".into()))
+        );
+        assert_eq!(
+            parse_slash_command("/complete task task-1").unwrap(),
+            Some(SlashCommand::CompleteTask("task-1".into()))
+        );
+        assert_eq!(
+            parse_slash_command("/start task task-1").unwrap(),
+            Some(SlashCommand::StartTask("task-1".into()))
+        );
+        assert!(matches!(
+            parse_slash_command("/models").unwrap(),
+            Some(SlashCommand::Models)
+        ));
+    }
+
+    #[test]
+    fn tool_registry_has_no_destructive_tools() {
+        let tools = local_ai_tool_registry();
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "create_task" && tool.write)
+        );
+        assert!(!tools.iter().any(|tool| {
+            tool.name.contains("delete")
+                || tool.name.contains("archive")
+                || tool.name.contains("shell")
+                || tool.name.contains("sql")
+        }));
     }
 
     #[tokio::test]

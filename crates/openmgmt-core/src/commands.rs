@@ -1,13 +1,16 @@
 use crate::{
     db::{Database, Result},
     local_ai::{
-        OllamaClient, plan_day_prompt, prompt_messages, rewrite_task_prompt,
-        suggest_next_task_prompt, summarize_project_prompt, triage_tasks_prompt, workflow_error,
-        workflow_response,
+        OllamaClient, SlashCommand, chat_prompt_messages, compact_task_lines, local_ai_tool,
+        local_ai_tool_registry, parse_slash_command, plan_day_prompt, prompt_messages,
+        rewrite_task_prompt, slash_help, suggest_next_task_prompt, summarize_project_prompt,
+        triage_tasks_prompt, workflow_error, workflow_response,
     },
     models::{
-        BoardState, CalendarBlock, LocalAiChatMessage, LocalAiChatResponse,
-        LocalAiConnectionResult, LocalAiModelListResult, LocalAiSettings, LocalAiSettingsPatch,
+        BoardState, CalendarBlock, LocalAiChatMessage, LocalAiChatMessageRecord,
+        LocalAiChatResponse, LocalAiChatRole, LocalAiChatSession, LocalAiChatTurn,
+        LocalAiConnectionResult, LocalAiContextScope, LocalAiModelListResult, LocalAiSettings,
+        LocalAiSettingsPatch, LocalAiToolCall, LocalAiToolCallStatus, LocalAiToolDefinition,
         LocalAiWorkflowResponse, NewOrganization, NewProject, NewSavedTaskView, NewTask,
         Organization, OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch,
         ScheduleConflict, ScheduleTaskInput, ScheduledBlockCompletion, ScoringSettings,
@@ -373,6 +376,474 @@ impl AppService {
             },
         )
     }
+    pub fn list_local_ai_chat_sessions(&self) -> Result<Vec<LocalAiChatSession>> {
+        self.database.list_local_ai_chat_sessions()
+    }
+    pub fn create_local_ai_chat_session(
+        &self,
+        title: Option<String>,
+        model: Option<String>,
+    ) -> Result<LocalAiChatSession> {
+        self.database.create_local_ai_chat_session(title, model)
+    }
+    pub fn archive_local_ai_chat_session(&self, id: &str) -> Result<LocalAiChatSession> {
+        self.database.archive_local_ai_chat_session(id)
+    }
+    pub fn list_local_ai_chat_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<LocalAiChatMessageRecord>> {
+        self.database.list_local_ai_chat_messages(session_id)
+    }
+    pub fn list_local_ai_tools(&self) -> Vec<LocalAiToolDefinition> {
+        local_ai_tool_registry()
+    }
+    pub fn build_local_ai_chat_context(&self, scope: LocalAiContextScope) -> Result<String> {
+        let organizations = self.database.list_organizations()?;
+        let projects = self.database.list_projects()?;
+        let tasks = self
+            .database
+            .query_tasks(TaskQueryFilter::default(), Some(TaskSort::default()))?;
+        let board = self.database.board_state()?;
+        let mut lines = vec![
+            "OpenMgmt local context.".to_string(),
+            "P1 is highest priority; P5 is lowest.".to_string(),
+            format!(
+                "Workspace counts: {} organizations, {} projects, {} active tasks.",
+                organizations.len(),
+                projects.len(),
+                tasks.len()
+            ),
+        ];
+        if matches!(
+            scope,
+            LocalAiContextScope::Daily
+                | LocalAiContextScope::FullSummary
+                | LocalAiContextScope::Minimal
+        ) {
+            lines.push(format!(
+                "Board now:\n{}",
+                compact_task_lines(
+                    &board
+                        .now
+                        .iter()
+                        .map(|item| scored_to_context(item, &tasks))
+                        .collect::<Vec<_>>(),
+                    8
+                )
+            ));
+            lines.push(format!(
+                "Overdue:\n{}",
+                compact_task_lines(&self.database.get_overdue_tasks()?, 8)
+            ));
+            lines.push(format!(
+                "Blocked/waiting:\n{}",
+                compact_task_lines(
+                    &tasks
+                        .iter()
+                        .filter(|item| {
+                            matches!(item.task.status, TaskStatus::Blocked | TaskStatus::Waiting)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    8
+                )
+            ));
+        }
+        if matches!(
+            scope,
+            LocalAiContextScope::Schedule
+                | LocalAiContextScope::Daily
+                | LocalAiContextScope::FullSummary
+        ) {
+            lines.push(format!(
+                "Schedule today:\n{}",
+                compact_task_lines(&self.database.get_schedule_today()?, 8)
+            ));
+            lines.push(format!(
+                "Schedule week:\n{}",
+                compact_task_lines(&self.database.get_schedule_week()?, 8)
+            ));
+            lines.push(format!(
+                "Unscheduled:\n{}",
+                compact_task_lines(&self.database.get_unscheduled_tasks()?, 8)
+            ));
+        }
+        Ok(lines.join("\n\n"))
+    }
+    pub async fn send_local_ai_chat_message(
+        &self,
+        input: crate::models::SendLocalAiChatMessageInput,
+    ) -> Result<LocalAiChatTurn> {
+        let mut session = if let Some(id) = input.session_id.as_deref() {
+            self.database.get_local_ai_chat_session(id)?
+        } else {
+            self.database.create_local_ai_chat_session(
+                Some(chat_title(&input.message)),
+                input.model.clone(),
+            )?
+        };
+        if let Some(model) = input.model.clone() {
+            session = self
+                .database
+                .update_local_ai_chat_session_model(&session.id, Some(model))?;
+        }
+        let user = self.database.append_local_ai_chat_message(
+            &session.id,
+            LocalAiChatRole::User,
+            input.message.clone(),
+            session.model.clone(),
+            None,
+        )?;
+        if let Some(command) = parse_slash_command(&input.message)? {
+            self.handle_local_ai_slash_command(&mut session, &user, command)
+                .await?;
+            return self.local_ai_chat_turn(session);
+        }
+        let context = self.build_local_ai_chat_context(input.context_scope.unwrap_or_default())?;
+        let messages = chat_prompt_messages(context, input.message);
+        let output = match self.run_ollama_chat(session.model.clone(), messages).await {
+            Ok(chat) => chat.content,
+            Err(error) => format!("Local AI unavailable: {error}"),
+        };
+        self.database.append_local_ai_chat_message(
+            &session.id,
+            LocalAiChatRole::Assistant,
+            output,
+            session.model.clone(),
+            None,
+        )?;
+        self.local_ai_chat_turn(session)
+    }
+    pub async fn run_local_ai_slash_command(
+        &self,
+        session_id: Option<String>,
+        command: String,
+    ) -> Result<LocalAiChatTurn> {
+        self.send_local_ai_chat_message(crate::models::SendLocalAiChatMessageInput {
+            session_id,
+            message: command,
+            model: None,
+            context_scope: Some(LocalAiContextScope::Daily),
+            allow_write_proposals: true,
+        })
+        .await
+    }
+    pub fn confirm_local_ai_tool_call(&self, id: &str) -> Result<LocalAiToolCall> {
+        let mut call = self.database.get_local_ai_tool_call(id)?;
+        if call.status != LocalAiToolCallStatus::Proposed {
+            return Err(crate::db::CoreError::Validation(
+                "only proposed tool calls can be confirmed".into(),
+            ));
+        }
+        call.status = LocalAiToolCallStatus::Confirmed;
+        call.updated_at = Utc::now();
+        self.database.save_local_ai_tool_call(&call)?;
+        Ok(call)
+    }
+    pub fn cancel_local_ai_tool_call(&self, id: &str) -> Result<LocalAiToolCall> {
+        let mut call = self.database.get_local_ai_tool_call(id)?;
+        if call.status == LocalAiToolCallStatus::Executed {
+            return Err(crate::db::CoreError::Validation(
+                "executed tool calls cannot be canceled".into(),
+            ));
+        }
+        call.status = LocalAiToolCallStatus::Canceled;
+        call.updated_at = Utc::now();
+        self.database.save_local_ai_tool_call(&call)?;
+        Ok(call)
+    }
+    pub fn execute_local_ai_tool_call(&self, id: &str) -> Result<LocalAiToolCall> {
+        let mut call = self.database.get_local_ai_tool_call(id)?;
+        let tool = local_ai_tool(&call.tool_name)
+            .ok_or(crate::db::CoreError::NotFound("local AI tool"))?;
+        if tool.write && call.status != LocalAiToolCallStatus::Confirmed {
+            return Err(crate::db::CoreError::Validation(
+                "write tool calls require confirmation before execution".into(),
+            ));
+        }
+        match self.execute_known_local_ai_tool(&call) {
+            Ok(result) => {
+                call.result_json = Some(result.clone());
+                call.status = LocalAiToolCallStatus::Executed;
+                call.error_message = None;
+                call.updated_at = Utc::now();
+                self.database.save_local_ai_tool_call(&call)?;
+                let _ = self.database.append_local_ai_chat_message(
+                    &call.session_id,
+                    LocalAiChatRole::Tool,
+                    result.to_string(),
+                    None,
+                    Some(serde_json::json!({"tool_call_id": call.id})),
+                )?;
+                Ok(call)
+            }
+            Err(error) => {
+                call.status = LocalAiToolCallStatus::Failed;
+                call.error_message = Some(error.to_string());
+                call.updated_at = Utc::now();
+                self.database.save_local_ai_tool_call(&call)?;
+                Err(error)
+            }
+        }
+    }
+    async fn handle_local_ai_slash_command(
+        &self,
+        session: &mut LocalAiChatSession,
+        user_message: &LocalAiChatMessageRecord,
+        command: SlashCommand,
+    ) -> Result<()> {
+        let output = match command {
+            SlashCommand::Help => slash_help(),
+            SlashCommand::Plan => self.plan_day_with_ollama().await?.content,
+            SlashCommand::Board => serde_json::to_string_pretty(&self.database.board_state()?)
+                .map_err(|error| crate::db::CoreError::Validation(error.to_string()))?,
+            SlashCommand::Tasks(filter) => {
+                let mut tasks = self
+                    .database
+                    .query_tasks(TaskQueryFilter::default(), Some(TaskSort::default()))?;
+                if let Some(filter) = filter.as_deref() {
+                    tasks.retain(|item| match filter {
+                        "blocked" => {
+                            matches!(item.task.status, TaskStatus::Blocked | TaskStatus::Waiting)
+                        }
+                        "overdue" => item.task.due_at.is_some_and(|due| due < Utc::now()),
+                        _ => true,
+                    });
+                }
+                compact_task_lines(&tasks, 30)
+            }
+            SlashCommand::ScheduleToday => {
+                compact_task_lines(&self.database.get_schedule_today()?, 30)
+            }
+            SlashCommand::ScheduleWeek => {
+                compact_task_lines(&self.database.get_schedule_week()?, 30)
+            }
+            SlashCommand::Unscheduled => {
+                compact_task_lines(&self.database.get_unscheduled_tasks()?, 30)
+            }
+            SlashCommand::Models => {
+                let result = self.list_ollama_models().await?;
+                if !result.connected {
+                    result.error.unwrap_or_else(|| "Ollama unavailable".into())
+                } else if result.models.is_empty() {
+                    "No local Ollama models installed.".into()
+                } else {
+                    result
+                        .models
+                        .into_iter()
+                        .map(|model| model.name)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            }
+            SlashCommand::UseModel(model) => {
+                *session = self
+                    .database
+                    .update_local_ai_chat_session_model(&session.id, Some(model.clone()))?;
+                format!("Using model `{model}` for this session.")
+            }
+            SlashCommand::CreateTask(title) => {
+                self.database.create_local_ai_tool_call(
+                    &session.id,
+                    Some(user_message.id.clone()),
+                    "create_task".into(),
+                    serde_json::json!({ "title": title }),
+                    LocalAiToolCallStatus::Proposed,
+                )?;
+                "Proposed `create_task`. Confirm before execution.".into()
+            }
+            SlashCommand::CompleteTask(id) => {
+                self.database.create_local_ai_tool_call(
+                    &session.id,
+                    Some(user_message.id.clone()),
+                    "complete_task".into(),
+                    serde_json::json!({ "task_id": id }),
+                    LocalAiToolCallStatus::Proposed,
+                )?;
+                "Proposed `complete_task`. Confirm before execution.".into()
+            }
+            SlashCommand::StartTask(id) => {
+                self.database.create_local_ai_tool_call(
+                    &session.id,
+                    Some(user_message.id.clone()),
+                    "start_task".into(),
+                    serde_json::json!({ "task_id": id }),
+                    LocalAiToolCallStatus::Proposed,
+                )?;
+                "Proposed `start_task`. Confirm before execution.".into()
+            }
+        };
+        self.database.append_local_ai_chat_message(
+            &session.id,
+            LocalAiChatRole::Assistant,
+            output,
+            session.model.clone(),
+            None,
+        )?;
+        Ok(())
+    }
+
+    fn local_ai_chat_turn(&self, session: LocalAiChatSession) -> Result<LocalAiChatTurn> {
+        let messages = self.database.list_local_ai_chat_messages(&session.id)?;
+        let proposed_tool_calls = self
+            .database
+            .list_local_ai_tool_calls(&session.id)?
+            .into_iter()
+            .filter(|call| {
+                matches!(
+                    call.status,
+                    LocalAiToolCallStatus::Proposed | LocalAiToolCallStatus::Confirmed
+                )
+            })
+            .collect();
+        let assistant_output = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == LocalAiChatRole::Assistant)
+            .map(|message| message.content.clone());
+        Ok(LocalAiChatTurn {
+            session,
+            messages,
+            proposed_tool_calls,
+            assistant_output,
+        })
+    }
+
+    fn execute_known_local_ai_tool(&self, call: &LocalAiToolCall) -> Result<serde_json::Value> {
+        let args = &call.arguments_json;
+        let result = match call.tool_name.as_str() {
+            "get_summary" => serde_json::json!({
+                "organizations": self.database.list_organizations()?.len(),
+                "projects": self.database.list_projects()?.len(),
+                "tasks": self.database.list_tasks()?.len(),
+            }),
+            "get_board" => serde_json::to_value(self.database.board_state()?)?,
+            "get_daily_operations" => serde_json::json!({
+                "board": self.database.board_state()?,
+                "overdue": self.database.get_overdue_tasks()?,
+                "unscheduled": self.database.get_unscheduled_tasks()?,
+            }),
+            "get_schedule_day" => serde_json::to_value(self.database.get_schedule_today()?)?,
+            "get_schedule_week" => serde_json::to_value(self.database.get_schedule_week()?)?,
+            "list_tasks" => serde_json::to_value(self.database.list_tasks()?)?,
+            "list_projects" => serde_json::to_value(self.database.list_projects()?)?,
+            "list_organizations" => serde_json::to_value(self.database.list_organizations()?)?,
+            "get_task" => {
+                serde_json::to_value(self.database.get_task(required_arg(args, "task_id")?)?)?
+            }
+            "get_project" => serde_json::to_value(
+                self.database
+                    .get_project(required_arg(args, "project_id")?)?,
+            )?,
+            "create_organization" => {
+                serde_json::to_value(self.database.create_organization(NewOrganization {
+                    name: required_arg(args, "name")?.into(),
+                    slug: None,
+                    description: optional_arg(args, "description").map(str::to_owned),
+                    color: None,
+                    icon: None,
+                })?)?
+            }
+            "create_project" => serde_json::to_value(
+                self.database.create_project(NewProject {
+                    organization_id: optional_arg(args, "organization_id")
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            self.database
+                                .list_organizations()
+                                .ok()?
+                                .first()
+                                .map(|org| org.id.clone())
+                        })
+                        .ok_or(crate::db::CoreError::Validation(
+                            "organization_id is required".into(),
+                        ))?,
+                    name: required_arg(args, "name")?.into(),
+                    slug: None,
+                    description: optional_arg(args, "description").map(str::to_owned),
+                    project_type: Default::default(),
+                    status: Default::default(),
+                    priority: 3,
+                    deadline: None,
+                    repo_url: None,
+                    notes: None,
+                })?,
+            )?,
+            "create_task" => serde_json::to_value(
+                self.database.create_task(NewTask {
+                    project_id: optional_arg(args, "project_id")
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            self.database
+                                .list_projects()
+                                .ok()?
+                                .first()
+                                .map(|project| project.id.clone())
+                        })
+                        .ok_or(crate::db::CoreError::Validation(
+                            "project_id is required".into(),
+                        ))?,
+                    title: required_arg(args, "title")?.into(),
+                    description: optional_arg(args, "description").map(str::to_owned),
+                    status: Default::default(),
+                    priority: optional_i32_arg(args, "priority").unwrap_or(3),
+                    due_at: None,
+                    scheduled_at: None,
+                    estimated_minutes: None,
+                    time_limit_minutes: None,
+                    pinned: false,
+                    tags: Vec::new(),
+                })?,
+            )?,
+            "update_task" => serde_json::to_value(
+                self.database.update_task(
+                    required_arg(args, "task_id")?,
+                    TaskPatch {
+                        title: optional_arg(args, "title").map(str::to_owned),
+                        description: args
+                            .get("description")
+                            .and_then(|value| value.as_str())
+                            .map(|value| Some(value.to_owned())),
+                        status: None,
+                        priority: optional_i32_arg(args, "priority"),
+                        ..Default::default()
+                    },
+                )?,
+            )?,
+            "schedule_task" => serde_json::to_value(self.database.schedule_task(
+                required_arg(args, "task_id")?,
+                schedule_input_from_args(args)?,
+            )?)?,
+            "reschedule_task" => serde_json::to_value(self.database.reschedule_task(
+                required_arg(args, "task_id")?,
+                schedule_input_from_args(args)?,
+            )?)?,
+            "start_task" => serde_json::to_value(self.database.transition_task(
+                required_arg(args, "task_id")?,
+                TaskStatus::InProgress,
+                None,
+            )?)?,
+            "block_task" => serde_json::to_value(
+                self.database.transition_task(
+                    required_arg(args, "task_id")?,
+                    TaskStatus::Blocked,
+                    Some(
+                        optional_arg(args, "reason")
+                            .unwrap_or("Blocked by local AI proposal")
+                            .into(),
+                    ),
+                )?,
+            )?,
+            "complete_task" => serde_json::to_value(self.database.transition_task(
+                required_arg(args, "task_id")?,
+                TaskStatus::Done,
+                None,
+            )?)?,
+            _ => return Err(crate::db::CoreError::NotFound("local AI tool")),
+        };
+        Ok(result)
+    }
     pub fn export_tasks_json(&self) -> Result<String> {
         self.database.export_tasks_json()
     }
@@ -408,11 +879,106 @@ impl AppService {
     }
 }
 
+fn chat_title(message: &str) -> String {
+    let title = message.trim().chars().take(48).collect::<String>();
+    if title.is_empty() {
+        "Local AI chat".into()
+    } else {
+        title
+    }
+}
+
+fn scored_to_context(
+    scored: &crate::models::ScoredTask,
+    tasks: &[TaskWithContext],
+) -> TaskWithContext {
+    tasks
+        .iter()
+        .find(|item| item.task.id == scored.context.task.id)
+        .cloned()
+        .unwrap_or_else(|| TaskWithContext {
+            task: scored.context.task.clone(),
+            project_id: String::new(),
+            project_name: scored.context.project_name.clone(),
+            project_type: scored.context.project_type,
+            organization_id: String::new(),
+            organization_name: scored.context.organization_name.clone(),
+            organization_color: scored.context.organization_color.clone(),
+            organization_icon: None,
+            urgency_score: scored.urgency_score,
+            active_timer: None,
+        })
+}
+
+fn required_arg<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str> {
+    optional_arg(args, key)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| crate::db::CoreError::Validation(format!("{key} is required")))
+}
+
+fn optional_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    args.get(key).and_then(|value| value.as_str())
+}
+
+fn optional_i32_arg(args: &serde_json::Value, key: &str) -> Option<i32> {
+    args.get(key)
+        .and_then(|value| value.as_i64())
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+fn schedule_input_from_args(args: &serde_json::Value) -> Result<ScheduleTaskInput> {
+    Ok(ScheduleTaskInput {
+        start_at: DateTime::parse_from_rfc3339(required_arg(args, "start_at")?)
+            .map_err(|error| crate::db::CoreError::Validation(error.to_string()))?
+            .with_timezone(&Utc),
+        end_at: DateTime::parse_from_rfc3339(required_arg(args, "end_at")?)
+            .map_err(|error| crate::db::CoreError::Validation(error.to_string()))?
+            .with_timezone(&Utc),
+        timezone: optional_arg(args, "timezone").map(str::to_owned),
+        reminder_at: None,
+        deadline_at: None,
+        recurrence_rule: None,
+        recurrence_anchor_at: None,
+        recurrence_timezone: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::local_ai::{DEFAULT_OLLAMA_MODEL, prompt_messages};
-    use crate::models::{LocalAiSettingsPatch, NewOrganization, NewProject, NewTask, ProjectType};
+    use crate::models::{
+        LocalAiSettingsPatch, NewOrganization, NewProject, NewTask, ProjectType,
+        SendLocalAiChatMessageInput,
+    };
+
+    fn service_with_project() -> (AppService, Project) {
+        let database = Database::in_memory().unwrap();
+        let organization = database
+            .create_organization(NewOrganization {
+                name: "Test".into(),
+                slug: None,
+                description: None,
+                color: None,
+                icon: None,
+            })
+            .unwrap();
+        let project = database
+            .create_project(NewProject {
+                organization_id: organization.id,
+                name: "Project".into(),
+                slug: None,
+                description: None,
+                project_type: ProjectType::Software,
+                status: Default::default(),
+                priority: 3,
+                deadline: None,
+                repo_url: None,
+                notes: None,
+            })
+            .unwrap();
+        (AppService::new(database), project)
+    }
 
     #[tokio::test]
     async fn suggest_next_task_falls_back_when_ollama_is_unavailable() {
@@ -469,6 +1035,159 @@ mod tests {
 
         assert!(response.fallback_used);
         assert_eq!(response.fallback_task.unwrap().task.id, p1.id);
+    }
+
+    #[tokio::test]
+    async fn slash_help_and_board_return_messages() {
+        let service = AppService::new(Database::in_memory().unwrap());
+        let help = service
+            .send_local_ai_chat_message(SendLocalAiChatMessageInput {
+                session_id: None,
+                message: "/help".into(),
+                model: None,
+                context_scope: None,
+                allow_write_proposals: true,
+            })
+            .await
+            .unwrap();
+        assert!(help.assistant_output.unwrap().contains("/plan"));
+
+        let board = service
+            .send_local_ai_chat_message(SendLocalAiChatMessageInput {
+                session_id: Some(help.session.id),
+                message: "/board".into(),
+                model: None,
+                context_scope: None,
+                allow_write_proposals: true,
+            })
+            .await
+            .unwrap();
+        assert!(board.assistant_output.unwrap().contains("generated_at"));
+    }
+
+    #[tokio::test]
+    async fn slash_tasks_models_and_use_model_work() {
+        let (service, project) = service_with_project();
+        service
+            .database
+            .update_local_ai_settings(LocalAiSettingsPatch {
+                base_url: Some("http://127.0.0.1:9".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let task = service
+            .database
+            .create_task(NewTask {
+                project_id: project.id,
+                title: "Blocked task".into(),
+                description: None,
+                status: TaskStatus::Blocked,
+                priority: 1,
+                due_at: None,
+                scheduled_at: None,
+                estimated_minutes: None,
+                time_limit_minutes: None,
+                pinned: false,
+                tags: Vec::new(),
+            })
+            .unwrap();
+        let blocked = service
+            .run_local_ai_slash_command(None, "/tasks blocked".into())
+            .await
+            .unwrap();
+        assert!(blocked.assistant_output.unwrap().contains(&task.title));
+
+        let models = service
+            .run_local_ai_slash_command(Some(blocked.session.id.clone()), "/models".into())
+            .await
+            .unwrap();
+        assert!(models.assistant_output.unwrap().contains("Ollama"));
+
+        let switched = service
+            .run_local_ai_slash_command(Some(blocked.session.id), "/use llama3.2:3b".into())
+            .await
+            .unwrap();
+        assert_eq!(switched.session.model.as_deref(), Some("llama3.2:3b"));
+    }
+
+    #[tokio::test]
+    async fn write_slash_command_proposes_and_confirmation_gates_execution() {
+        let (service, _) = service_with_project();
+        let turn = service
+            .run_local_ai_slash_command(None, "/create task Confirm me".into())
+            .await
+            .unwrap();
+        let call = turn.proposed_tool_calls.first().unwrap();
+        assert_eq!(call.status, LocalAiToolCallStatus::Proposed);
+
+        let error = service.execute_local_ai_tool_call(&call.id).unwrap_err();
+        assert!(matches!(error, crate::db::CoreError::Validation(_)));
+
+        service.confirm_local_ai_tool_call(&call.id).unwrap();
+        let executed = service.execute_local_ai_tool_call(&call.id).unwrap();
+        assert_eq!(executed.status, LocalAiToolCallStatus::Executed);
+        assert!(
+            service
+                .database
+                .list_tasks()
+                .unwrap()
+                .iter()
+                .any(|task| task.title == "Confirm me")
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_tool_call_does_not_execute() {
+        let (service, _) = service_with_project();
+        let turn = service
+            .run_local_ai_slash_command(None, "/create task Do not create".into())
+            .await
+            .unwrap();
+        let id = turn.proposed_tool_calls[0].id.clone();
+        service.cancel_local_ai_tool_call(&id).unwrap();
+        assert!(service.execute_local_ai_tool_call(&id).is_err());
+        assert!(
+            !service
+                .database
+                .list_tasks()
+                .unwrap()
+                .iter()
+                .any(|task| task.title == "Do not create")
+        );
+    }
+
+    #[tokio::test]
+    async fn context_and_empty_db_chat_are_safe() {
+        let service = AppService::new(Database::in_memory().unwrap());
+        service
+            .database
+            .update_local_ai_settings(LocalAiSettingsPatch {
+                base_url: Some("http://127.0.0.1:9".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            service
+                .build_local_ai_chat_context(LocalAiContextScope::Daily)
+                .unwrap()
+                .contains("P1 is highest priority")
+        );
+
+        let turn = service
+            .send_local_ai_chat_message(SendLocalAiChatMessageInput {
+                session_id: None,
+                message: "Plan my day".into(),
+                model: None,
+                context_scope: Some(LocalAiContextScope::Daily),
+                allow_write_proposals: false,
+            })
+            .await
+            .unwrap();
+        assert!(
+            turn.assistant_output
+                .unwrap()
+                .contains("Local AI unavailable")
+        );
     }
 
     #[tokio::test]

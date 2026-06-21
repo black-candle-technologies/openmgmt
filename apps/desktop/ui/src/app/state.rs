@@ -94,6 +94,9 @@ pub struct AppState {
     pub notice: RwSignal<Option<String>>,
     pub loading: RwSignal<bool>,
     pub drawer: RwSignal<Option<Drawer>>,
+    /// Whether the global Local AI chat overlay is open. Lives here so the
+    /// top-bar launcher (and any page) can toggle it without prop drilling.
+    pub chat_open: RwSignal<bool>,
     /// Wall-clock time of the last successful data load. Used by the board to
     /// show a "last refreshed" timestamp without blanking existing data.
     pub synced_at: RwSignal<Option<DateTime<Utc>>>,
@@ -109,6 +112,7 @@ impl AppState {
             notice: RwSignal::new(None),
             loading: RwSignal::new(true),
             drawer: RwSignal::new(None),
+            chat_open: RwSignal::new(false),
             synced_at: RwSignal::new(None),
             refresh_token: RwSignal::new(0),
             board_refresh_token: RwSignal::new(0),

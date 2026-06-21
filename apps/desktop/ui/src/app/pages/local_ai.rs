@@ -6,7 +6,6 @@
 use leptos::prelude::*;
 use openmgmt_core::{
     LocalAiConnectionResult, LocalAiModelListResult, LocalAiSettings, LocalAiSettingsPatch,
-    LocalAiWorkflowResponse,
 };
 use serde_json::json;
 use wasm_bindgen_futures::spawn_local;
@@ -38,11 +37,6 @@ struct LocalAiView {
     action: RwSignal<Option<&'static str>>,
     error: RwSignal<Option<String>>,
     notice: RwSignal<Option<String>>,
-    // Action panel selections + result.
-    project_id: RwSignal<String>,
-    task_id: RwSignal<String>,
-    instruction: RwSignal<String>,
-    result: RwSignal<Option<(String, LocalAiWorkflowResponse)>>,
 }
 
 impl LocalAiView {
@@ -61,10 +55,6 @@ impl LocalAiView {
             action: RwSignal::new(None),
             error: RwSignal::new(None),
             notice: RwSignal::new(None),
-            project_id: RwSignal::new(String::new()),
-            task_id: RwSignal::new(String::new()),
-            instruction: RwSignal::new(String::new()),
-            result: RwSignal::new(None),
         }
     }
 
@@ -223,63 +213,6 @@ pub fn LocalAiPage(state: AppState) -> impl IntoView {
         });
     };
 
-    // A workflow action that takes no extra args (plan / suggest / triage).
-    let run_simple = move |label: &'static str, command: &'static str| {
-        view.start(label);
-        view.result.set(None);
-        spawn_local(async move {
-            run_workflow(view, label, command, json!({})).await;
-            view.finish();
-        });
-    };
-
-    let summarize = move || {
-        let project_id = view.project_id.get();
-        if project_id.is_empty() {
-            view.error
-                .set(Some("Select a project to summarize.".into()));
-            return;
-        }
-        view.start("summarize");
-        view.result.set(None);
-        spawn_local(async move {
-            run_workflow(
-                view,
-                "summarize",
-                "summarize_project_with_local_ai",
-                json!({ "projectId": project_id }),
-            )
-            .await;
-            view.finish();
-        });
-    };
-
-    let rewrite = move || {
-        let task_id = view.task_id.get();
-        if task_id.is_empty() {
-            view.error.set(Some("Select a task to rewrite.".into()));
-            return;
-        }
-        let instruction = view.instruction.get();
-        let instruction = if instruction.trim().is_empty() {
-            "Make it clearer and more actionable.".to_owned()
-        } else {
-            instruction
-        };
-        view.start("rewrite");
-        view.result.set(None);
-        spawn_local(async move {
-            run_workflow(
-                view,
-                "rewrite",
-                "rewrite_task_description_with_local_ai",
-                json!({ "taskId": task_id, "instruction": instruction }),
-            )
-            .await;
-            view.finish();
-        });
-    };
-
     let busy = move || view.action.get().is_some();
 
     view! {
@@ -431,146 +364,20 @@ pub fn LocalAiPage(state: AppState) -> impl IntoView {
                 </div>
             </Panel>
 
-            // --- Actions ---------------------------------------------------
+            // --- Command chat launcher -------------------------------------
             <Panel class="localai-actions">
-                <div class="section-head"><div class="section-head-title"><h2>"Run a local action"</h2></div></div>
+                <div class="section-head"><div class="section-head-title"><h2>"Command chat"</h2></div></div>
                 <p class="settings-note">
-                    "These read your data and return suggestions. They never change anything on their own."
+                    "Open the Local AI chat to ask about your work, run slash commands like "
+                    <code>"/plan"</code>" or "<code>"/board"</code>", and confirm safe write actions. \
+                     It reads your data and never changes anything without your confirmation."
                 </p>
-
                 <div class="localai-action-buttons">
-                    <button class="btn btn-primary" disabled=busy on:click=move |_| run_simple("plan", "plan_day_with_local_ai")>
-                        {move || if view.action.get() == Some("plan") { "Planning…" } else { "Plan my day" }}
-                    </button>
-                    <button class="btn btn-ghost" disabled=busy on:click=move |_| run_simple("suggest", "suggest_next_task_with_local_ai")>
-                        {move || if view.action.get() == Some("suggest") { "Thinking…" } else { "Suggest next task" }}
-                    </button>
-                    <button class="btn btn-ghost" disabled=busy on:click=move |_| run_simple("triage", "triage_tasks_with_local_ai")>
-                        {move || if view.action.get() == Some("triage") { "Triaging…" } else { "Triage tasks" }}
+                    <button class="btn btn-primary" on:click=move |_| state.chat_open.set(true)>
+                        "Open chat"
                     </button>
                 </div>
-
-                // Summarize project
-                <div class="localai-action-row">
-                    {move || {
-                        let projects = state.snapshot.get().projects;
-                        if projects.is_empty() {
-                            view! { <p class="localai-empty">"No projects yet — create one to summarize it."</p> }.into_any()
-                        } else {
-                            view! {
-                                <FormField label="Summarize project">
-                                    <select
-                                        prop:value=move || view.project_id.get()
-                                        on:change=move |event| view.project_id.set(event_target_value(&event))
-                                    >
-                                        <option value="">"Select a project…"</option>
-                                        <For each=move || state.snapshot.get().projects key=|p| p.id.clone() let:project>
-                                            <option value=project.id.clone()>{project.name.clone()}</option>
-                                        </For>
-                                    </select>
-                                </FormField>
-                                <button class="btn btn-ghost localai-go" disabled=busy on:click=move |_| summarize()>
-                                    {move || if view.action.get() == Some("summarize") { "Summarizing…" } else { "Summarize" }}
-                                </button>
-                            }.into_any()
-                        }
-                    }}
-                </div>
-
-                // Rewrite task description
-                <div class="localai-action-row localai-action-rewrite">
-                    {move || {
-                        let tasks = state.snapshot.get().tasks;
-                        if tasks.is_empty() {
-                            view! { <p class="localai-empty">"No tasks yet — create one to rewrite its description."</p> }.into_any()
-                        } else {
-                            view! {
-                                <FormField label="Rewrite task description">
-                                    <select
-                                        prop:value=move || view.task_id.get()
-                                        on:change=move |event| view.task_id.set(event_target_value(&event))
-                                    >
-                                        <option value="">"Select a task…"</option>
-                                        <For each=move || state.snapshot.get().tasks key=|t| t.id.clone() let:task>
-                                            <option value=task.id.clone()>{task.title.clone()}</option>
-                                        </For>
-                                    </select>
-                                </FormField>
-                                <FormField label="Instruction (optional)">
-                                    <input
-                                        type="text"
-                                        placeholder="Make it clearer and more actionable."
-                                        prop:value=move || view.instruction.get()
-                                        on:input=move |event| view.instruction.set(event_target_value(&event))
-                                    />
-                                </FormField>
-                                <button class="btn btn-ghost localai-go" disabled=busy on:click=move |_| rewrite()>
-                                    {move || if view.action.get() == Some("rewrite") { "Rewriting…" } else { "Suggest rewrite" }}
-                                </button>
-                                <p class="localai-empty">"The suggestion is shown below and is never saved automatically."</p>
-                            }.into_any()
-                        }
-                    }}
-                </div>
-
-                // Result panel
-                {move || view.result.get().map(|(label, response)| result_view(label, response))}
             </Panel>
-        </div>
-    }
-}
-
-/// Runs a workflow command, storing the `(label, response)` result or surfacing
-/// an error. Workflow commands return a `LocalAiWorkflowResponse` whose own
-/// `error` field is set when Ollama was unavailable, so we check both layers.
-async fn run_workflow(
-    view: LocalAiView,
-    label: &'static str,
-    command: &str,
-    args: serde_json::Value,
-) {
-    match invoke::<LocalAiWorkflowResponse>(command, args).await {
-        Ok(response) => {
-            if let Some(error) = response.error.clone() {
-                view.error
-                    .set(Some(friendly_error(&error, &view.base_url.get())));
-                // A fallback (e.g. suggest-next-task) is still useful to show.
-                if response.fallback_used {
-                    view.result.set(Some((label.to_owned(), response)));
-                }
-            } else {
-                view.result.set(Some((label.to_owned(), response)));
-            }
-        }
-        Err(error) => view
-            .error
-            .set(Some(friendly_error(&error, &view.base_url.get()))),
-    }
-}
-
-fn result_view(label: String, response: LocalAiWorkflowResponse) -> impl IntoView {
-    let model = response.model.clone().unwrap_or_else(|| "—".into());
-    let fallback = response.fallback_used.then(|| {
-        let title = response
-            .fallback_task
-            .as_ref()
-            .map(|task| task.task.title.clone())
-            .unwrap_or_default();
-        view! {
-            <p class="localai-fallback">
-                "Ollama was unavailable, so this is a non-AI fallback by urgency"
-                {(!title.is_empty()).then(|| format!(": {title}"))}"."
-            </p>
-        }
-    });
-    view! {
-        <div class="localai-result">
-            <div class="localai-result-head">
-                <span class="localai-result-label">{action_title(&label)}</span>
-                <span class="localai-result-model">"Model: "{model}</span>
-            </div>
-            {fallback}
-            <pre class="localai-result-body">{response.content}</pre>
         </div>
     }
 }
@@ -693,17 +500,6 @@ fn friendly_error(error: &str, base_url: &str) -> String {
         return format!("Model not found. Try `ollama pull {DEFAULT_MODEL}`, then refresh models.");
     }
     error.to_owned()
-}
-
-fn action_title(label: &str) -> &'static str {
-    match label {
-        "plan" => "Plan for today",
-        "suggest" => "Next task",
-        "triage" => "Triage",
-        "summarize" => "Project summary",
-        "rewrite" => "Suggested description",
-        _ => "Result",
-    }
 }
 
 /// Parse the temperature input: blank clears it, otherwise it must be a number.

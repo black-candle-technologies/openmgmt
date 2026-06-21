@@ -93,6 +93,30 @@ string_enum!(CalendarBlockStatus {
     Canceled => "canceled",
 });
 
+string_enum!(LocalAiChatRole {
+    User => "user",
+    Assistant => "assistant",
+    System => "system",
+    Tool => "tool",
+});
+
+string_enum!(LocalAiToolCallStatus {
+    Proposed => "proposed",
+    Confirmed => "confirmed",
+    Executed => "executed",
+    Failed => "failed",
+    Canceled => "canceled",
+});
+
+string_enum!(LocalAiContextScope {
+    Minimal => "minimal",
+    Daily => "daily",
+    Project => "project",
+    Task => "task",
+    Schedule => "schedule",
+    FullSummary => "full_summary",
+});
+
 string_enum!(AiProviderKind {
     OpenAi => "openai",
     Anthropic => "anthropic",
@@ -234,6 +258,73 @@ pub struct LocalAiWorkflowResponse {
     pub fallback_used: bool,
     pub fallback_task: Option<TaskWithContext>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAiChatSession {
+    pub id: String,
+    pub title: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub archived_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAiChatMessageRecord {
+    pub id: String,
+    pub session_id: String,
+    pub role: LocalAiChatRole,
+    pub content: String,
+    pub model: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub metadata_json: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAiToolCall {
+    pub id: String,
+    pub session_id: String,
+    pub message_id: Option<String>,
+    pub tool_name: String,
+    pub arguments_json: serde_json::Value,
+    pub result_json: Option<serde_json::Value>,
+    pub status: LocalAiToolCallStatus,
+    pub error_message: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAiToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub write: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendLocalAiChatMessageInput {
+    pub session_id: Option<String>,
+    pub message: String,
+    pub model: Option<String>,
+    pub context_scope: Option<LocalAiContextScope>,
+    #[serde(default)]
+    pub allow_write_proposals: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAiChatTurn {
+    pub session: LocalAiChatSession,
+    pub messages: Vec<LocalAiChatMessageRecord>,
+    pub proposed_tool_calls: Vec<LocalAiToolCall>,
+    pub assistant_output: Option<String>,
+}
+
+impl Default for LocalAiContextScope {
+    fn default() -> Self {
+        Self::Daily
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

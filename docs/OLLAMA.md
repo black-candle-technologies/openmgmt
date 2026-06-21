@@ -1,6 +1,6 @@
 # OpenMgmt Ollama Integration
 
-OpenMgmt can use a local Ollama server for read-only planning workflows. Data is sent only to the configured local Ollama base URL.
+OpenMgmt can use a local Ollama server for local AI command chat and planning workflows. Data is sent only to the configured local Ollama base URL.
 
 ## Setup
 
@@ -34,11 +34,17 @@ OpenMgmt can:
 - Test the local Ollama connection with `/api/version`
 - List installed local models with `/api/tags`
 - Run a simple prompt with `/api/chat`
+- Persist local AI chat sessions and messages
+- Switch models per chat session with `/use <model>`
+- Run deterministic slash commands such as `/board`, `/tasks blocked`, and `/schedule today`
+- Propose write tools that require confirmation before execution
 - Plan the day from board and schedule context
 - Suggest the next task
 - Triage overdue, blocked, due-soon, and unscheduled tasks
 - Summarize a project
 - Suggest a rewritten task description without saving it
+
+See `docs/LOCAL_AI_CHAT.md` for the chat/tool flow.
 
 ## Privacy
 

@@ -2,6 +2,7 @@
 //! (sidebar + top bar + routed content), and the dedicated TV board entry.
 
 pub mod board;
+pub mod chat;
 pub mod components;
 pub mod forms;
 pub mod pages;
@@ -122,6 +123,7 @@ pub fn App() -> impl IntoView {
                 </main>
             </div>
             <DrawerHost state now />
+            <chat::LocalAiChat state page />
         </div>
     }
     .into_any()
@@ -197,6 +199,7 @@ fn TopBar(state: AppState, page: RwSignal<Page>) -> impl IntoView {
                 </span>
             </div>
             <div class="topbar-actions">
+                <Button variant="ghost" on_click=Callback::new(move |_| state.chat_open.update(|open| *open = !*open))>"Local AI"</Button>
                 <Button variant="ghost" on_click=Callback::new(move |_| state.refresh())>"Refresh"</Button>
                 <Button variant="primary" on_click=Callback::new(move |_| {
                     spawn_local(async move {

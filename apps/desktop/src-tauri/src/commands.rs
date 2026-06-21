@@ -1,12 +1,13 @@
 use chrono::{DateTime, Utc};
 use openmgmt_core::{
-    AppService, BoardState, CalendarBlock, LocalAiChatResponse, LocalAiConnectionResult,
-    LocalAiModelListResult, LocalAiSettings, LocalAiSettingsPatch, LocalAiWorkflowResponse,
-    NewOrganization, NewProject, NewSavedTaskView, NewTask, Organization, OrganizationPatch,
-    Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch, ScheduleConflict, ScheduleTaskInput,
-    ScheduledBlockCompletion, ScoringSettings, ScoringSettingsPatch, SyncSettings,
-    SyncSettingsPatch, SyncStatus, Task, TaskPatch, TaskQueryFilter, TaskSort, TaskTimerSession,
-    TaskWithContext, TimeBlockSuggestion,
+    AppService, BoardState, CalendarBlock, LocalAiChatMessageRecord, LocalAiChatResponse,
+    LocalAiChatSession, LocalAiChatTurn, LocalAiConnectionResult, LocalAiModelListResult,
+    LocalAiSettings, LocalAiSettingsPatch, LocalAiToolCall, LocalAiToolDefinition,
+    LocalAiWorkflowResponse, NewOrganization, NewProject, NewSavedTaskView, NewTask, Organization,
+    OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch, ScheduleConflict,
+    ScheduleTaskInput, ScheduledBlockCompletion, ScoringSettings, ScoringSettingsPatch,
+    SendLocalAiChatMessageInput, SyncSettings, SyncSettingsPatch, SyncStatus, Task, TaskPatch,
+    TaskQueryFilter, TaskSort, TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
 };
 use openmgmt_sync_client::{SyncConnectionTestResult, SyncOnceResult};
 use std::path::{Component, Path, PathBuf};
@@ -456,6 +457,88 @@ pub async fn rewrite_task_description_with_local_ai(
     core(
         service
             .rewrite_task_description_with_ollama(&task_id, &instruction)
+            .await,
+    )
+}
+
+#[tauri::command]
+pub fn list_local_ai_chat_sessions(
+    service: State<'_, AppService>,
+) -> CommandResult<Vec<LocalAiChatSession>> {
+    core(service.list_local_ai_chat_sessions())
+}
+
+#[tauri::command]
+pub fn create_local_ai_chat_session(
+    service: State<'_, AppService>,
+    title: Option<String>,
+    model: Option<String>,
+) -> CommandResult<LocalAiChatSession> {
+    core(service.create_local_ai_chat_session(title, model))
+}
+
+#[tauri::command]
+pub fn archive_local_ai_chat_session(
+    service: State<'_, AppService>,
+    id: String,
+) -> CommandResult<LocalAiChatSession> {
+    core(service.archive_local_ai_chat_session(&id))
+}
+
+#[tauri::command]
+pub fn list_local_ai_chat_messages(
+    service: State<'_, AppService>,
+    session_id: String,
+) -> CommandResult<Vec<LocalAiChatMessageRecord>> {
+    core(service.list_local_ai_chat_messages(&session_id))
+}
+
+#[tauri::command]
+pub async fn send_local_ai_chat_message(
+    service: State<'_, AppService>,
+    input: SendLocalAiChatMessageInput,
+) -> CommandResult<LocalAiChatTurn> {
+    core(service.send_local_ai_chat_message(input).await)
+}
+
+#[tauri::command]
+pub fn confirm_local_ai_tool_call(
+    service: State<'_, AppService>,
+    id: String,
+) -> CommandResult<LocalAiToolCall> {
+    core(service.confirm_local_ai_tool_call(&id))
+}
+
+#[tauri::command]
+pub fn cancel_local_ai_tool_call(
+    service: State<'_, AppService>,
+    id: String,
+) -> CommandResult<LocalAiToolCall> {
+    core(service.cancel_local_ai_tool_call(&id))
+}
+
+#[tauri::command]
+pub fn execute_local_ai_tool_call(
+    service: State<'_, AppService>,
+    id: String,
+) -> CommandResult<LocalAiToolCall> {
+    core(service.execute_local_ai_tool_call(&id))
+}
+
+#[tauri::command]
+pub fn list_local_ai_tools(service: State<'_, AppService>) -> Vec<LocalAiToolDefinition> {
+    service.list_local_ai_tools()
+}
+
+#[tauri::command]
+pub async fn run_local_ai_slash_command(
+    service: State<'_, AppService>,
+    session_id: Option<String>,
+    command: String,
+) -> CommandResult<LocalAiChatTurn> {
+    core(
+        service
+            .run_local_ai_slash_command(session_id, command)
             .await,
     )
 }

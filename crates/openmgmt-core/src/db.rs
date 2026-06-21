@@ -8,9 +8,10 @@ use crate::{
     },
     models::{
         ActiveTimerInfo, BoardState, CalendarBlock, CalendarBlockSource, CalendarBlockStatus,
-        LocalAiSettings, LocalAiSettingsPatch, NewOrganization, NewProject, NewSavedTaskView,
-        NewTask, Organization, OrganizationPatch, Project, ProjectPatch, RecurrenceRule,
-        SavedTaskView, SavedTaskViewPatch, ScheduleConflict, ScheduleTaskInput,
+        LocalAiChatMessageRecord, LocalAiChatRole, LocalAiChatSession, LocalAiSettings,
+        LocalAiSettingsPatch, LocalAiToolCall, LocalAiToolCallStatus, NewOrganization, NewProject,
+        NewSavedTaskView, NewTask, Organization, OrganizationPatch, Project, ProjectPatch,
+        RecurrenceRule, SavedTaskView, SavedTaskViewPatch, ScheduleConflict, ScheduleTaskInput,
         ScheduledBlockCompletion, ScoringSettings, ScoringSettingsPatch, Task, TaskContext,
         TaskPatch, TaskQueryFilter, TaskSort, TaskSortField, TaskStatus, TaskTimerSession,
         TaskWithContext, TimeBlockSuggestion,
@@ -53,6 +54,8 @@ pub enum CoreError {
     LockPoisoned,
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("serialization error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
@@ -230,6 +233,42 @@ impl Database {
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS local_ai_chat_sessions (
+              id TEXT PRIMARY KEY NOT NULL,
+              title TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              model TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              archived_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS local_ai_chat_sessions_updated_idx
+              ON local_ai_chat_sessions(updated_at);
+            CREATE TABLE IF NOT EXISTS local_ai_chat_messages (
+              id TEXT PRIMARY KEY NOT NULL,
+              session_id TEXT NOT NULL REFERENCES local_ai_chat_sessions(id),
+              role TEXT NOT NULL,
+              content TEXT NOT NULL,
+              model TEXT,
+              created_at TEXT NOT NULL,
+              metadata_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS local_ai_chat_messages_session_idx
+              ON local_ai_chat_messages(session_id, created_at);
+            CREATE TABLE IF NOT EXISTS local_ai_tool_calls (
+              id TEXT PRIMARY KEY NOT NULL,
+              session_id TEXT NOT NULL REFERENCES local_ai_chat_sessions(id),
+              message_id TEXT REFERENCES local_ai_chat_messages(id),
+              tool_name TEXT NOT NULL,
+              arguments_json TEXT NOT NULL,
+              result_json TEXT,
+              status TEXT NOT NULL,
+              error_message TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS local_ai_tool_calls_session_idx
+              ON local_ai_tool_calls(session_id, created_at);
             CREATE TABLE IF NOT EXISTS sync_events (
               event_id TEXT PRIMARY KEY NOT NULL,
               device_id TEXT NOT NULL,
@@ -2149,6 +2188,156 @@ impl Database {
         Ok(settings)
     }
 
+    pub fn list_local_ai_chat_sessions(&self) -> Result<Vec<LocalAiChatSession>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,title,provider,model,created_at,updated_at,archived_at
+             FROM local_ai_chat_sessions WHERE archived_at IS NULL ORDER BY updated_at DESC",
+        )?;
+        Ok(statement
+            .query_map([], map_local_ai_chat_session)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn create_local_ai_chat_session(
+        &self,
+        title: Option<String>,
+        model: Option<String>,
+    ) -> Result<LocalAiChatSession> {
+        let now = Utc::now();
+        let settings = self.get_local_ai_settings()?;
+        let session = LocalAiChatSession {
+            id: Uuid::new_v4().to_string(),
+            title: title
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "Local AI chat".into()),
+            provider: "ollama".into(),
+            model: model.or(settings.default_model),
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+        };
+        let connection = self.connection()?;
+        save_local_ai_chat_session_with_connection(&connection, &session)?;
+        Ok(session)
+    }
+
+    pub fn get_local_ai_chat_session(&self, id: &str) -> Result<LocalAiChatSession> {
+        let connection = self.connection()?;
+        get_local_ai_chat_session_with_connection(&connection, id)
+    }
+
+    pub fn update_local_ai_chat_session_model(
+        &self,
+        id: &str,
+        model: Option<String>,
+    ) -> Result<LocalAiChatSession> {
+        let mut session = self.get_local_ai_chat_session(id)?;
+        session.model = model;
+        session.updated_at = Utc::now();
+        let connection = self.connection()?;
+        save_local_ai_chat_session_with_connection(&connection, &session)?;
+        Ok(session)
+    }
+
+    pub fn archive_local_ai_chat_session(&self, id: &str) -> Result<LocalAiChatSession> {
+        let mut session = self.get_local_ai_chat_session(id)?;
+        let now = Utc::now();
+        session.archived_at = Some(now);
+        session.updated_at = now;
+        let connection = self.connection()?;
+        save_local_ai_chat_session_with_connection(&connection, &session)?;
+        Ok(session)
+    }
+
+    pub fn list_local_ai_chat_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<LocalAiChatMessageRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,session_id,role,content,model,created_at,metadata_json
+             FROM local_ai_chat_messages WHERE session_id=?1 ORDER BY created_at,id",
+        )?;
+        Ok(statement
+            .query_map([session_id], map_local_ai_chat_message)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn append_local_ai_chat_message(
+        &self,
+        session_id: &str,
+        role: LocalAiChatRole,
+        content: String,
+        model: Option<String>,
+        metadata_json: Option<serde_json::Value>,
+    ) -> Result<LocalAiChatMessageRecord> {
+        let now = Utc::now();
+        let message = LocalAiChatMessageRecord {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.into(),
+            role,
+            content,
+            model,
+            created_at: now,
+            metadata_json,
+        };
+        let mut session = self.get_local_ai_chat_session(session_id)?;
+        session.updated_at = now;
+        let connection = self.connection()?;
+        insert_local_ai_chat_message_with_connection(&connection, &message)?;
+        save_local_ai_chat_session_with_connection(&connection, &session)?;
+        Ok(message)
+    }
+
+    pub fn create_local_ai_tool_call(
+        &self,
+        session_id: &str,
+        message_id: Option<String>,
+        tool_name: String,
+        arguments_json: serde_json::Value,
+        status: LocalAiToolCallStatus,
+    ) -> Result<LocalAiToolCall> {
+        let now = Utc::now();
+        let call = LocalAiToolCall {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.into(),
+            message_id,
+            tool_name,
+            arguments_json,
+            result_json: None,
+            status,
+            error_message: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let connection = self.connection()?;
+        save_local_ai_tool_call_with_connection(&connection, &call)?;
+        Ok(call)
+    }
+
+    pub fn get_local_ai_tool_call(&self, id: &str) -> Result<LocalAiToolCall> {
+        let connection = self.connection()?;
+        get_local_ai_tool_call_with_connection(&connection, id)
+    }
+
+    pub fn list_local_ai_tool_calls(&self, session_id: &str) -> Result<Vec<LocalAiToolCall>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,session_id,message_id,tool_name,arguments_json,result_json,status,
+                    error_message,created_at,updated_at
+             FROM local_ai_tool_calls WHERE session_id=?1 ORDER BY created_at,id",
+        )?;
+        Ok(statement
+            .query_map([session_id], map_local_ai_tool_call)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn save_local_ai_tool_call(&self, call: &LocalAiToolCall) -> Result<()> {
+        let connection = self.connection()?;
+        save_local_ai_tool_call_with_connection(&connection, call)
+    }
+
     pub fn export_tasks_json(&self) -> Result<String> {
         serde_json::to_string_pretty(&self.query_tasks(TaskQueryFilter::default(), None)?)
             .map_err(|error| CoreError::Validation(format!("could not export tasks: {error}")))
@@ -3161,6 +3350,52 @@ fn map_local_ai_settings(row: &Row<'_>) -> rusqlite::Result<LocalAiSettings> {
     })
 }
 
+fn map_local_ai_chat_session(row: &Row<'_>) -> rusqlite::Result<LocalAiChatSession> {
+    Ok(LocalAiChatSession {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        provider: row.get(2)?,
+        model: row.get(3)?,
+        created_at: parse_time(row.get(4)?)?,
+        updated_at: parse_time(row.get(5)?)?,
+        archived_at: parse_optional_time(row.get(6)?)?,
+    })
+}
+
+fn map_local_ai_chat_message(row: &Row<'_>) -> rusqlite::Result<LocalAiChatMessageRecord> {
+    let metadata_json = row
+        .get::<_, Option<String>>(6)?
+        .map(|value| serde_json::from_str(&value).unwrap_or(serde_json::Value::Null));
+    Ok(LocalAiChatMessageRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        role: parse_enum(row.get::<_, String>(2)?)?,
+        content: row.get(3)?,
+        model: row.get(4)?,
+        created_at: parse_time(row.get(5)?)?,
+        metadata_json,
+    })
+}
+
+fn map_local_ai_tool_call(row: &Row<'_>) -> rusqlite::Result<LocalAiToolCall> {
+    let arguments_json = row.get::<_, String>(4)?;
+    let result_json = row
+        .get::<_, Option<String>>(5)?
+        .map(|value| serde_json::from_str(&value).unwrap_or(serde_json::Value::Null));
+    Ok(LocalAiToolCall {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        message_id: row.get(2)?,
+        tool_name: row.get(3)?,
+        arguments_json: serde_json::from_str(&arguments_json).unwrap_or(serde_json::Value::Null),
+        result_json,
+        status: parse_enum(row.get::<_, String>(6)?)?,
+        error_message: row.get(7)?,
+        created_at: parse_time(row.get(8)?)?,
+        updated_at: parse_time(row.get(9)?)?,
+    })
+}
+
 fn insert_saved_task_view_with_connection(
     connection: &Connection,
     view: &SavedTaskView,
@@ -3359,6 +3594,118 @@ fn save_local_ai_settings_with_connection(
             settings.last_error,
             timestamp(settings.created_at),
             timestamp(settings.updated_at),
+        ],
+    )?;
+    Ok(())
+}
+
+fn get_local_ai_chat_session_with_connection(
+    connection: &Connection,
+    id: &str,
+) -> Result<LocalAiChatSession> {
+    connection
+        .query_row(
+            "SELECT id,title,provider,model,created_at,updated_at,archived_at
+             FROM local_ai_chat_sessions WHERE id=?1",
+            [id],
+            map_local_ai_chat_session,
+        )
+        .optional()?
+        .ok_or(CoreError::NotFound("local AI chat session"))
+}
+
+fn save_local_ai_chat_session_with_connection(
+    connection: &Connection,
+    session: &LocalAiChatSession,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO local_ai_chat_sessions (id,title,provider,model,created_at,updated_at,archived_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(id) DO UPDATE SET
+            title=excluded.title,
+            provider=excluded.provider,
+            model=excluded.model,
+            updated_at=excluded.updated_at,
+            archived_at=excluded.archived_at",
+        params![
+            session.id,
+            session.title,
+            session.provider,
+            session.model,
+            timestamp(session.created_at),
+            timestamp(session.updated_at),
+            session.archived_at.map(timestamp),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_local_ai_chat_message_with_connection(
+    connection: &Connection,
+    message: &LocalAiChatMessageRecord,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO local_ai_chat_messages
+            (id,session_id,role,content,model,created_at,metadata_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            message.id,
+            message.session_id,
+            message.role.to_string(),
+            message.content,
+            message.model,
+            timestamp(message.created_at),
+            message
+                .metadata_json
+                .as_ref()
+                .map(|value| value.to_string()),
+        ],
+    )?;
+    Ok(())
+}
+
+fn get_local_ai_tool_call_with_connection(
+    connection: &Connection,
+    id: &str,
+) -> Result<LocalAiToolCall> {
+    connection
+        .query_row(
+            "SELECT id,session_id,message_id,tool_name,arguments_json,result_json,status,
+                    error_message,created_at,updated_at
+             FROM local_ai_tool_calls WHERE id=?1",
+            [id],
+            map_local_ai_tool_call,
+        )
+        .optional()?
+        .ok_or(CoreError::NotFound("local AI tool call"))
+}
+
+fn save_local_ai_tool_call_with_connection(
+    connection: &Connection,
+    call: &LocalAiToolCall,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO local_ai_tool_calls (
+            id,session_id,message_id,tool_name,arguments_json,result_json,status,
+            error_message,created_at,updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+         ON CONFLICT(id) DO UPDATE SET
+            message_id=excluded.message_id,
+            result_json=excluded.result_json,
+            status=excluded.status,
+            error_message=excluded.error_message,
+            updated_at=excluded.updated_at",
+        params![
+            call.id,
+            call.session_id,
+            call.message_id,
+            call.tool_name,
+            call.arguments_json.to_string(),
+            call.result_json.as_ref().map(|value| value.to_string()),
+            call.status.to_string(),
+            call.error_message,
+            timestamp(call.created_at),
+            timestamp(call.updated_at),
         ],
     )?;
     Ok(())
@@ -3775,6 +4122,39 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(error, CoreError::Validation(_)));
+    }
+
+    #[test]
+    fn local_ai_chat_session_create_list_archive() {
+        let db = Database::in_memory().unwrap();
+        let session = db
+            .create_local_ai_chat_session(Some("Test chat".into()), Some("qwen3:1.7b".into()))
+            .unwrap();
+
+        assert_eq!(db.list_local_ai_chat_sessions().unwrap().len(), 1);
+        assert_eq!(session.title, "Test chat");
+
+        db.archive_local_ai_chat_session(&session.id).unwrap();
+        assert!(db.list_local_ai_chat_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_ai_chat_message_save_list() {
+        let db = Database::in_memory().unwrap();
+        let session = db.create_local_ai_chat_session(None, None).unwrap();
+        db.append_local_ai_chat_message(
+            &session.id,
+            LocalAiChatRole::User,
+            "hello".into(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let messages = db.list_local_ai_chat_messages(&session.id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "hello");
+        assert_eq!(messages[0].role, LocalAiChatRole::User);
     }
 
     #[test]
