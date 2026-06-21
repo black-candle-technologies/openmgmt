@@ -207,6 +207,10 @@ pub struct LocalAiSettings {
     pub default_model: Option<String>,
     pub keep_alive: Option<String>,
     pub temperature: Option<f32>,
+    /// Optional `num_ctx` override. When unset we use the selected model's
+    /// detected context length (or a safe default).
+    #[serde(default)]
+    pub context_window: Option<u64>,
     pub allow_local_network: bool,
     pub last_connected_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
@@ -221,9 +225,13 @@ pub struct LocalAiSettingsPatch {
     pub default_model: Option<Option<String>>,
     pub keep_alive: Option<Option<String>>,
     pub temperature: Option<Option<f32>>,
+    pub context_window: Option<Option<u64>>,
     pub allow_local_network: Option<bool>,
 }
 
+/// A local model plus the Zed-style capability record we detect from
+/// `/api/show`. Capability fields default to "unknown/false" so an older cached
+/// payload (or a `/api/tags`-only listing) still deserializes cleanly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalAiModel {
     pub name: String,
@@ -234,6 +242,21 @@ pub struct LocalAiModel {
     pub family: Option<String>,
     pub details: Option<serde_json::Value>,
     pub installed: bool,
+    #[serde(default)]
+    pub parameter_size: Option<String>,
+    #[serde(default)]
+    pub quantization_level: Option<String>,
+    #[serde(default)]
+    pub context_length: Option<u64>,
+    #[serde(default)]
+    pub supports_tools: bool,
+    #[serde(default)]
+    pub supports_vision: bool,
+    #[serde(default)]
+    pub supports_thinking: bool,
+    /// Embedding-only models can't chat; surfaced so the UI demotes/hides them.
+    #[serde(default)]
+    pub is_embedding_model: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +287,19 @@ pub struct LocalAiChatResponse {
     pub load_duration: Option<i64>,
     pub prompt_eval_count: Option<i64>,
     pub eval_count: Option<i64>,
+    /// Native Ollama tool calls, when the model emitted any.
+    #[serde(default)]
+    pub tool_calls: Vec<LocalAiNativeToolCall>,
+    #[serde(default)]
+    pub done_reason: Option<String>,
+}
+
+/// A native Ollama tool call (`message.tool_calls[].function`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAiNativeToolCall {
+    pub name: String,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

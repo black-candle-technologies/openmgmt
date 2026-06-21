@@ -85,6 +85,8 @@ fn main() {
             commands::confirm_local_ai_tool_call,
             commands::cancel_local_ai_tool_call,
             commands::execute_local_ai_tool_call,
+            commands::confirm_local_ai_plan,
+            commands::cancel_local_ai_plan,
             commands::list_local_ai_tools,
             commands::run_local_ai_slash_command,
             commands::export_tasks_json,

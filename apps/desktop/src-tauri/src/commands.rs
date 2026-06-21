@@ -536,6 +536,22 @@ pub fn execute_local_ai_tool_call(
 }
 
 #[tauri::command]
+pub fn confirm_local_ai_plan(
+    service: State<'_, AppService>,
+    session_id: String,
+) -> CommandResult<LocalAiChatTurn> {
+    core(service.confirm_local_ai_plan(&session_id))
+}
+
+#[tauri::command]
+pub fn cancel_local_ai_plan(
+    service: State<'_, AppService>,
+    session_id: String,
+) -> CommandResult<LocalAiChatTurn> {
+    core(service.cancel_local_ai_plan(&session_id))
+}
+
+#[tauri::command]
 pub fn list_local_ai_tools(service: State<'_, AppService>) -> Vec<LocalAiToolDefinition> {
     service.list_local_ai_tools()
 }

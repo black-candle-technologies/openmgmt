@@ -11,8 +11,8 @@
 use leptos::prelude::*;
 use openmgmt_core::{
     LocalAiAccessMode, LocalAiChatMessageRecord, LocalAiChatRole, LocalAiChatSession,
-    LocalAiChatTurn, LocalAiConnectionResult, LocalAiModelListResult, LocalAiSettings,
-    LocalAiToolCall, LocalAiToolCallStatus,
+    LocalAiChatTurn, LocalAiConnectionResult, LocalAiModel, LocalAiModelListResult,
+    LocalAiSettings, LocalAiToolCall,
 };
 use serde_json::json;
 use wasm_bindgen_futures::spawn_local;
@@ -32,7 +32,7 @@ struct ChatState {
     session_title: RwSignal<String>,
     messages: RwSignal<Vec<LocalAiChatMessageRecord>>,
     proposals: RwSignal<Vec<LocalAiToolCall>>,
-    models: RwSignal<Vec<String>>,
+    models: RwSignal<Vec<LocalAiModel>>,
     model: RwSignal<String>,
     /// The single user-facing control: how much this chat may change.
     access_mode: RwSignal<LocalAiAccessMode>,
@@ -94,8 +94,7 @@ impl ChatState {
         match invoke::<LocalAiModelListResult>("list_ollama_models", json!({})).await {
             Ok(result) => {
                 self.connected.set(Some(result.connected));
-                self.models
-                    .set(result.models.into_iter().map(|model| model.name).collect());
+                self.models.set(result.models);
             }
             Err(_) => {
                 if let Ok(conn) =
@@ -200,35 +199,27 @@ pub fn LocalAiChat(state: AppState, page: RwSignal<Page>) -> impl IntoView {
         });
     };
 
-    let confirm = move |call_id: String| {
-        chat.busy_tool.set(Some(call_id.clone()));
+    // Confirm the whole grouped plan: the backend runs every step in order,
+    // stops on failure, and appends a conversational summary.
+    let confirm_plan = move || {
+        let Some(session_id) = chat.session_id.get() else {
+            return;
+        };
+        chat.busy_tool.set(Some("plan".into()));
         chat.error.set(None);
         spawn_local(async move {
-            // Confirm marks the call ready; execute performs the operation,
-            // resolves any name selectors, and appends a result message.
-            let confirmed =
-                invoke::<LocalAiToolCall>("confirm_local_ai_tool_call", json!({ "id": call_id }))
-                    .await;
-            let result = match confirmed {
-                Ok(_) => {
-                    invoke::<LocalAiToolCall>(
-                        "execute_local_ai_tool_call",
-                        json!({ "id": call_id }),
-                    )
-                    .await
-                }
-                Err(error) => Err(error),
-            };
-            match result {
-                Ok(_) => {
-                    if let Some(session_id) = chat.session_id.get() {
-                        chat.load_messages(&session_id).await;
+            match invoke::<LocalAiChatTurn>(
+                "confirm_local_ai_plan",
+                json!({ "sessionId": session_id }),
+            )
+            .await
+            {
+                Ok(turn) => {
+                    let mutated = turn.mutated;
+                    chat.apply_turn(turn);
+                    if mutated {
+                        state.refresh();
                     }
-                    chat.proposals.update(|calls| {
-                        calls.retain(|call| call.id != call_id);
-                    });
-                    // A write executed: refresh the rest of the app.
-                    state.refresh();
                 }
                 Err(error) => chat.error.set(Some(error)),
             }
@@ -236,23 +227,23 @@ pub fn LocalAiChat(state: AppState, page: RwSignal<Page>) -> impl IntoView {
         });
     };
 
-    let cancel = move |call_id: String| {
-        chat.busy_tool.set(Some(call_id.clone()));
+    let cancel_plan = move || {
+        let Some(session_id) = chat.session_id.get() else {
+            return;
+        };
+        chat.busy_tool.set(Some("plan".into()));
         spawn_local(async move {
-            let _ =
-                invoke::<LocalAiToolCall>("cancel_local_ai_tool_call", json!({ "id": call_id }))
-                    .await;
-            chat.proposals.update(|calls| {
-                calls.retain(|call| call.id != call_id);
-            });
+            match invoke::<LocalAiChatTurn>(
+                "cancel_local_ai_plan",
+                json!({ "sessionId": session_id }),
+            )
+            .await
+            {
+                Ok(turn) => chat.apply_turn(turn),
+                Err(error) => chat.error.set(Some(error)),
+            }
             chat.busy_tool.set(None);
         });
-    };
-
-    let confirm_all = move || {
-        for call in chat.proposals.get() {
-            confirm(call.id.clone());
-        }
     };
 
     let new_chat = move || {
@@ -272,9 +263,8 @@ pub fn LocalAiChat(state: AppState, page: RwSignal<Page>) -> impl IntoView {
                     <ChatSessions chat new_chat=Callback::new(move |_| new_chat()) />
                     <ChatBody
                         chat
-                        confirm=Callback::new(confirm)
-                        cancel=Callback::new(cancel)
-                        confirm_all=Callback::new(move |_| confirm_all())
+                        confirm_plan=Callback::new(move |_| confirm_plan())
+                        cancel_plan=Callback::new(move |_| cancel_plan())
                     />
                     <ChatFooter chat send=Callback::new(move |_| send()) />
                 </div>
@@ -343,12 +333,16 @@ fn ChatHeader(chat: ChatState, state: AppState, page: RwSignal<Page>) -> impl In
                     <option value="">{format!("Auto ({DEFAULT_MODEL})")}</option>
                     <For
                         each=move || model_options(&chat.models.get(), &chat.model.get())
-                        key=|name| name.clone()
-                        let:name
+                        key=|model| model.name.clone()
+                        let:model
                     >
-                        <option value=name.clone()>{name.clone()}</option>
+                        <option value=model.name.clone()>{model_label(&model)}</option>
                     </For>
                 </select>
+                {move || {
+                    let (label, tone) = model_capability_badge(&chat.models.get(), &chat.model.get());
+                    view! { <Badge label=label tone=tone /> }
+                }}
                 <button class="chat-icon-btn" title="Refresh models" on:click=move |_| refresh_models()>"⟳"</button>
                 <button
                     class="chat-icon-btn"
@@ -369,9 +363,8 @@ fn ChatHeader(chat: ChatState, state: AppState, page: RwSignal<Page>) -> impl In
 #[component]
 fn ChatBody(
     chat: ChatState,
-    confirm: Callback<String>,
-    cancel: Callback<String>,
-    confirm_all: Callback<()>,
+    confirm_plan: Callback<()>,
+    cancel_plan: Callback<()>,
 ) -> impl IntoView {
     view! {
         <div class="chat-body">
@@ -417,19 +410,11 @@ fn ChatBody(
                 }
             }}
 
-            // Pending proposed write actions (Ask First mode).
+            // The pending write plan (Ask First mode): one grouped card.
             {move || {
                 let proposals = chat.proposals.get();
-                (proposals.len() > 1).then(|| view! {
-                    <div class="chat-plan-actions">
-                        <span class="chat-plan-label">{format!("{} proposed actions", proposals.len())}</span>
-                        <button class="btn btn-primary btn-sm" on:click=move |_| confirm_all.run(())>"Confirm all"</button>
-                    </div>
-                })
+                (!proposals.is_empty()).then(|| plan_card(proposals, chat, confirm_plan, cancel_plan))
             }}
-            <For each=move || chat.proposals.get() key=|call| call.id.clone() let:call>
-                {proposal_card(call, chat, confirm, cancel)}
-            </For>
 
             {move || chat.sending.get().then(|| view! {
                 <div class="chat-thinking"><span class="spinner"></span>"Thinking…"</div>
@@ -544,47 +529,58 @@ fn message_view(message: LocalAiChatMessageRecord) -> impl IntoView {
     .into_any()
 }
 
-/// A proposed write action: human-readable tool + arguments, with Confirm /
-/// Cancel. Shown only in Ask First mode.
-fn proposal_card(
-    call: LocalAiToolCall,
+/// The pending write plan as one grouped card: every step in order, with a
+/// single Confirm / Cancel. Shown only in Ask First mode.
+fn plan_card(
+    proposals: Vec<LocalAiToolCall>,
     chat: ChatState,
-    confirm: Callback<String>,
-    cancel: Callback<String>,
+    confirm_plan: Callback<()>,
+    cancel_plan: Callback<()>,
 ) -> impl IntoView {
-    let confirm_id = call.id.clone();
-    let cancel_id = call.id.clone();
-    let busy_id = call.id.clone();
-    let is_busy = Signal::derive(move || chat.busy_tool.get().as_deref() == Some(busy_id.as_str()));
-    let confirmed = matches!(call.status, LocalAiToolCallStatus::Confirmed);
-    let rows = argument_rows(&call.arguments_json);
+    let is_busy = Signal::derive(move || chat.busy_tool.get().as_deref() == Some("plan"));
+    let steps = proposals
+        .iter()
+        .map(|call| (call.id.clone(), plan_step_line(call)))
+        .collect::<Vec<_>>();
     view! {
-        <div class="chat-proposal">
+        <div class="chat-proposal chat-plan">
             <div class="chat-proposal-head">
-                <span class="chat-proposal-eyebrow">"PROPOSED ACTION"</span>
-                <span class="chat-proposal-tool">{humanize_tool(&call.tool_name)}</span>
+                <span class="chat-proposal-eyebrow">"PROPOSED PLAN"</span>
             </div>
-            <div class="chat-proposal-args">
-                <For each=move || rows.clone() key=|(k, _)| k.clone() let:row>
-                    <div class="chat-proposal-arg">
-                        <span class="chat-proposal-key">{row.0}</span>
-                        <span class="chat-proposal-val">{row.1}</span>
-                    </div>
+            <ol class="chat-plan-steps">
+                <For each=move || steps.clone() key=|(id, _)| id.clone() let:step>
+                    <li class="chat-plan-step">{step.1}</li>
                 </For>
-            </div>
+            </ol>
             <div class="chat-proposal-actions">
                 <button
                     class="btn btn-primary chat-proposal-confirm"
                     disabled=move || is_busy.get()
-                    on:click=move |_| confirm.run(confirm_id.clone())
-                >{move || if is_busy.get() { "Working…" } else if confirmed { "Run" } else { "Confirm" }}</button>
+                    on:click=move |_| confirm_plan.run(())
+                >{move || if is_busy.get() { "Working…" } else { "Confirm plan" }}</button>
                 <button
                     class="btn btn-ghost"
                     disabled=move || is_busy.get()
-                    on:click=move |_| cancel.run(cancel_id.clone())
+                    on:click=move |_| cancel_plan.run(())
                 >"Cancel"</button>
             </div>
         </div>
+    }
+}
+
+/// One readable line for a plan step: "Create task: localtask".
+fn plan_step_line(call: &LocalAiToolCall) -> String {
+    let action = humanize_tool(&call.tool_name);
+    let subject = call
+        .arguments_json
+        .get("title")
+        .or_else(|| call.arguments_json.get("name"))
+        .or_else(|| call.arguments_json.get("task_selector"))
+        .or_else(|| call.arguments_json.get("project_selector"))
+        .and_then(|value| value.as_str());
+    match subject {
+        Some(subject) => format!("{action}: {subject}"),
+        None => action,
     }
 }
 
@@ -637,12 +633,76 @@ fn access_mode_hint(mode: LocalAiAccessMode) -> &'static str {
     }
 }
 
-fn model_options(models: &[String], selected: &str) -> Vec<String> {
-    let mut options = models.to_vec();
-    if !selected.is_empty() && !options.iter().any(|name| name == selected) {
-        options.insert(0, selected.to_owned());
+/// Selectable chat models: installed non-embedding models, plus the saved
+/// selection if it isn't in the list (so a configured model is never dropped).
+fn model_options(models: &[LocalAiModel], selected: &str) -> Vec<LocalAiModel> {
+    let mut options = models
+        .iter()
+        .filter(|model| !model.is_embedding_model)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !selected.is_empty() && !options.iter().any(|model| model.name == selected) {
+        options.insert(0, placeholder_model(selected));
     }
     options
+}
+
+/// Dropdown label: model name plus a compact capability suffix.
+fn model_label(model: &LocalAiModel) -> String {
+    let mut tags = Vec::new();
+    if model.supports_tools {
+        tags.push("tools".to_string());
+    } else {
+        tags.push("json".to_string());
+    }
+    if model.supports_thinking {
+        tags.push("thinking".into());
+    }
+    if model.supports_vision {
+        tags.push("vision".into());
+    }
+    if let Some(context) = model.context_length {
+        tags.push(format_context(context));
+    }
+    format!("{} · {}", model.name, tags.join(", "))
+}
+
+/// Badge for the active model: whether it can use native tools, or runs on the
+/// JSON plan fallback.
+fn model_capability_badge(models: &[LocalAiModel], selected: &str) -> (&'static str, &'static str) {
+    match models.iter().find(|model| model.name == selected) {
+        Some(model) if model.supports_tools => ("tools", "done"),
+        Some(_) => ("json fallback", "muted"),
+        None => ("auto", "muted"),
+    }
+}
+
+fn placeholder_model(name: &str) -> LocalAiModel {
+    LocalAiModel {
+        name: name.to_owned(),
+        display_name: Some(name.to_owned()),
+        size: None,
+        modified_at: None,
+        digest: None,
+        family: None,
+        details: None,
+        installed: false,
+        parameter_size: None,
+        quantization_level: None,
+        context_length: None,
+        supports_tools: false,
+        supports_vision: false,
+        supports_thinking: false,
+        is_embedding_model: false,
+    }
+}
+
+fn format_context(tokens: u64) -> String {
+    if tokens >= 1000 {
+        format!("{}k ctx", tokens / 1000)
+    } else {
+        format!("{tokens} ctx")
+    }
 }
 
 /// True when content looks like JSON/structured output we should render mono.
@@ -657,26 +717,4 @@ fn humanize_tool(name: &str) -> String {
         first.make_ascii_uppercase();
     }
     text
-}
-
-/// Flatten a tool's JSON arguments into display rows. Selector keys read as the
-/// plain noun ("Organization", "Project") so cards aren't full of jargon.
-fn argument_rows(args: &serde_json::Value) -> Vec<(String, String)> {
-    args.as_object()
-        .map(|map| {
-            map.iter()
-                .map(|(key, value)| {
-                    let display = match value {
-                        serde_json::Value::String(text) => text.clone(),
-                        other => other.to_string(),
-                    };
-                    let key = key
-                        .strip_suffix("_selector")
-                        .or_else(|| key.strip_suffix("_id"))
-                        .unwrap_or(key);
-                    (humanize_tool(key), display)
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }

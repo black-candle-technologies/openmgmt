@@ -227,6 +227,7 @@ impl Database {
               default_model TEXT,
               keep_alive TEXT,
               temperature REAL,
+              context_window INTEGER,
               allow_local_network INTEGER NOT NULL DEFAULT 0,
               last_connected_at TEXT,
               last_error TEXT,
@@ -319,6 +320,7 @@ impl Database {
         self.ensure_task_scheduling_columns()?;
         self.ensure_local_ai_settings()?;
         self.ensure_local_ai_access_mode_column()?;
+        self.ensure_local_ai_context_window_column()?;
         self.ensure_sync_event_ownership_columns()?;
         self.seed_system_saved_task_views()?;
         self.ensure_default_scoring_settings()?;
@@ -463,6 +465,25 @@ impl Database {
             connection.execute(
                 "ALTER TABLE local_ai_chat_sessions
                  ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'ask_before_write'",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Idempotently add `context_window` to settings created before the
+    /// context-window override existed.
+    fn ensure_local_ai_context_window_column(&self) -> Result<()> {
+        let connection = self.connection()?;
+        let has_column = connection
+            .prepare("PRAGMA table_info(local_ai_settings)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|column| column == "context_window");
+        if !has_column {
+            connection.execute(
+                "ALTER TABLE local_ai_settings ADD COLUMN context_window INTEGER",
                 [],
             )?;
         }
@@ -2183,6 +2204,9 @@ impl Database {
         if let Some(temperature) = patch.temperature {
             settings.temperature = temperature;
         }
+        if let Some(context_window) = patch.context_window {
+            settings.context_window = context_window;
+        }
         settings.updated_at = Utc::now();
         let connection = self.connection()?;
         save_local_ai_settings_with_connection(&connection, &settings)?;
@@ -2372,6 +2396,19 @@ impl Database {
     pub fn save_local_ai_tool_call(&self, call: &LocalAiToolCall) -> Result<()> {
         let connection = self.connection()?;
         save_local_ai_tool_call_with_connection(&connection, call)
+    }
+
+    /// Cancel every still-pending (proposed or confirmed-but-not-run) tool call
+    /// in a session. Used to clear a stale plan when a new turn starts and to
+    /// cancel a whole plan on the user's request. Returns the count canceled.
+    pub fn cancel_pending_local_ai_tool_calls(&self, session_id: &str) -> Result<usize> {
+        let connection = self.connection()?;
+        let canceled = connection.execute(
+            "UPDATE local_ai_tool_calls SET status='canceled', updated_at=?2
+             WHERE session_id=?1 AND status IN ('proposed','confirmed')",
+            params![session_id, timestamp(Utc::now())],
+        )?;
+        Ok(canceled)
     }
 
     pub fn export_tasks_json(&self) -> Result<String> {
@@ -3378,11 +3415,12 @@ fn map_local_ai_settings(row: &Row<'_>) -> rusqlite::Result<LocalAiSettings> {
         default_model: row.get(4)?,
         keep_alive: row.get(5)?,
         temperature: row.get(6)?,
-        allow_local_network: row.get(7)?,
-        last_connected_at: parse_optional_time(row.get(8)?)?,
-        last_error: row.get(9)?,
-        created_at: parse_time(row.get(10)?)?,
-        updated_at: parse_time(row.get(11)?)?,
+        context_window: row.get::<_, Option<i64>>(7)?.map(|value| value as u64),
+        allow_local_network: row.get(8)?,
+        last_connected_at: parse_optional_time(row.get(9)?)?,
+        last_error: row.get(10)?,
+        created_at: parse_time(row.get(11)?)?,
+        updated_at: parse_time(row.get(12)?)?,
     })
 }
 
@@ -3577,6 +3615,7 @@ fn default_local_ai_settings(now: DateTime<Utc>) -> LocalAiSettings {
         default_model: Some(DEFAULT_OLLAMA_MODEL.into()),
         keep_alive: Some(DEFAULT_OLLAMA_KEEP_ALIVE.into()),
         temperature: None,
+        context_window: None,
         allow_local_network: false,
         last_connected_at: None,
         last_error: None,
@@ -3589,7 +3628,8 @@ fn get_local_ai_settings_with_connection(connection: &Connection) -> Result<Loca
     connection
         .query_row(
             "SELECT id,enabled,provider,base_url,default_model,keep_alive,temperature,
-                    allow_local_network,last_connected_at,last_error,created_at,updated_at
+                    context_window,allow_local_network,last_connected_at,last_error,
+                    created_at,updated_at
              FROM local_ai_settings WHERE id='default'",
             [],
             map_local_ai_settings,
@@ -3605,8 +3645,9 @@ fn save_local_ai_settings_with_connection(
     connection.execute(
         "INSERT INTO local_ai_settings (
             id,enabled,provider,base_url,default_model,keep_alive,temperature,
-            allow_local_network,last_connected_at,last_error,created_at,updated_at
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+            context_window,allow_local_network,last_connected_at,last_error,
+            created_at,updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
          ON CONFLICT(id) DO UPDATE SET
             enabled=excluded.enabled,
             provider=excluded.provider,
@@ -3614,6 +3655,7 @@ fn save_local_ai_settings_with_connection(
             default_model=excluded.default_model,
             keep_alive=excluded.keep_alive,
             temperature=excluded.temperature,
+            context_window=excluded.context_window,
             allow_local_network=excluded.allow_local_network,
             last_connected_at=excluded.last_connected_at,
             last_error=excluded.last_error,
@@ -3626,6 +3668,7 @@ fn save_local_ai_settings_with_connection(
             settings.default_model,
             settings.keep_alive,
             settings.temperature,
+            settings.context_window.map(|value| value as i64),
             settings.allow_local_network as i32,
             settings.last_connected_at.map(timestamp),
             settings.last_error,

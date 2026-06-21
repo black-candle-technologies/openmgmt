@@ -1,12 +1,13 @@
 use crate::{
     db::{Database, Result},
     local_ai::{
-        AgentDecision, MAX_AGENT_STEPS, OllamaClient, ParsedToolCall, SlashCommand, ToolDecision,
-        agent_system_prompt, build_agent_messages, build_tool_manifest_text, compact_task_lines,
-        local_ai_tool, local_ai_tool_registry, parse_agent_response, parse_slash_command,
-        plan_day_prompt, prompt_messages, rewrite_task_prompt, slash_help,
-        suggest_next_task_prompt, summarize_project_prompt, tool_decision, triage_tasks_prompt,
-        workflow_error, workflow_response,
+        ChatOptions, LocalAiTurnIntent, OllamaClient, PlannedStep, SlashCommand,
+        build_chat_messages, build_read_messages, classify_turn, compact_task_lines, local_ai_tool,
+        local_ai_tool_registry, parse_action_plan, parse_say_command, parse_slash_command,
+        plan_action_from_message, plan_covers_request, plan_day_prompt, plan_from_message,
+        plan_is_executable, prompt_messages, rewrite_task_prompt, slash_help,
+        suggest_next_task_prompt, summarize_project_prompt, triage_tasks_prompt, workflow_error,
+        workflow_response, write_planning_prompt, write_tool_manifest_text,
     },
     models::{
         BoardState, CalendarBlock, LocalAiAccessMode, LocalAiChatMessage, LocalAiChatMessageRecord,
@@ -249,8 +250,12 @@ impl AppService {
                 "local AI integration is disabled".into(),
             ));
         }
+        let options = ChatOptions {
+            num_ctx: settings.context_window,
+            ..Default::default()
+        };
         OllamaClient::new(&settings, 30)?
-            .chat(&settings, model, messages)
+            .chat(&settings, model, messages, options)
             .await
     }
     pub async fn plan_day_with_ollama(&self) -> Result<LocalAiWorkflowResponse> {
@@ -481,9 +486,10 @@ impl AppService {
         }
         Ok(lines.join("\n\n"))
     }
-    /// The Local AI agent turn: build context + tool manifest, then run a bounded
-    /// reason→tool→observe loop against Ollama. Tool execution is gated by the
-    /// session's access mode (read-only / ask-first / full-access).
+    /// A Local AI chat turn. The user message is first *classified* — pure chat,
+    /// a workspace read, a write request, or something too vague — and only write
+    /// requests ever touch the tool layer. Writes build a complete plan up front
+    /// and apply it under the session's access mode.
     pub async fn send_local_ai_chat_message(
         &self,
         input: crate::models::SendLocalAiChatMessageInput,
@@ -513,233 +519,297 @@ impl AppService {
             session.model.clone(),
             None,
         )?;
-        // Slash commands remain as a hidden power-user/debug path; normal use is
-        // natural language handled by the agent loop below.
+        // Slash commands remain a hidden power-user/debug path.
         if let Some(command) = parse_slash_command(&input.message)? {
             self.handle_local_ai_slash_command(&mut session, &user, command)
                 .await?;
             return self.local_ai_chat_turn(session, false);
         }
 
-        let context = self.build_local_ai_chat_context(input.context_scope.unwrap_or_default())?;
-        let manifest = build_tool_manifest_text();
-        let history = self.database.list_local_ai_chat_messages(&session.id)?;
-        let mut messages = build_agent_messages(
-            agent_system_prompt(session.access_mode, &manifest),
-            &context,
-            &history,
-            8,
-        );
-
-        let mut mutated = false;
-        let mut turn_complete = false;
-        let mut summaries: Vec<String> = Vec::new();
-
-        for _ in 0..MAX_AGENT_STEPS {
-            let (decision, raw) = match self.agent_step(session.model.clone(), &messages).await {
-                Ok(value) => value,
-                Err(error) => {
-                    self.append_assistant(&session, format!("Local AI unavailable: {error}"))?;
-                    return self.local_ai_chat_turn(session, mutated);
-                }
-            };
-            let Some(decision) = decision else {
-                let text = if raw.trim().is_empty() {
-                    "I couldn't produce a valid response. Please rephrase.".to_string()
-                } else {
-                    raw
-                };
-                self.append_assistant(&session, text)?;
-                turn_complete = true;
-                break;
-            };
-            match decision {
-                AgentDecision::Final { message } => {
-                    let text = if message.trim().is_empty() {
-                        "Done.".to_string()
-                    } else {
-                        message
-                    };
-                    self.append_assistant(&session, text)?;
-                    turn_complete = true;
-                    break;
-                }
-                AgentDecision::ToolCalls { message, calls } => {
-                    if let Some(note) = message.filter(|note| !note.trim().is_empty()) {
-                        self.append_assistant(&session, note.clone())?;
-                        messages.push(LocalAiChatMessage {
-                            role: "assistant".into(),
-                            content: note,
-                        });
-                    }
-                    let outcome = self.run_local_ai_tool_plan(&session, &user.id, calls)?;
-                    mutated |= outcome.mutated;
-                    summaries.extend(outcome.summaries.clone());
-                    if outcome.has_proposals {
-                        // Ask First: stop and wait for the user to confirm.
-                        turn_complete = true;
-                        break;
-                    }
-                    if outcome.executed_any {
-                        messages.push(LocalAiChatMessage {
-                            role: "user".into(),
-                            content: format!(
-                                "Tool results:\n{}\nIf the request is complete, reply with a final JSON message. Otherwise call more tools.",
-                                outcome.summaries.join("\n")
-                            ),
-                        });
-                        continue;
-                    }
-                    // Blocked / unknown / failed only: the appended messages
-                    // already explain; stop so we don't loop.
-                    turn_complete = true;
-                    break;
-                }
+        let mutated = match classify_turn(&input.message) {
+            LocalAiTurnIntent::Chat => self.run_chat_turn(&session, &input.message).await?,
+            LocalAiTurnIntent::Read => self.run_read_turn(&session, &input.message).await?,
+            LocalAiTurnIntent::Clarify => {
+                self.append_assistant(
+                    &session,
+                    "I can make changes for you — tell me what to do and which task, project, or organization it's about."
+                        .into(),
+                )?;
+                false
             }
-        }
-
-        if !turn_complete {
-            // Step limit reached mid-work: never end silent or with raw JSON.
-            let summary = if summaries.is_empty() {
-                "I reached my step limit before finishing. Please try a smaller request."
-                    .to_string()
-            } else {
-                format!("Done. {}", summaries.join(" "))
-            };
-            self.append_assistant(&session, summary)?;
-        }
+            LocalAiTurnIntent::Write => {
+                self.run_write_turn(&session, &user, &input.message).await?
+            }
+        };
 
         self.local_ai_chat_turn(session, mutated)
     }
 
-    /// One Ollama round-trip, parsed into a decision. On parse failure, retries
-    /// once with a stricter "JSON only" nudge before giving up (returns `None`).
-    async fn agent_step(
-        &self,
-        model: Option<String>,
-        messages: &[LocalAiChatMessage],
-    ) -> Result<(Option<AgentDecision>, String)> {
-        let chat = self
-            .run_ollama_chat(model.clone(), messages.to_vec())
-            .await?;
-        if let Some(decision) = parse_agent_response(&chat.content) {
-            return Ok((Some(decision), chat.content));
+    /// Pure conversation: no workspace data, no tools. `say`/`repeat` echo
+    /// deterministically; everything else gets a plain chat reply.
+    async fn run_chat_turn(&self, session: &LocalAiChatSession, message: &str) -> Result<bool> {
+        if let Some(echoed) = parse_say_command(message) {
+            self.append_assistant(session, echoed)?;
+            return Ok(false);
         }
-        let mut retry = messages.to_vec();
-        retry.push(LocalAiChatMessage {
-            role: "user".into(),
-            content: "Your previous reply was not valid. Reply with ONLY one JSON object: \
-                {\"type\":\"final\",\"message\":\"...\"} or \
-                {\"type\":\"tool_calls\",\"tool_calls\":[...]}."
-                .into(),
-        });
-        let chat = self.run_ollama_chat(model, retry).await?;
-        Ok((parse_agent_response(&chat.content), chat.content))
+        let history = self.database.list_local_ai_chat_messages(&session.id)?;
+        let messages = build_chat_messages(&history, 8);
+        match self.run_ollama_chat(session.model.clone(), messages).await {
+            Ok(chat) => self.append_assistant(session, non_empty(chat.content, "…"))?,
+            Err(error) => {
+                self.append_assistant(session, format!("Local AI unavailable: {error}"))?
+            }
+        }
+        Ok(false)
     }
 
-    /// Execute a model-produced tool plan against the access gate. Reads run
-    /// immediately; writes execute (full access), are proposed (ask first), or
-    /// are blocked (read only). Every call is logged in `local_ai_tool_calls`.
-    pub fn run_local_ai_tool_plan(
+    /// A workspace question: answer conversationally from injected read context.
+    /// No writes, no proposals.
+    async fn run_read_turn(&self, session: &LocalAiChatSession, _message: &str) -> Result<bool> {
+        let context = self.build_local_ai_chat_context(LocalAiContextScope::Daily)?;
+        let history = self.database.list_local_ai_chat_messages(&session.id)?;
+        let messages = build_read_messages(&context, &history, 8);
+        match self.run_ollama_chat(session.model.clone(), messages).await {
+            Ok(chat) => self.append_assistant(
+                session,
+                non_empty(
+                    chat.content,
+                    "I don't have anything to add from your workspace.",
+                ),
+            )?,
+            Err(error) => {
+                self.append_assistant(session, format!("Local AI unavailable: {error}"))?
+            }
+        }
+        Ok(false)
+    }
+
+    /// A write request: build a complete plan, then apply the access mode.
+    /// Read only explains; Ask first proposes one grouped plan; Full access
+    /// executes the whole plan in order and reports back conversationally.
+    async fn run_write_turn(
+        &self,
+        session: &LocalAiChatSession,
+        user: &LocalAiChatMessageRecord,
+        message: &str,
+    ) -> Result<bool> {
+        // A new plan supersedes any earlier un-acted one in this session.
+        self.database
+            .cancel_pending_local_ai_tool_calls(&session.id)?;
+
+        // Planning may call Ollama (non create-chain writes); a dead server
+        // degrades to a friendly message instead of a hard command error.
+        let steps = match self.build_write_plan(session, message).await {
+            Ok(steps) => steps,
+            Err(error) => {
+                self.append_assistant(session, format!("Local AI unavailable: {error}"))?;
+                return Ok(false);
+            }
+        };
+        if steps.is_empty() {
+            self.append_assistant(
+                session,
+                "I couldn't turn that into a concrete change. Tell me the action and the task, project, or organization to apply it to."
+                    .into(),
+            )?;
+            return Ok(false);
+        }
+
+        match session.access_mode {
+            LocalAiAccessMode::ReadOnly => {
+                self.append_assistant(
+                    session,
+                    "I can do that, but this chat is in Read Only. Switch to Ask First or Full Access to let me make changes."
+                        .into(),
+                )?;
+                Ok(false)
+            }
+            LocalAiAccessMode::AskBeforeWrite => {
+                // One grouped plan: a Proposed record per step, all tied to this
+                // user message so the UI renders a single plan card.
+                for step in &steps {
+                    self.database.create_local_ai_tool_call(
+                        &session.id,
+                        Some(user.id.clone()),
+                        step.tool_name.clone(),
+                        step.arguments.clone(),
+                        LocalAiToolCallStatus::Proposed,
+                    )?;
+                }
+                self.append_assistant(session, propose_intro(&steps))?;
+                Ok(false)
+            }
+            LocalAiAccessMode::FullAccess => {
+                self.append_assistant(session, "On it.".into())?;
+                let outcome = self.execute_plan_steps(session, &user.id, &steps)?;
+                self.append_assistant(session, finalize_plan(&outcome))?;
+                Ok(outcome.mutated)
+            }
+        }
+    }
+
+    /// Build a complete, validated write plan. The common create-chain is built
+    /// deterministically (reliable on tiny models); everything else asks the
+    /// model for an `action_plan`, validates it, and repairs once.
+    async fn build_write_plan(
+        &self,
+        session: &LocalAiChatSession,
+        message: &str,
+    ) -> Result<Vec<PlannedStep>> {
+        let deterministic = plan_from_message(message);
+        if plan_is_executable(&deterministic) {
+            return Ok(deterministic);
+        }
+        // Common single-shot status changes (complete/start/cancel/…) are also
+        // deterministic, so they don't depend on the model emitting valid JSON.
+        let action = plan_action_from_message(message);
+        if plan_is_executable(&action) {
+            return Ok(action);
+        }
+        let mut steps = self.request_action_plan(session, message).await?;
+        // One repair pass if the plan is unusable or misses a named entity.
+        if (!plan_is_executable(&steps) || !plan_covers_request(message, &steps).is_empty())
+            && let Ok(repaired) = self.request_action_plan(session, message).await
+            && plan_is_executable(&repaired)
+        {
+            steps = repaired;
+        }
+        // Last resort: fall back to whatever the deterministic extractor found.
+        if !plan_is_executable(&steps) {
+            steps = deterministic;
+        }
+        steps.retain(|step| local_ai_tool(&step.tool_name).is_some_and(|tool| tool.write));
+        Ok(steps)
+    }
+
+    /// One planning round-trip: ask the model for an `action_plan` and parse it.
+    async fn request_action_plan(
+        &self,
+        session: &LocalAiChatSession,
+        message: &str,
+    ) -> Result<Vec<PlannedStep>> {
+        let messages = vec![
+            LocalAiChatMessage {
+                role: "system".into(),
+                content: write_planning_prompt(&write_tool_manifest_text()),
+            },
+            LocalAiChatMessage {
+                role: "user".into(),
+                content: format!("Request: {message}\nReturn the action_plan JSON."),
+            },
+        ];
+        let chat = self
+            .run_ollama_chat(session.model.clone(), messages)
+            .await?;
+        Ok(parse_action_plan(&chat.content)
+            .map(|plan| plan.steps)
+            .unwrap_or_default())
+    }
+
+    /// Execute plan steps in order, stopping on the first failure. Each step is
+    /// logged and produces a compact tool-result message in the transcript.
+    fn execute_plan_steps(
         &self,
         session: &LocalAiChatSession,
         user_message_id: &str,
-        calls: Vec<ParsedToolCall>,
+        steps: &[PlannedStep],
     ) -> Result<PlanOutcome> {
         let mut outcome = PlanOutcome::default();
-        for call in calls {
-            let Some(tool) = local_ai_tool(&call.tool_name) else {
-                self.append_assistant(
-                    session,
-                    format!(
-                        "I don't have a tool called `{}`, so I skipped it.",
-                        call.tool_name
-                    ),
-                )?;
+        for step in steps {
+            let Some(tool) = local_ai_tool(&step.tool_name) else {
                 continue;
             };
-            match tool_decision(session.access_mode, tool.write) {
-                ToolDecision::Blocked => {
-                    self.database.create_local_ai_tool_call(
+            let mut record = self.database.create_local_ai_tool_call(
+                &session.id,
+                Some(user_message_id.to_owned()),
+                tool.name.clone(),
+                step.arguments.clone(),
+                LocalAiToolCallStatus::Confirmed,
+            )?;
+            match self.run_tool(&tool.name, &step.arguments) {
+                Ok(result) => {
+                    record.result_json = Some(result.clone());
+                    record.status = LocalAiToolCallStatus::Executed;
+                    record.updated_at = Utc::now();
+                    self.database.save_local_ai_tool_call(&record)?;
+                    let summary = summarize_tool_result(&tool.name, &result);
+                    self.database.append_local_ai_chat_message(
                         &session.id,
-                        Some(user_message_id.to_owned()),
-                        tool.name.clone(),
-                        call.arguments.clone(),
-                        LocalAiToolCallStatus::BlockedByAccessMode,
+                        LocalAiChatRole::Tool,
+                        summary.clone(),
+                        None,
+                        Some(serde_json::json!({
+                            "tool_call_id": record.id,
+                            "tool_name": tool.name,
+                            "result": result,
+                        })),
                     )?;
+                    outcome.executed_any = true;
+                    outcome.mutated |= tool.write;
+                    outcome.summaries.push(summary);
+                }
+                Err(error) => {
+                    record.status = LocalAiToolCallStatus::Failed;
+                    record.error_message = Some(error.to_string());
+                    record.updated_at = Utc::now();
+                    self.database.save_local_ai_tool_call(&record)?;
                     self.append_assistant(
                         session,
-                        format!(
-                            "This chat is in read-only mode, so I can't run {}. Switch to Ask First or Full Access and I'll do it.",
-                            humanize_tool_name(&tool.name)
-                        ),
+                        format!("I couldn't {}: {error}", humanize_tool_name(&tool.name)),
                     )?;
-                    outcome.blocked_any = true;
-                }
-                ToolDecision::Propose => {
-                    self.database.create_local_ai_tool_call(
-                        &session.id,
-                        Some(user_message_id.to_owned()),
-                        tool.name.clone(),
-                        call.arguments.clone(),
-                        LocalAiToolCallStatus::Proposed,
-                    )?;
-                    outcome.has_proposals = true;
-                }
-                ToolDecision::Execute => {
-                    let status = if tool.write {
-                        LocalAiToolCallStatus::Confirmed
-                    } else {
-                        LocalAiToolCallStatus::Proposed
-                    };
-                    let mut record = self.database.create_local_ai_tool_call(
-                        &session.id,
-                        Some(user_message_id.to_owned()),
-                        tool.name.clone(),
-                        call.arguments.clone(),
-                        status,
-                    )?;
-                    match self.run_tool(&tool.name, &call.arguments) {
-                        Ok(result) => {
-                            record.result_json = Some(result.clone());
-                            record.status = LocalAiToolCallStatus::Executed;
-                            record.updated_at = Utc::now();
-                            self.database.save_local_ai_tool_call(&record)?;
-                            let summary = summarize_tool_result(&tool.name, &result);
-                            self.database.append_local_ai_chat_message(
-                                &session.id,
-                                LocalAiChatRole::Tool,
-                                summary.clone(),
-                                None,
-                                Some(serde_json::json!({
-                                    "tool_call_id": record.id,
-                                    "tool_name": tool.name,
-                                    "result": result,
-                                })),
-                            )?;
-                            outcome.executed_any = true;
-                            outcome.mutated |= tool.write;
-                            outcome.summaries.push(summary);
-                        }
-                        Err(error) => {
-                            record.status = LocalAiToolCallStatus::Failed;
-                            record.error_message = Some(error.to_string());
-                            record.updated_at = Utc::now();
-                            self.database.save_local_ai_tool_call(&record)?;
-                            self.append_assistant(
-                                session,
-                                format!(
-                                    "I couldn't run {}: {error}",
-                                    humanize_tool_name(&tool.name)
-                                ),
-                            )?;
-                            outcome.failed_any = true;
-                        }
-                    }
+                    outcome.failed_any = true;
+                    break; // Later steps may depend on this one — stop here.
                 }
             }
         }
         Ok(outcome)
+    }
+
+    /// Confirm and run a whole proposed plan (Ask First mode). Steps execute in
+    /// order, stop on failure, and the turn ends with a conversational summary.
+    pub fn confirm_local_ai_plan(&self, session_id: &str) -> Result<LocalAiChatTurn> {
+        let session = self.database.get_local_ai_chat_session(session_id)?;
+        let steps = self
+            .database
+            .list_local_ai_tool_calls(session_id)?
+            .into_iter()
+            .filter(|call| call.status == LocalAiToolCallStatus::Proposed)
+            .map(|call| PlannedStep {
+                tool_name: call.tool_name,
+                arguments: call.arguments_json,
+            })
+            .collect::<Vec<_>>();
+        if steps.is_empty() {
+            return self.local_ai_chat_turn(session, false);
+        }
+        // The proposals were created against the user message; reuse the most
+        // recent one so the executed records stay grouped with it.
+        let user_message_id = self
+            .database
+            .list_local_ai_chat_messages(session_id)?
+            .into_iter()
+            .rev()
+            .find(|message| message.role == LocalAiChatRole::User)
+            .map(|message| message.id);
+        // Mark the proposals consumed, then run a fresh ordered execution.
+        self.database
+            .cancel_pending_local_ai_tool_calls(session_id)?;
+        let outcome =
+            self.execute_plan_steps(&session, user_message_id.as_deref().unwrap_or(""), &steps)?;
+        self.append_assistant(&session, finalize_plan(&outcome))?;
+        self.local_ai_chat_turn(session, outcome.mutated)
+    }
+
+    /// Cancel a whole proposed plan (Ask First mode) without running anything.
+    pub fn cancel_local_ai_plan(&self, session_id: &str) -> Result<LocalAiChatTurn> {
+        let session = self.database.get_local_ai_chat_session(session_id)?;
+        let canceled = self
+            .database
+            .cancel_pending_local_ai_tool_calls(session_id)?;
+        if canceled > 0 {
+            self.append_assistant(&session, "Canceled that plan.".into())?;
+        }
+        self.local_ai_chat_turn(session, false)
     }
 
     fn append_assistant(&self, session: &LocalAiChatSession, content: String) -> Result<()> {
@@ -1418,15 +1488,50 @@ fn summarize_tool_result(tool_name: &str, result: &serde_json::Value) -> String 
     }
 }
 
-/// Result of running a model tool plan through the access gate.
+/// Result of executing a write plan in order.
 #[derive(Debug, Default, Clone)]
 pub struct PlanOutcome {
     pub executed_any: bool,
-    pub blocked_any: bool,
-    pub has_proposals: bool,
     pub failed_any: bool,
     pub mutated: bool,
     pub summaries: Vec<String>,
+}
+
+/// A short intro shown above an Ask-First plan card.
+fn propose_intro(steps: &[PlannedStep]) -> String {
+    let count = steps.len();
+    if count == 1 {
+        "Here's what I'll do — confirm to apply it.".into()
+    } else {
+        format!("Here's my {count}-step plan — confirm to apply it.")
+    }
+}
+
+/// The conversational wrap-up after a plan runs: report what happened, or that
+/// nothing did. Falls back gracefully when the model isn't involved.
+fn finalize_plan(outcome: &PlanOutcome) -> String {
+    if outcome.summaries.is_empty() {
+        return if outcome.failed_any {
+            "I couldn't complete that — see the error above.".into()
+        } else {
+            "Nothing to do.".into()
+        };
+    }
+    let body = outcome.summaries.join(" ");
+    if outcome.failed_any {
+        format!("{body} I stopped there after an error.")
+    } else {
+        format!("Done. {body}")
+    }
+}
+
+/// Trim a model reply, substituting a fallback when it's blank.
+fn non_empty(content: String, fallback: &str) -> String {
+    if content.trim().is_empty() {
+        fallback.into()
+    } else {
+        content
+    }
 }
 
 fn schedule_input_from_args(args: &serde_json::Value) -> Result<ScheduleTaskInput> {
@@ -1710,37 +1815,27 @@ mod tests {
         AppService::new(database)
     }
 
-    fn plan_session(service: &AppService, mode: LocalAiAccessMode) -> (LocalAiChatSession, String) {
-        let session = service
-            .create_local_ai_chat_session(Some("Agent".into()), None)
-            .unwrap();
-        let session = service
-            .update_local_ai_chat_session_access_mode(&session.id, mode)
-            .unwrap();
-        let user = service
-            .database
-            .append_local_ai_chat_message(
-                &session.id,
-                LocalAiChatRole::User,
-                "go".into(),
-                None,
-                None,
-            )
-            .unwrap();
-        (session, user.id)
-    }
+    /// The canonical multi-step request. `build_write_plan` resolves this
+    /// deterministically, so these turn tests never touch Ollama.
+    const CREATE_CHAIN: &str = "create an organization called localtest, and then a project under that called localproject and then a task under that called localtask";
 
-    fn project_task_plan() -> Vec<ParsedToolCall> {
-        vec![
-            ParsedToolCall {
-                tool_name: "create_project".into(),
-                arguments: serde_json::json!({ "name": "localtest", "organization_selector": "any" }),
-            },
-            ParsedToolCall {
-                tool_name: "create_task".into(),
-                arguments: serde_json::json!({ "title": "do things", "project_selector": "localtest" }),
-            },
-        ]
+    async fn send(
+        service: &AppService,
+        session_id: Option<String>,
+        mode: LocalAiAccessMode,
+        message: &str,
+    ) -> LocalAiChatTurn {
+        service
+            .send_local_ai_chat_message(SendLocalAiChatMessageInput {
+                session_id,
+                message: message.into(),
+                model: None,
+                context_scope: None,
+                access_mode: Some(mode),
+                allow_write_proposals: true,
+            })
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -1764,95 +1859,111 @@ mod tests {
         assert_eq!(reloaded.access_mode, LocalAiAccessMode::FullAccess);
     }
 
-    #[test]
-    fn full_access_plan_creates_project_and_task() {
-        let service = service_with_org();
-        let (session, user_id) = plan_session(&service, LocalAiAccessMode::FullAccess);
+    #[tokio::test]
+    async fn full_access_executes_whole_plan_in_order() {
+        let service = AppService::new(Database::in_memory().unwrap());
+        let turn = send(&service, None, LocalAiAccessMode::FullAccess, CREATE_CHAIN).await;
+        assert!(turn.mutated);
+        assert!(turn.proposed_tool_calls.is_empty());
 
-        let outcome = service
-            .run_local_ai_tool_plan(&session, &user_id, project_task_plan())
-            .unwrap();
-        assert!(outcome.executed_any && outcome.mutated);
-        assert!(!outcome.has_proposals && !outcome.blocked_any);
-
-        let projects = service.database.list_projects().unwrap();
-        let project = projects.iter().find(|p| p.name == "localtest").unwrap();
-        let tasks = service.database.list_tasks().unwrap();
-        let task = tasks.iter().find(|t| t.title == "do things").unwrap();
+        // All three created, in dependency order (task under project under org).
+        let org = service.database.list_organizations().unwrap();
+        let org = org.iter().find(|o| o.name == "localtest").unwrap();
+        let project = service.database.list_projects().unwrap();
+        let project = project.iter().find(|p| p.name == "localproject").unwrap();
+        assert_eq!(project.organization_id, org.id);
+        let task = service.database.list_tasks().unwrap();
+        let task = task.iter().find(|t| t.title == "localtask").unwrap();
         assert_eq!(task.project_id, project.id);
+        // One conversational wrap-up, no follow-up needed.
+        assert!(turn.assistant_output.unwrap().starts_with("Done"));
     }
 
-    #[test]
-    fn ask_before_write_plan_proposes_then_confirms() {
-        let service = service_with_org();
-        let (session, user_id) = plan_session(&service, LocalAiAccessMode::AskBeforeWrite);
+    #[tokio::test]
+    async fn ask_first_proposes_one_grouped_plan_then_confirms() {
+        let service = AppService::new(Database::in_memory().unwrap());
+        let turn = send(
+            &service,
+            None,
+            LocalAiAccessMode::AskBeforeWrite,
+            CREATE_CHAIN,
+        )
+        .await;
 
-        let outcome = service
-            .run_local_ai_tool_plan(&session, &user_id, project_task_plan())
-            .unwrap();
-        assert!(outcome.has_proposals && !outcome.executed_any && !outcome.mutated);
-        // Nothing created yet.
-        assert!(service.database.list_projects().unwrap().is_empty());
+        // One grouped plan of three proposals; nothing created yet.
+        assert_eq!(turn.proposed_tool_calls.len(), 3);
+        assert!(!turn.mutated);
+        assert!(service.database.list_organizations().unwrap().is_empty());
 
-        // Confirm + execute each proposal in order; the task resolves the
-        // project created by the first proposal.
-        let proposals = service
-            .database
-            .list_local_ai_tool_calls(&session.id)
-            .unwrap();
-        assert_eq!(proposals.len(), 2);
-        for call in proposals {
-            service.confirm_local_ai_tool_call(&call.id).unwrap();
-            service.execute_local_ai_tool_call(&call.id).unwrap();
-        }
-
+        // Confirm the whole plan; all three are created in order.
+        let confirmed = service.confirm_local_ai_plan(&turn.session.id).unwrap();
+        assert!(confirmed.mutated);
+        assert!(confirmed.proposed_tool_calls.is_empty());
         let project = service
             .database
             .list_projects()
             .unwrap()
             .into_iter()
-            .find(|p| p.name == "localtest")
+            .find(|p| p.name == "localproject")
             .unwrap();
         let task = service
             .database
             .list_tasks()
             .unwrap()
             .into_iter()
-            .find(|t| t.title == "do things")
+            .find(|t| t.title == "localtask")
             .unwrap();
         assert_eq!(task.project_id, project.id);
     }
 
-    #[test]
-    fn read_only_plan_blocks_writes() {
-        let service = service_with_org();
-        let (session, user_id) = plan_session(&service, LocalAiAccessMode::ReadOnly);
+    #[tokio::test]
+    async fn read_only_blocks_whole_write_plan() {
+        let service = AppService::new(Database::in_memory().unwrap());
+        let turn = send(&service, None, LocalAiAccessMode::ReadOnly, CREATE_CHAIN).await;
 
-        let outcome = service
-            .run_local_ai_tool_plan(&session, &user_id, project_task_plan())
-            .unwrap();
-        assert!(outcome.blocked_any && !outcome.executed_any && !outcome.mutated);
+        assert!(!turn.mutated);
+        assert!(turn.proposed_tool_calls.is_empty());
+        assert!(service.database.list_organizations().unwrap().is_empty());
         assert!(service.database.list_projects().unwrap().is_empty());
-        assert!(service.database.list_tasks().unwrap().is_empty());
+        assert!(turn.assistant_output.unwrap().contains("Read Only"));
+    }
 
-        // A blocked tool call is logged and the user is told write access is needed.
-        let calls = service
-            .database
-            .list_local_ai_tool_calls(&session.id)
-            .unwrap();
+    #[tokio::test]
+    async fn pure_chat_echoes_without_touching_tools() {
+        let service = AppService::new(Database::in_memory().unwrap());
+        // Even in Full Access, "say X" is conversational — no tools, no writes.
+        let turn = send(
+            &service,
+            None,
+            LocalAiAccessMode::FullAccess,
+            "say the words something",
+        )
+        .await;
+        assert_eq!(turn.assistant_output.as_deref(), Some("something"));
+        assert!(!turn.mutated);
         assert!(
-            calls
-                .iter()
-                .all(|call| call.status == LocalAiToolCallStatus::BlockedByAccessMode)
+            service
+                .database
+                .list_local_ai_tool_calls(&turn.session.id)
+                .unwrap()
+                .is_empty()
         );
-        let messages = service
-            .database
-            .list_local_ai_chat_messages(&session.id)
-            .unwrap();
+
+        // "say clear schedule" must not become a clear_task_schedule call.
+        let turn = send(
+            &service,
+            Some(turn.session.id.clone()),
+            LocalAiAccessMode::FullAccess,
+            "say the words \"clear schedule\"",
+        )
+        .await;
+        assert_eq!(turn.assistant_output.as_deref(), Some("clear schedule"));
         assert!(
-            messages
-                .iter()
-                .any(|m| m.content.contains("read-only mode"))
+            service
+                .database
+                .list_local_ai_tool_calls(&turn.session.id)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -1957,5 +2068,55 @@ mod tests {
                 .error
                 .is_none()
         );
+    }
+
+    /// End-to-end against a real Ollama (needs qwen3:1.7b). Run with
+    /// `cargo test -p openmgmt-core live_new_flow_smoke -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_new_flow_smoke() {
+        let service = AppService::new(Database::in_memory().unwrap());
+
+        // Capability enrichment from /api/show.
+        let models = service.list_ollama_models().await.unwrap().models;
+        let qwen = models.iter().find(|m| m.name == "qwen3:1.7b").unwrap();
+        assert!(qwen.supports_tools && qwen.supports_thinking && !qwen.is_embedding_model);
+        assert!(qwen.context_length.is_some());
+
+        // Pure chat echoes deterministically — no model JSON, no tools.
+        let chat = send(
+            &service,
+            None,
+            LocalAiAccessMode::FullAccess,
+            "say the words something",
+        )
+        .await;
+        assert_eq!(chat.assistant_output.as_deref(), Some("something"));
+
+        // A create-chain, then a status change — each completes in one turn.
+        let setup = send(
+            &service,
+            None,
+            LocalAiAccessMode::FullAccess,
+            "create an org called Acme, a project called Web, and a task called Draft",
+        )
+        .await;
+        assert!(setup.mutated);
+        let complete = send(
+            &service,
+            Some(setup.session.id.clone()),
+            LocalAiAccessMode::FullAccess,
+            "complete the task called Draft",
+        )
+        .await;
+        assert!(complete.mutated);
+        let task = service
+            .database
+            .list_tasks()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.title == "Draft")
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Done);
     }
 }

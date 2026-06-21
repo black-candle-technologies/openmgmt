@@ -5,7 +5,8 @@
 
 use leptos::prelude::*;
 use openmgmt_core::{
-    LocalAiConnectionResult, LocalAiModelListResult, LocalAiSettings, LocalAiSettingsPatch,
+    LocalAiConnectionResult, LocalAiModel, LocalAiModelListResult, LocalAiSettings,
+    LocalAiSettingsPatch,
 };
 use serde_json::json;
 use wasm_bindgen_futures::spawn_local;
@@ -26,8 +27,9 @@ struct LocalAiView {
     default_model: RwSignal<String>,
     keep_alive: RwSignal<String>,
     temperature: RwSignal<String>,
+    context_window: RwSignal<String>,
     allow_local_network: RwSignal<bool>,
-    models: RwSignal<Vec<String>>,
+    models: RwSignal<Vec<LocalAiModel>>,
     connection: RwSignal<Option<LocalAiConnectionResult>>,
     /// True once a model list request has completed (so "no models" only shows
     /// after we've actually looked).
@@ -47,6 +49,7 @@ impl LocalAiView {
             default_model: RwSignal::new(String::new()),
             keep_alive: RwSignal::new(DEFAULT_KEEP_ALIVE.into()),
             temperature: RwSignal::new(String::new()),
+            context_window: RwSignal::new(String::new()),
             allow_local_network: RwSignal::new(false),
             models: RwSignal::new(Vec::new()),
             connection: RwSignal::new(None),
@@ -67,6 +70,12 @@ impl LocalAiView {
         self.temperature.set(
             settings
                 .temperature
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        );
+        self.context_window.set(
+            settings
+                .context_window
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
         );
@@ -92,8 +101,7 @@ impl LocalAiView {
     async fn refresh_models(self, quiet: bool) {
         match invoke::<LocalAiModelListResult>("list_ollama_models", json!({})).await {
             Ok(result) => {
-                self.models
-                    .set(result.models.into_iter().map(|model| model.name).collect());
+                self.models.set(result.models);
                 self.models_loaded.set(true);
                 // A successful tags call also confirms the connection.
                 self.connection.set(Some(LocalAiConnectionResult {
@@ -173,12 +181,21 @@ pub fn LocalAiPage(state: AppState) -> impl IntoView {
                 return;
             }
         };
+        let context_window = match parse_context_window(&view.context_window.get()) {
+            Ok(value) => value,
+            Err(error) => {
+                view.error.set(Some(error));
+                view.finish();
+                return;
+            }
+        };
         let patch = LocalAiSettingsPatch {
             enabled: Some(true),
             base_url: Some(view.base_url.get().trim().to_owned()),
             default_model: Some(optional_text(view.default_model.get())),
             keep_alive: Some(optional_text(view.keep_alive.get())),
             temperature: Some(temperature),
+            context_window: Some(context_window),
             allow_local_network: Some(view.allow_local_network.get()),
         };
         spawn_local(async move {
@@ -301,10 +318,10 @@ pub fn LocalAiPage(state: AppState) -> impl IntoView {
                             <option value="">{format!("Auto ({DEFAULT_MODEL})")}</option>
                             <For
                                 each=move || model_options(&view.models.get(), &view.default_model.get())
-                                key=|name| name.clone()
-                                let:name
+                                key=|model| model.name.clone()
+                                let:model
                             >
-                                <option value=name.clone()>{name.clone()}</option>
+                                <option value=model.name.clone()>{model_label(&model)}</option>
                             </For>
                         </select>
                     </FormField>
@@ -338,6 +355,16 @@ pub fn LocalAiPage(state: AppState) -> impl IntoView {
                             placeholder="0.7"
                             prop:value=move || view.temperature.get()
                             on:input=move |event| view.temperature.set(event_target_value(&event))
+                        />
+                    </FormField>
+                    <FormField label="Context window" hint="Blank = model default. Overrides num_ctx.">
+                        <input
+                            type="number"
+                            step="1024"
+                            min="0"
+                            placeholder="4096"
+                            prop:value=move || view.context_window.get()
+                            on:input=move |event| view.context_window.set(event_target_value(&event))
                         />
                     </FormField>
                 </div>
@@ -376,6 +403,11 @@ pub fn LocalAiPage(state: AppState) -> impl IntoView {
                     <strong>"Read only"</strong>" (look, never change), "
                     <strong>"Ask first"</strong>" (propose changes and wait for confirmation — the default), or "
                     <strong>"Full access"</strong>" (make changes without confirmation)."
+                </p>
+                <p class="settings-note">
+                    "OpenMgmt uses safe typed tools for writes — no shell, SQL, or file access. \
+                     Full access can change your workspace without asking, so use it deliberately. \
+                     OpenMgmt never loads a model just because Local AI opens; pick one to start."
                 </p>
                 <div class="localai-action-buttons">
                     <button class="btn btn-primary" on:click=move |_| state.chat_open.set(true)>
@@ -442,14 +474,79 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
-/// Dropdown options: every fetched model, plus the saved default if it isn't
-/// installed (so a configured-but-missing model is never silently dropped).
-fn model_options(models: &[String], default_model: &str) -> Vec<String> {
-    let mut options = models.to_vec();
-    if !default_model.is_empty() && !options.iter().any(|name| name == default_model) {
-        options.insert(0, default_model.to_owned());
+/// Dropdown options: installed non-embedding models, plus the saved default if
+/// it isn't installed (so a configured-but-missing model is never dropped).
+fn model_options(models: &[LocalAiModel], default_model: &str) -> Vec<LocalAiModel> {
+    let mut options = models
+        .iter()
+        .filter(|model| !model.is_embedding_model)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !default_model.is_empty() && !options.iter().any(|model| model.name == default_model) {
+        let mut placeholder = LocalAiModel {
+            name: default_model.to_owned(),
+            display_name: Some(default_model.to_owned()),
+            size: None,
+            modified_at: None,
+            digest: None,
+            family: None,
+            details: None,
+            installed: false,
+            parameter_size: None,
+            quantization_level: None,
+            context_length: None,
+            supports_tools: false,
+            supports_vision: false,
+            supports_thinking: false,
+            is_embedding_model: false,
+        };
+        placeholder.display_name = Some(default_model.to_owned());
+        options.insert(0, placeholder);
     }
     options
+}
+
+/// Dropdown label: model name plus a compact capability suffix (tools/thinking/
+/// vision/context), so the user can pick a tool-capable model at a glance.
+fn model_label(model: &LocalAiModel) -> String {
+    if !model.installed {
+        return model.name.clone();
+    }
+    let mut tags = vec![
+        if model.supports_tools {
+            "tools"
+        } else {
+            "json"
+        }
+        .to_string(),
+    ];
+    if model.supports_thinking {
+        tags.push("thinking".into());
+    }
+    if model.supports_vision {
+        tags.push("vision".into());
+    }
+    if let Some(context) = model.context_length {
+        tags.push(if context >= 1000 {
+            format!("{}k ctx", context / 1000)
+        } else {
+            format!("{context} ctx")
+        });
+    }
+    format!("{} · {}", model.name, tags.join(", "))
+}
+
+/// Parse the context-window override: blank clears it, otherwise a positive int.
+fn parse_context_window(value: &str) -> Result<Option<u64>, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed.parse::<u64>() {
+        Ok(0) => Ok(None),
+        Ok(value) => Ok(Some(value)),
+        Err(_) => Err("Context window must be a whole number (e.g. 4096) or left blank.".into()),
+    }
 }
 
 /// Short capability note for the well-known recommended models.

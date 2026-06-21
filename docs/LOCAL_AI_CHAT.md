@@ -33,32 +33,58 @@ a warning badge.
 
 ## How a Turn Works
 
-1. You send a natural-language message.
-2. OpenMgmt builds compact workspace context and a tool manifest and sends them,
-   with the access mode, to Ollama.
-3. The model replies with either a final answer or structured tool calls.
-4. OpenMgmt validates and resolves the tool calls, then applies the access gate:
-   execute (reads, or writes in full access), propose (writes in ask-first), or
-   block (writes in read-only).
-5. Tool results are appended to the transcript.
-6. If tools ran, OpenMgmt feeds the results back so the model can summarize what
-   happened. The loop is capped at a few steps so it can never run away.
+Every message is **classified** first, and only write requests ever touch the
+tool layer:
 
-Example — in Full access, "Create a project called localtest under any
-organization and make a task called do things" creates the project, then the
-task inside it, and replies with what was created. In Ask first, the same
-message shows proposed action cards; clicking Confirm runs them in order. In
-Read only, it explains it needs write access.
+1. **Classify the turn** (deterministic router): pure chat, a workspace read, a
+   write request, or something too vague to act on.
+2. **Pure chat** → a plain conversational reply. The model never sees the write
+   tool manifest and cannot call tools. "Say the words something" replies
+   "something"; "what can you do?" answers in plain language.
+3. **Read** → OpenMgmt injects compact workspace context and the model answers
+   conversationally. No mutations, no proposals.
+4. **Write** → OpenMgmt builds a **complete, ordered plan** up front (every step
+   the request needs), validates it, and then applies the access gate:
+   - **Read only** — nothing changes; it explains how to switch modes.
+   - **Ask first** — one grouped *plan card* with every step; **Confirm plan**
+     runs them in order, **Cancel** discards the whole plan.
+   - **Full access** — the whole plan executes in order automatically, then the
+     assistant reports what it did in one message.
+
+Because the plan is built before anything runs, multi-step requests finish in a
+single turn — no need to keep prompting for the next step.
+
+Example — in **Full access**, "create an organization called localtest, and then
+a project under that called localproject and then a task under that called
+localtask" creates all three (org → project → task, in dependency order) and
+replies "Done — …". In **Ask first**, the same message shows one three-step plan
+card; **Confirm plan** runs all three in order. In **Read only**, it explains it
+needs write access.
+
+### Native tools vs. JSON plan fallback
+
+Borrowing from Zed's Ollama integration, OpenMgmt detects each model's
+capabilities (see [OLLAMA.md](OLLAMA.md)). Native Ollama tool calling is used for
+tool-capable models on read interactions where it helps; models without tool
+support fall back to a strict JSON `action_plan` protocol. **Writes always go
+through the plan-first path regardless** — it's the safest product behavior, and
+it's validated and access-gated before anything mutates.
 
 ## Safety
 
 - Only known OpenMgmt operations are exposed — there is no shell, filesystem, or
   raw-SQL tool. Even Full access is "full access to OpenMgmt operations", not
   arbitrary code execution.
-- Unknown tools, malformed tool calls, and calls with missing required arguments
-  are rejected.
+- The router keeps pure chat away from tools entirely: "say the words clear
+  schedule" replies "clear schedule" — it never runs `clear_task_schedule`.
+- Write tools only run when the turn is classified as a write request, so an
+  unrelated message can't trigger a mutation even in Full access.
+- Unknown tools, malformed plans, and read tools in a write plan are rejected;
+  an invalid plan is repaired once, then turns into a clarifying question rather
+  than a random action.
 - The assistant never claims to have changed data unless a tool actually ran.
-- Destructive operations (archiving, resetting settings) are flagged.
+- Destructive operations (archiving, resetting settings) are flagged. There is no
+  destructive *delete* tool in v1.
 
 ## Privacy
 
