@@ -1,10 +1,12 @@
 use chrono::{DateTime, Utc};
 use openmgmt_core::{
-    AppService, BoardState, CalendarBlock, NewOrganization, NewProject, NewSavedTaskView, NewTask,
-    Organization, OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch,
-    ScheduleConflict, ScheduleTaskInput, ScheduledBlockCompletion, ScoringSettings,
-    ScoringSettingsPatch, SyncSettings, SyncSettingsPatch, SyncStatus, Task, TaskPatch,
-    TaskQueryFilter, TaskSort, TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
+    AppService, BoardState, CalendarBlock, LocalAiChatResponse, LocalAiConnectionResult,
+    LocalAiModelListResult, LocalAiSettings, LocalAiSettingsPatch, LocalAiWorkflowResponse,
+    NewOrganization, NewProject, NewSavedTaskView, NewTask, Organization, OrganizationPatch,
+    Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch, ScheduleConflict, ScheduleTaskInput,
+    ScheduledBlockCompletion, ScoringSettings, ScoringSettingsPatch, SyncSettings,
+    SyncSettingsPatch, SyncStatus, Task, TaskPatch, TaskQueryFilter, TaskSort, TaskTimerSession,
+    TaskWithContext, TimeBlockSuggestion,
 };
 use openmgmt_sync_client::{SyncConnectionTestResult, SyncOnceResult};
 use std::path::{Component, Path, PathBuf};
@@ -369,6 +371,93 @@ pub fn update_scoring_settings(
 #[tauri::command]
 pub fn reset_scoring_settings(service: State<'_, AppService>) -> CommandResult<ScoringSettings> {
     core(service.reset_scoring_settings())
+}
+
+#[tauri::command]
+pub fn get_local_ai_settings(service: State<'_, AppService>) -> CommandResult<LocalAiSettings> {
+    core(service.get_local_ai_settings())
+}
+
+#[tauri::command]
+pub fn update_local_ai_settings(
+    service: State<'_, AppService>,
+    patch: LocalAiSettingsPatch,
+) -> CommandResult<LocalAiSettings> {
+    core(service.update_local_ai_settings(patch))
+}
+
+#[tauri::command]
+pub fn reset_local_ai_settings(service: State<'_, AppService>) -> CommandResult<LocalAiSettings> {
+    core(service.reset_local_ai_settings())
+}
+
+#[tauri::command]
+pub async fn test_ollama_connection(
+    service: State<'_, AppService>,
+) -> CommandResult<LocalAiConnectionResult> {
+    core(service.test_ollama_connection().await)
+}
+
+#[tauri::command]
+pub async fn list_ollama_models(
+    service: State<'_, AppService>,
+) -> CommandResult<LocalAiModelListResult> {
+    core(service.list_ollama_models().await)
+}
+
+#[tauri::command]
+pub async fn run_local_ai_prompt(
+    service: State<'_, AppService>,
+    prompt: String,
+    model: Option<String>,
+) -> CommandResult<LocalAiChatResponse> {
+    core(
+        service
+            .run_ollama_chat(model, openmgmt_core::local_ai::prompt_messages(prompt))
+            .await,
+    )
+}
+
+#[tauri::command]
+pub async fn plan_day_with_local_ai(
+    service: State<'_, AppService>,
+) -> CommandResult<LocalAiWorkflowResponse> {
+    core(service.plan_day_with_ollama().await)
+}
+
+#[tauri::command]
+pub async fn summarize_project_with_local_ai(
+    service: State<'_, AppService>,
+    project_id: String,
+) -> CommandResult<LocalAiWorkflowResponse> {
+    core(service.summarize_project_with_ollama(&project_id).await)
+}
+
+#[tauri::command]
+pub async fn triage_tasks_with_local_ai(
+    service: State<'_, AppService>,
+) -> CommandResult<LocalAiWorkflowResponse> {
+    core(service.triage_tasks_with_ollama().await)
+}
+
+#[tauri::command]
+pub async fn suggest_next_task_with_local_ai(
+    service: State<'_, AppService>,
+) -> CommandResult<LocalAiWorkflowResponse> {
+    core(service.suggest_next_task_with_ollama().await)
+}
+
+#[tauri::command]
+pub async fn rewrite_task_description_with_local_ai(
+    service: State<'_, AppService>,
+    task_id: String,
+    instruction: String,
+) -> CommandResult<LocalAiWorkflowResponse> {
+    core(
+        service
+            .rewrite_task_description_with_ollama(&task_id, &instruction)
+            .await,
+    )
 }
 
 #[tauri::command]

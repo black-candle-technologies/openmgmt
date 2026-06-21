@@ -160,6 +160,83 @@ pub struct AiToolPermissionCheck {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAiSettings {
+    pub id: String,
+    pub enabled: bool,
+    pub provider: String,
+    pub base_url: String,
+    pub default_model: Option<String>,
+    pub keep_alive: Option<String>,
+    pub temperature: Option<f32>,
+    pub allow_local_network: bool,
+    pub last_connected_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LocalAiSettingsPatch {
+    pub enabled: Option<bool>,
+    pub base_url: Option<String>,
+    pub default_model: Option<Option<String>>,
+    pub keep_alive: Option<Option<String>>,
+    pub temperature: Option<Option<f32>>,
+    pub allow_local_network: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAiModel {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub size: Option<i64>,
+    pub modified_at: Option<DateTime<Utc>>,
+    pub digest: Option<String>,
+    pub family: Option<String>,
+    pub details: Option<serde_json::Value>,
+    pub installed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAiConnectionResult {
+    pub connected: bool,
+    pub version: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAiModelListResult {
+    pub connected: bool,
+    pub models: Vec<LocalAiModel>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAiChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAiChatResponse {
+    pub model: String,
+    pub content: String,
+    pub total_duration: Option<i64>,
+    pub load_duration: Option<i64>,
+    pub prompt_eval_count: Option<i64>,
+    pub eval_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAiWorkflowResponse {
+    pub content: String,
+    pub model: Option<String>,
+    pub fallback_used: bool,
+    pub fallback_task: Option<TaskWithContext>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Organization {
     pub id: String,
     pub name: String,

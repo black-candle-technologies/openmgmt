@@ -34,6 +34,7 @@ pub enum Page {
     Schedule,
     Board,
     Sync,
+    LocalAi,
     Settings,
 }
 
@@ -49,6 +50,7 @@ impl Page {
             Page::Schedule => "Schedule",
             Page::Board => "Board",
             Page::Sync => "Sync",
+            Page::LocalAi => "Local AI",
             Page::Settings => "Settings",
         }
     }

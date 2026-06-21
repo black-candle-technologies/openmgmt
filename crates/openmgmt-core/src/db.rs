@@ -2,13 +2,18 @@
 use crate::models::{ProjectStatus, ProjectType};
 use crate::{
     board::build_board,
+    local_ai::{
+        DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_KEEP_ALIVE, DEFAULT_OLLAMA_MODEL,
+        validate_local_ai_base_url,
+    },
     models::{
         ActiveTimerInfo, BoardState, CalendarBlock, CalendarBlockSource, CalendarBlockStatus,
-        NewOrganization, NewProject, NewSavedTaskView, NewTask, Organization, OrganizationPatch,
-        Project, ProjectPatch, RecurrenceRule, SavedTaskView, SavedTaskViewPatch, ScheduleConflict,
-        ScheduleTaskInput, ScheduledBlockCompletion, ScoringSettings, ScoringSettingsPatch, Task,
-        TaskContext, TaskPatch, TaskQueryFilter, TaskSort, TaskSortField, TaskStatus,
-        TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
+        LocalAiSettings, LocalAiSettingsPatch, NewOrganization, NewProject, NewSavedTaskView,
+        NewTask, Organization, OrganizationPatch, Project, ProjectPatch, RecurrenceRule,
+        SavedTaskView, SavedTaskViewPatch, ScheduleConflict, ScheduleTaskInput,
+        ScheduledBlockCompletion, ScoringSettings, ScoringSettingsPatch, Task, TaskContext,
+        TaskPatch, TaskQueryFilter, TaskSort, TaskSortField, TaskStatus, TaskTimerSession,
+        TaskWithContext, TimeBlockSuggestion,
     },
     scheduling::{generate_schedule_ics, next_recurrence_at},
     scoring::{ScoringWeights, score_task},
@@ -211,6 +216,20 @@ impl Database {
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS local_ai_settings (
+              id TEXT PRIMARY KEY NOT NULL,
+              enabled INTEGER NOT NULL,
+              provider TEXT NOT NULL,
+              base_url TEXT NOT NULL,
+              default_model TEXT,
+              keep_alive TEXT,
+              temperature REAL,
+              allow_local_network INTEGER NOT NULL DEFAULT 0,
+              last_connected_at TEXT,
+              last_error TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS sync_events (
               event_id TEXT PRIMARY KEY NOT NULL,
               device_id TEXT NOT NULL,
@@ -258,6 +277,7 @@ impl Database {
             "#,
         )?;
         self.ensure_task_scheduling_columns()?;
+        self.ensure_local_ai_settings()?;
         self.ensure_sync_event_ownership_columns()?;
         self.seed_system_saved_task_views()?;
         self.ensure_default_scoring_settings()?;
@@ -383,6 +403,22 @@ impl Database {
             save_scoring_settings_with_connection(
                 &connection,
                 &default_scoring_settings(Utc::now()),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_local_ai_settings(&self) -> Result<()> {
+        let exists: bool = self.connection()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_ai_settings WHERE id='default')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            let connection = self.connection()?;
+            save_local_ai_settings_with_connection(
+                &connection,
+                &default_local_ai_settings(Utc::now()),
             )?;
         }
         Ok(())
@@ -2057,6 +2093,62 @@ impl Database {
         Ok(settings)
     }
 
+    pub fn get_local_ai_settings(&self) -> Result<LocalAiSettings> {
+        let connection = self.connection()?;
+        get_local_ai_settings_with_connection(&connection)
+    }
+
+    pub fn update_local_ai_settings(&self, patch: LocalAiSettingsPatch) -> Result<LocalAiSettings> {
+        let mut settings = self.get_local_ai_settings()?;
+        if let Some(enabled) = patch.enabled {
+            settings.enabled = enabled;
+        }
+        if let Some(allow_local_network) = patch.allow_local_network {
+            settings.allow_local_network = allow_local_network;
+        }
+        if let Some(base_url) = patch.base_url {
+            let base_url = base_url.trim().trim_end_matches('/').to_owned();
+            validate_local_ai_base_url(&base_url, settings.allow_local_network)?;
+            settings.base_url = base_url;
+        } else {
+            validate_local_ai_base_url(&settings.base_url, settings.allow_local_network)?;
+        }
+        if let Some(default_model) = patch.default_model {
+            settings.default_model = normalize_optional(default_model);
+        }
+        if let Some(keep_alive) = patch.keep_alive {
+            settings.keep_alive = normalize_optional(keep_alive);
+        }
+        if let Some(temperature) = patch.temperature {
+            settings.temperature = temperature;
+        }
+        settings.updated_at = Utc::now();
+        let connection = self.connection()?;
+        save_local_ai_settings_with_connection(&connection, &settings)?;
+        Ok(settings)
+    }
+
+    pub fn update_local_ai_connection_status(
+        &self,
+        connected: bool,
+        error: Option<String>,
+    ) -> Result<LocalAiSettings> {
+        let mut settings = self.get_local_ai_settings()?;
+        settings.last_connected_at = connected.then(Utc::now);
+        settings.last_error = error;
+        settings.updated_at = Utc::now();
+        let connection = self.connection()?;
+        save_local_ai_settings_with_connection(&connection, &settings)?;
+        Ok(settings)
+    }
+
+    pub fn reset_local_ai_settings(&self) -> Result<LocalAiSettings> {
+        let settings = default_local_ai_settings(Utc::now());
+        let connection = self.connection()?;
+        save_local_ai_settings_with_connection(&connection, &settings)?;
+        Ok(settings)
+    }
+
     pub fn export_tasks_json(&self) -> Result<String> {
         serde_json::to_string_pretty(&self.query_tasks(TaskQueryFilter::default(), None)?)
             .map_err(|error| CoreError::Validation(format!("could not export tasks: {error}")))
@@ -3052,6 +3144,23 @@ fn map_saved_task_view(row: &Row<'_>) -> rusqlite::Result<SavedTaskView> {
     })
 }
 
+fn map_local_ai_settings(row: &Row<'_>) -> rusqlite::Result<LocalAiSettings> {
+    Ok(LocalAiSettings {
+        id: row.get(0)?,
+        enabled: row.get(1)?,
+        provider: row.get(2)?,
+        base_url: row.get(3)?,
+        default_model: row.get(4)?,
+        keep_alive: row.get(5)?,
+        temperature: row.get(6)?,
+        allow_local_network: row.get(7)?,
+        last_connected_at: parse_optional_time(row.get(8)?)?,
+        last_error: row.get(9)?,
+        created_at: parse_time(row.get(10)?)?,
+        updated_at: parse_time(row.get(11)?)?,
+    })
+}
+
 fn insert_saved_task_view_with_connection(
     connection: &Connection,
     view: &SavedTaskView,
@@ -3185,6 +3294,74 @@ fn default_scoring_settings(now: DateTime<Utc>) -> ScoringSettings {
         created_at: now,
         updated_at: now,
     }
+}
+
+fn default_local_ai_settings(now: DateTime<Utc>) -> LocalAiSettings {
+    LocalAiSettings {
+        id: "default".into(),
+        enabled: true,
+        provider: "ollama".into(),
+        base_url: DEFAULT_OLLAMA_BASE_URL.into(),
+        default_model: Some(DEFAULT_OLLAMA_MODEL.into()),
+        keep_alive: Some(DEFAULT_OLLAMA_KEEP_ALIVE.into()),
+        temperature: None,
+        allow_local_network: false,
+        last_connected_at: None,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn get_local_ai_settings_with_connection(connection: &Connection) -> Result<LocalAiSettings> {
+    connection
+        .query_row(
+            "SELECT id,enabled,provider,base_url,default_model,keep_alive,temperature,
+                    allow_local_network,last_connected_at,last_error,created_at,updated_at
+             FROM local_ai_settings WHERE id='default'",
+            [],
+            map_local_ai_settings,
+        )
+        .optional()?
+        .ok_or(CoreError::NotFound("local AI settings"))
+}
+
+fn save_local_ai_settings_with_connection(
+    connection: &Connection,
+    settings: &LocalAiSettings,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO local_ai_settings (
+            id,enabled,provider,base_url,default_model,keep_alive,temperature,
+            allow_local_network,last_connected_at,last_error,created_at,updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+         ON CONFLICT(id) DO UPDATE SET
+            enabled=excluded.enabled,
+            provider=excluded.provider,
+            base_url=excluded.base_url,
+            default_model=excluded.default_model,
+            keep_alive=excluded.keep_alive,
+            temperature=excluded.temperature,
+            allow_local_network=excluded.allow_local_network,
+            last_connected_at=excluded.last_connected_at,
+            last_error=excluded.last_error,
+            updated_at=excluded.updated_at",
+        params![
+            settings.id,
+            settings.enabled as i32,
+            settings.provider,
+            settings.base_url,
+            settings.default_model,
+            settings.keep_alive,
+            settings.temperature,
+            settings.allow_local_network as i32,
+            settings.last_connected_at.map(timestamp),
+            settings.last_error,
+            timestamp(settings.created_at),
+            timestamp(settings.updated_at),
+        ],
+    )?;
+    Ok(())
 }
 
 fn scoring_settings_to_weights(settings: &ScoringSettings) -> ScoringWeights {
@@ -3553,6 +3730,51 @@ mod tests {
         assert!(db.list_organizations().unwrap().is_empty());
         assert!(db.list_projects().unwrap().is_empty());
         assert!(db.list_tasks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn default_local_ai_settings_are_created() {
+        let db = Database::in_memory().unwrap();
+        let settings = db.get_local_ai_settings().unwrap();
+
+        assert!(settings.enabled);
+        assert_eq!(settings.provider, "ollama");
+        assert_eq!(settings.base_url, DEFAULT_OLLAMA_BASE_URL);
+        assert_eq!(
+            settings.default_model.as_deref(),
+            Some(DEFAULT_OLLAMA_MODEL)
+        );
+        assert_eq!(
+            settings.keep_alive.as_deref(),
+            Some(DEFAULT_OLLAMA_KEEP_ALIVE)
+        );
+    }
+
+    #[test]
+    fn local_ai_settings_update_persists() {
+        let db = Database::in_memory().unwrap();
+        db.update_local_ai_settings(LocalAiSettingsPatch {
+            default_model: Some(Some("llama3.2:3b".into())),
+            temperature: Some(Some(0.2)),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let settings = db.get_local_ai_settings().unwrap();
+        assert_eq!(settings.default_model.as_deref(), Some("llama3.2:3b"));
+        assert_eq!(settings.temperature, Some(0.2));
+    }
+
+    #[test]
+    fn local_ai_settings_reject_invalid_base_url() {
+        let db = Database::in_memory().unwrap();
+        let error = db
+            .update_local_ai_settings(LocalAiSettingsPatch {
+                base_url: Some("https://api.openai.com".into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(error, CoreError::Validation(_)));
     }
 
     #[test]

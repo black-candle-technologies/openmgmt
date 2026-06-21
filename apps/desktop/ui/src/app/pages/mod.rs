@@ -3,6 +3,7 @@
 mod board;
 mod daily_ops;
 mod dashboard;
+mod local_ai;
 mod organizations;
 mod project_detail;
 mod projects;
@@ -14,6 +15,7 @@ mod tasks;
 pub use board::BoardPage;
 pub use daily_ops::DailyOpsPage;
 pub use dashboard::Dashboard;
+pub use local_ai::LocalAiPage;
 pub use organizations::OrganizationsPage;
 pub use project_detail::ProjectDetailPage;
 pub use projects::ProjectsPage;

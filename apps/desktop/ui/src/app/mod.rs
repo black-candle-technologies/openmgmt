@@ -116,6 +116,7 @@ pub fn App() -> impl IntoView {
                         Page::Schedule => view! { <pages::SchedulePage state now /> }.into_any(),
                         Page::Board => view! { <pages::BoardPage state now /> }.into_any(),
                         Page::Sync => view! { <pages::SyncPage /> }.into_any(),
+                        Page::LocalAi => view! { <pages::LocalAiPage state /> }.into_any(),
                         Page::Settings => view! { <pages::SettingsPage state /> }.into_any(),
                     }}
                 </main>
@@ -146,6 +147,7 @@ fn Sidebar(state: AppState, page: RwSignal<Page>) -> impl IntoView {
                 <NavButton label="Organizations" target=Page::Organizations page />
                 <p class="sidebar-label">"OPERATIONS"</p>
                 <NavButton label="Board" target=Page::Board page />
+                <NavButton label="Local AI" target=Page::LocalAi page />
                 <NavButton label="Sync" target=Page::Sync page />
                 <NavButton label="Settings" target=Page::Settings page />
             </nav>

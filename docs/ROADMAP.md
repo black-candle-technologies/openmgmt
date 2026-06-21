@@ -17,6 +17,7 @@
 - Configurable workday boundaries and scoring weights
 - Recurring tasks, dependencies, and saved filters
 - SQLite backup, restore, and JSON/CSV export
+- Local model integration through Ollama
 - Tauri end-to-end tests and accessibility audit
 
 ## Scheduling and Calendar Integration

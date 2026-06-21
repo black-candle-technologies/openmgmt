@@ -4,6 +4,8 @@ pub mod board;
 pub mod commands;
 #[cfg(feature = "native")]
 pub mod db;
+#[cfg(feature = "native")]
+pub mod local_ai;
 pub mod models;
 pub mod scheduling;
 pub mod scoring;

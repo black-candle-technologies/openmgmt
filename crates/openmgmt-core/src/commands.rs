@@ -1,7 +1,14 @@
 use crate::{
     db::{Database, Result},
+    local_ai::{
+        OllamaClient, plan_day_prompt, prompt_messages, rewrite_task_prompt,
+        suggest_next_task_prompt, summarize_project_prompt, triage_tasks_prompt, workflow_error,
+        workflow_response,
+    },
     models::{
-        BoardState, CalendarBlock, NewOrganization, NewProject, NewSavedTaskView, NewTask,
+        BoardState, CalendarBlock, LocalAiChatMessage, LocalAiChatResponse,
+        LocalAiConnectionResult, LocalAiModelListResult, LocalAiSettings, LocalAiSettingsPatch,
+        LocalAiWorkflowResponse, NewOrganization, NewProject, NewSavedTaskView, NewTask,
         Organization, OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch,
         ScheduleConflict, ScheduleTaskInput, ScheduledBlockCompletion, ScoringSettings,
         ScoringSettingsPatch, Task, TaskPatch, TaskQueryFilter, TaskSort, TaskStatus,
@@ -9,7 +16,7 @@ use crate::{
     },
     sync::{SyncSettings, SyncSettingsPatch, SyncStatus},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 
 #[derive(Clone)]
 pub struct AppService {
@@ -205,6 +212,167 @@ impl AppService {
     pub fn reset_scoring_settings(&self) -> Result<ScoringSettings> {
         self.database.reset_scoring_settings()
     }
+    pub fn get_local_ai_settings(&self) -> Result<LocalAiSettings> {
+        self.database.get_local_ai_settings()
+    }
+    pub fn update_local_ai_settings(&self, patch: LocalAiSettingsPatch) -> Result<LocalAiSettings> {
+        self.database.update_local_ai_settings(patch)
+    }
+    pub fn reset_local_ai_settings(&self) -> Result<LocalAiSettings> {
+        self.database.reset_local_ai_settings()
+    }
+    pub async fn test_ollama_connection(&self) -> Result<LocalAiConnectionResult> {
+        let settings = self.database.get_local_ai_settings()?;
+        let result = OllamaClient::new(&settings, 4)?.test_connection().await;
+        let _ = self
+            .database
+            .update_local_ai_connection_status(result.connected, result.error.clone())?;
+        Ok(result)
+    }
+    pub async fn list_ollama_models(&self) -> Result<LocalAiModelListResult> {
+        let settings = self.database.get_local_ai_settings()?;
+        Ok(OllamaClient::new(&settings, 5)?.list_models().await)
+    }
+    pub async fn run_ollama_chat(
+        &self,
+        model: Option<String>,
+        messages: Vec<LocalAiChatMessage>,
+    ) -> Result<LocalAiChatResponse> {
+        let settings = self.database.get_local_ai_settings()?;
+        if !settings.enabled {
+            return Err(crate::db::CoreError::Validation(
+                "local AI integration is disabled".into(),
+            ));
+        }
+        OllamaClient::new(&settings, 30)?
+            .chat(&settings, model, messages)
+            .await
+    }
+    pub async fn plan_day_with_ollama(&self) -> Result<LocalAiWorkflowResponse> {
+        let board = self.database.board_state()?;
+        let schedule = self.database.get_schedule_today()?;
+        Ok(
+            match self
+                .run_ollama_chat(None, prompt_messages(plan_day_prompt(&board, &schedule)))
+                .await
+            {
+                Ok(chat) => workflow_response(chat, false, None),
+                Err(error) => workflow_error(error),
+            },
+        )
+    }
+    pub async fn summarize_project_with_ollama(
+        &self,
+        project_id: &str,
+    ) -> Result<LocalAiWorkflowResponse> {
+        let project = self.database.get_project(project_id)?;
+        let tasks = self
+            .database
+            .list_tasks()?
+            .into_iter()
+            .filter(|task| task.project_id == project_id)
+            .collect::<Vec<_>>();
+        Ok(
+            match self
+                .run_ollama_chat(
+                    None,
+                    prompt_messages(summarize_project_prompt(&project, &tasks)),
+                )
+                .await
+            {
+                Ok(chat) => workflow_response(chat, false, None),
+                Err(error) => workflow_error(error),
+            },
+        )
+    }
+    pub async fn triage_tasks_with_ollama(&self) -> Result<LocalAiWorkflowResponse> {
+        let now = Utc::now();
+        let overdue = self.database.get_overdue_tasks()?;
+        let unscheduled = self.database.get_unscheduled_tasks()?;
+        let tasks = self
+            .database
+            .query_tasks(TaskQueryFilter::default(), Some(TaskSort::default()))?;
+        let blocked = tasks
+            .iter()
+            .filter(|item| matches!(item.task.status, TaskStatus::Blocked | TaskStatus::Waiting))
+            .cloned()
+            .collect::<Vec<_>>();
+        let due_soon = tasks
+            .iter()
+            .filter(|item| {
+                item.task
+                    .due_at
+                    .is_some_and(|due| due >= now && due <= now + Duration::hours(24))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(
+            match self
+                .run_ollama_chat(
+                    None,
+                    prompt_messages(triage_tasks_prompt(
+                        &overdue,
+                        &blocked,
+                        &due_soon,
+                        &unscheduled,
+                    )),
+                )
+                .await
+            {
+                Ok(chat) => workflow_response(chat, false, None),
+                Err(error) => workflow_error(error),
+            },
+        )
+    }
+    pub async fn suggest_next_task_with_ollama(&self) -> Result<LocalAiWorkflowResponse> {
+        let board = self.database.board_state()?;
+        let tasks = self
+            .database
+            .query_tasks(TaskQueryFilter::default(), Some(TaskSort::default()))?;
+        match self
+            .run_ollama_chat(
+                None,
+                prompt_messages(suggest_next_task_prompt(&board, &tasks)),
+            )
+            .await
+        {
+            Ok(chat) => Ok(workflow_response(chat, false, None)),
+            Err(error) => Ok(LocalAiWorkflowResponse {
+                content: tasks
+                    .first()
+                    .map(|task| {
+                        format!(
+                            "Fallback next task: P{} {}. {}",
+                            task.task.priority, task.task.title, error
+                        )
+                    })
+                    .unwrap_or_else(|| format!("No available task. {error}")),
+                model: None,
+                fallback_used: true,
+                fallback_task: tasks.first().cloned(),
+                error: Some(error.to_string()),
+            }),
+        }
+    }
+    pub async fn rewrite_task_description_with_ollama(
+        &self,
+        task_id: &str,
+        instruction: &str,
+    ) -> Result<LocalAiWorkflowResponse> {
+        let task = self.database.get_task(task_id)?;
+        Ok(
+            match self
+                .run_ollama_chat(
+                    None,
+                    prompt_messages(rewrite_task_prompt(&task, instruction)),
+                )
+                .await
+            {
+                Ok(chat) => workflow_response(chat, false, None),
+                Err(error) => workflow_error(error),
+            },
+        )
+    }
     pub fn export_tasks_json(&self) -> Result<String> {
         self.database.export_tasks_json()
     }
@@ -237,5 +405,98 @@ impl AppService {
     }
     pub fn clear_sync_error(&self) -> Result<SyncStatus> {
         self.database.clear_sync_error()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::local_ai::{DEFAULT_OLLAMA_MODEL, prompt_messages};
+    use crate::models::{LocalAiSettingsPatch, NewOrganization, NewProject, NewTask, ProjectType};
+
+    #[tokio::test]
+    async fn suggest_next_task_falls_back_when_ollama_is_unavailable() {
+        let database = Database::in_memory().unwrap();
+        database
+            .update_local_ai_settings(LocalAiSettingsPatch {
+                base_url: Some("http://127.0.0.1:9".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let organization = database
+            .create_organization(NewOrganization {
+                name: "Test".into(),
+                slug: None,
+                description: None,
+                color: None,
+                icon: None,
+            })
+            .unwrap();
+        let project = database
+            .create_project(NewProject {
+                organization_id: organization.id,
+                name: "Project".into(),
+                slug: None,
+                description: None,
+                project_type: ProjectType::Software,
+                status: Default::default(),
+                priority: 3,
+                deadline: None,
+                repo_url: None,
+                notes: None,
+            })
+            .unwrap();
+        let p1 = database
+            .create_task(NewTask {
+                project_id: project.id,
+                title: "Top task".into(),
+                description: None,
+                status: Default::default(),
+                priority: 1,
+                due_at: None,
+                scheduled_at: None,
+                estimated_minutes: None,
+                time_limit_minutes: None,
+                pinned: false,
+                tags: Vec::new(),
+            })
+            .unwrap();
+
+        let response = AppService::new(database)
+            .suggest_next_task_with_ollama()
+            .await
+            .unwrap();
+
+        assert!(response.fallback_used);
+        assert_eq!(response.fallback_task.unwrap().task.id, p1.id);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_ollama_smoke() {
+        let service = AppService::new(Database::in_memory().unwrap());
+
+        assert!(service.test_ollama_connection().await.unwrap().connected);
+        assert!(service.list_ollama_models().await.unwrap().connected);
+        assert!(
+            !service
+                .run_ollama_chat(
+                    Some(DEFAULT_OLLAMA_MODEL.into()),
+                    prompt_messages("Say ready.".into()),
+                )
+                .await
+                .unwrap()
+                .content
+                .trim()
+                .is_empty()
+        );
+        assert!(
+            service
+                .plan_day_with_ollama()
+                .await
+                .unwrap()
+                .error
+                .is_none()
+        );
     }
 }

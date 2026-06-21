@@ -1205,3 +1205,50 @@ a { color: inherit; }
   margin-left: 7px; font: 700 10px var(--mono); letter-spacing: 0.03em;
   color: #9fb46a; white-space: nowrap;
 }
+
+/* 18. Local AI / Ollama page --------------------------------------------- */
+.localai-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+
+.localai-privacy { display: flex; align-items: flex-start; gap: 12px; }
+.localai-privacy-mark { flex-shrink: 0; width: 34px; height: 34px; display: grid; place-items: center; border-radius: var(--radius-sm); background: var(--surface-sunken); color: var(--green); }
+.localai-privacy-mark svg { fill: none; stroke: currentcolor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.localai-privacy p { margin: 0; color: var(--text-soft); font-size: 13px; line-height: 1.5; }
+
+.localai-version { margin: -4px 0 12px; color: var(--text-muted); font-size: 13px; }
+.localai-version strong { color: var(--text-soft); font-family: var(--mono); }
+
+.localai-model-row { display: flex; align-items: flex-end; gap: 10px; }
+.localai-model-row .form-field { flex: 1; }
+.localai-refresh { flex-shrink: 0; margin-bottom: 14px; }
+.localai-model-note { margin: -6px 0 12px; color: var(--text-muted); font-size: 12px; }
+
+.localai-action-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+.localai-action-row { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 10px; padding-top: 14px; border-top: 1px solid var(--line); }
+.localai-action-row .form-field { flex: 1 1 200px; margin-bottom: 0; }
+.localai-action-rewrite { flex-direction: column; align-items: stretch; }
+.localai-action-rewrite .form-field { flex: 1; }
+.localai-go { flex-shrink: 0; }
+.localai-empty { margin: 4px 0 0; color: var(--text-muted); font-size: 12px; }
+
+.localai-onboard { border-left: 3px solid var(--warn); }
+.localai-onboard-title { font-size: 16px; margin-bottom: 6px; }
+.localai-onboard p { color: var(--text-soft); font-size: 13px; line-height: 1.5; margin: 0 0 12px; }
+.localai-link { color: var(--green); font-weight: 600; }
+.localai-snippet { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.localai-snippet code { flex: 1; font: 13px var(--mono); background: var(--surface-sunken); color: var(--text); padding: 8px 11px; border-radius: var(--radius-sm); overflow-x: auto; white-space: nowrap; }
+.localai-copy { flex-shrink: 0; padding: 7px 12px; }
+
+.localai-result { margin-top: 16px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-2); overflow: hidden; }
+.localai-result-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--surface-sunken); }
+.localai-result-label { font-weight: 700; font-size: 14px; }
+.localai-result-model { font: 11px var(--mono); color: var(--text-muted); }
+.localai-fallback { margin: 0; padding: 10px 14px; color: #8a5a1c; background: #f6ecd9; font-size: 12px; border-bottom: 1px solid var(--line); }
+.localai-result-body {
+  margin: 0; padding: 14px; max-height: 420px; overflow: auto;
+  font: 13px/1.55 var(--font); color: var(--text);
+  white-space: pre-wrap; word-break: break-word;
+}
+
+@media (max-width: 1000px) {
+  .localai-layout { grid-template-columns: 1fr; }
+}
