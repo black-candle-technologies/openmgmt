@@ -219,7 +219,7 @@ pub fn LocalAiPage(state: AppState) -> impl IntoView {
         <PageHeader
             eyebrow="LOCAL ASSISTANT"
             title="Local AI"
-            description="Run planning and triage with a local Ollama model. Nothing leaves your machine."
+            description="A local assistant that can read your workspace and, depending on access mode, manage tasks, projects, and schedules. Nothing leaves your machine."
         >
             {move || {
                 let (label, tone) = status_badge(
@@ -364,13 +364,18 @@ pub fn LocalAiPage(state: AppState) -> impl IntoView {
                 </div>
             </Panel>
 
-            // --- Command chat launcher -------------------------------------
+            // --- Assistant launcher ----------------------------------------
             <Panel class="localai-actions">
-                <div class="section-head"><div class="section-head-title"><h2>"Command chat"</h2></div></div>
+                <div class="section-head"><div class="section-head-title"><h2>"Assistant"</h2></div></div>
                 <p class="settings-note">
-                    "Open the Local AI chat to ask about your work, run slash commands like "
-                    <code>"/plan"</code>" or "<code>"/board"</code>", and confirm safe write actions. \
-                     It reads your data and never changes anything without your confirmation."
+                    "Open the Local AI chat to ask about your work or tell it what to change in plain language. \
+                     It reads your workspace and manages tasks, projects, and schedules through safe, typed tools."
+                </p>
+                <p class="settings-note">
+                    "Access mode is set inside each chat: "
+                    <strong>"Read only"</strong>" (look, never change), "
+                    <strong>"Ask first"</strong>" (propose changes and wait for confirmation — the default), or "
+                    <strong>"Full access"</strong>" (make changes without confirmation)."
                 </p>
                 <div class="localai-action-buttons">
                     <button class="btn btn-primary" on:click=move |_| state.chat_open.set(true)>

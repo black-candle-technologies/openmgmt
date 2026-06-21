@@ -1,6 +1,9 @@
 # OpenMgmt Ollama Integration
 
-OpenMgmt can use a local Ollama server for local AI command chat and planning workflows. Data is sent only to the configured local Ollama base URL.
+OpenMgmt uses a local Ollama server to power the Local AI chat — an agent-style
+assistant that reads your workspace and, depending on access mode, manages
+OpenMgmt through typed tools. Data is sent only to the configured local Ollama
+base URL.
 
 ## Setup
 
@@ -27,24 +30,29 @@ Default OpenMgmt settings:
 - Keep alive: `5m`
 - Chat mode: non-streaming `/api/chat` with `"stream": false`
 
-## Workflows
+## What It Powers
 
-OpenMgmt can:
+OpenMgmt uses Ollama to:
 
-- Test the local Ollama connection with `/api/version`
-- List installed local models with `/api/tags`
-- Run a simple prompt with `/api/chat`
-- Persist local AI chat sessions and messages
-- Switch models per chat session with `/use <model>`
-- Run deterministic slash commands such as `/board`, `/tasks blocked`, and `/schedule today`
-- Propose write tools that require confirmation before execution
-- Plan the day from board and schedule context
-- Suggest the next task
-- Triage overdue, blocked, due-soon, and unscheduled tasks
-- Summarize a project
-- Suggest a rewritten task description without saving it
+- Test the local connection with `/api/version` and list installed models with `/api/tags`.
+- Run the Local AI **agent loop** over non-streaming `/api/chat`: natural-language
+  in, structured tool calls out, validated and gated by the chat's access mode.
+- Read your workspace and manage tasks/projects/schedules through typed tools.
+- Persist chat sessions and messages, with per-session model selection.
 
-See `docs/LOCAL_AI_CHAT.md` for the chat/tool flow.
+Access modes (Read only / Ask first / Full access) are documented in
+`docs/LOCAL_AI_CHAT.md`. The earlier planning workflows (plan day, suggest next
+task, triage, summarize project) still exist behind the scenes, but the chat is
+now an agent rather than a command runner.
+
+### Structured tool protocol
+
+Local models rarely support native function calling, so the model is asked to
+return one JSON object per turn — either `{"type":"final","message":"…"}` or
+`{"type":"tool_calls","tool_calls":[…]}`. OpenMgmt parses this defensively
+(fenced, loose, or surrounded by prose), retries once with a stricter nudge on
+malformed output, and falls back to plain text without ever claiming a write
+happened.
 
 ## Privacy
 
@@ -57,3 +65,6 @@ This integration is local-only. OpenMgmt rejects cloud-looking base URLs and doe
 - Model too slow: use a smaller model such as `qwen3:1.7b`.
 - GPU or VRAM pressure: close other GPU-heavy apps or use a smaller quantized model.
 - Wrong URL: use `http://127.0.0.1:11434` unless you explicitly enabled local-network access.
+- Model "says" it did something but nothing changed: that means it didn't emit a
+  valid tool call (common with very small models). Rephrase, or pick a slightly
+  larger model. The tool runtime intentionally never fakes a mutation from prose.

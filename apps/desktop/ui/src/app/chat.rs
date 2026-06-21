@@ -1,7 +1,8 @@
-//! The global Local AI command chat: a right-docked overlay panel, available on
-//! every page, that talks to the local Ollama-backed chat tools. It runs slash
-//! commands, shows proposed write actions as confirm/cancel cards, and renders
-//! read-tool results — never mutating data without an explicit confirm.
+//! The global Local AI agent chat: a right-docked overlay panel, available on
+//! every page, that talks to the local Ollama-backed agent runtime. It speaks
+//! natural language, runs OpenMgmt tools through a typed runtime, and is gated
+//! by a per-chat access mode (read only / ask first / full access) — never
+//! mutating data without the access the user has granted.
 //!
 //! All chat state lives in [`ChatState`] (created once in [`LocalAiChat`], which
 //! is always mounted in the app shell) so a session persists across page
@@ -9,36 +10,20 @@
 
 use leptos::prelude::*;
 use openmgmt_core::{
-    LocalAiChatMessageRecord, LocalAiChatRole, LocalAiChatSession, LocalAiChatTurn,
-    LocalAiConnectionResult, LocalAiContextScope, LocalAiModelListResult, LocalAiSettings,
+    LocalAiAccessMode, LocalAiChatMessageRecord, LocalAiChatRole, LocalAiChatSession,
+    LocalAiChatTurn, LocalAiConnectionResult, LocalAiModelListResult, LocalAiSettings,
     LocalAiToolCall, LocalAiToolCallStatus,
 };
 use serde_json::json;
 use wasm_bindgen_futures::spawn_local;
 
 use super::components::Badge;
-use super::state::{AppState, Page, invoke};
+use super::state::{AppState, Page, confirmed, invoke};
 
 const DEFAULT_MODEL: &str = "qwen3:1.7b";
 
-/// The slash commands shown in the inline hint (kept in sync with the backend
-/// `slash_help`). Static because the set is fixed and documented.
-const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/help", "List commands"),
-    ("/plan", "Plan today"),
-    ("/board", "Current board state"),
-    ("/tasks", "Active tasks"),
-    ("/tasks blocked", "Blocked + waiting tasks"),
-    ("/tasks overdue", "Overdue tasks"),
-    ("/schedule today", "Today's schedule"),
-    ("/schedule week", "This week's schedule"),
-    ("/unscheduled", "Unscheduled tasks"),
-    ("/models", "List local models"),
-    ("/use <model>", "Switch model for this chat"),
-    ("/create task <title>", "Propose a new task"),
-    ("/complete task <id>", "Propose completing a task"),
-    ("/start task <id>", "Propose starting a task"),
-];
+const FULL_ACCESS_WARNING: &str =
+    "Allow Local AI to create and update OpenMgmt data without confirmation in this chat?";
 
 #[derive(Clone, Copy)]
 struct ChatState {
@@ -49,9 +34,10 @@ struct ChatState {
     proposals: RwSignal<Vec<LocalAiToolCall>>,
     models: RwSignal<Vec<String>>,
     model: RwSignal<String>,
+    /// The single user-facing control: how much this chat may change.
+    access_mode: RwSignal<LocalAiAccessMode>,
     connected: RwSignal<Option<bool>>,
     input: RwSignal<String>,
-    scope: RwSignal<LocalAiContextScope>,
     sending: RwSignal<bool>,
     busy_tool: RwSignal<Option<String>>,
     error: RwSignal<Option<String>>,
@@ -69,9 +55,9 @@ impl ChatState {
             proposals: RwSignal::new(Vec::new()),
             models: RwSignal::new(Vec::new()),
             model: RwSignal::new(String::new()),
+            access_mode: RwSignal::new(LocalAiAccessMode::AskBeforeWrite),
             connected: RwSignal::new(None),
             input: RwSignal::new(String::new()),
-            scope: RwSignal::new(LocalAiContextScope::Daily),
             sending: RwSignal::new(false),
             busy_tool: RwSignal::new(None),
             error: RwSignal::new(None),
@@ -112,8 +98,6 @@ impl ChatState {
                     .set(result.models.into_iter().map(|model| model.name).collect());
             }
             Err(_) => {
-                // Fall back to a plain connection probe so the badge is right
-                // even if the tags call shape changes.
                 if let Ok(conn) =
                     invoke::<LocalAiConnectionResult>("test_ollama_connection", json!({})).await
                 {
@@ -126,6 +110,7 @@ impl ChatState {
     async fn adopt_session(self, session: LocalAiChatSession) {
         self.session_id.set(Some(session.id.clone()));
         self.session_title.set(session.title.clone());
+        self.access_mode.set(session.access_mode);
         if let Some(model) = session.model.clone() {
             self.model.set(model);
         }
@@ -147,6 +132,7 @@ impl ChatState {
     fn apply_turn(self, turn: LocalAiChatTurn) {
         self.session_id.set(Some(turn.session.id.clone()));
         self.session_title.set(turn.session.title.clone());
+        self.access_mode.set(turn.session.access_mode);
         if let Some(model) = turn.session.model.clone() {
             self.model.set(model);
         }
@@ -179,29 +165,33 @@ pub fn LocalAiChat(state: AppState, page: RwSignal<Page>) -> impl IntoView {
             let value = chat.model.get();
             (!value.is_empty()).then_some(value)
         };
-        // `input` is the top-level command arg (no casing conversion needed for a
-        // lowercase name). Its NESTED fields are deserialized by serde directly,
-        // so they must use the struct's snake_case field names — Tauri's
-        // camelCase→snake_case conversion applies only to top-level args.
+        // `input` is the top-level command arg. Its NESTED fields are
+        // deserialized by serde directly, so they must use the struct's
+        // snake_case field names — Tauri's camelCase→snake_case conversion
+        // applies only to top-level args.
         let input = json!({
             "input": {
                 "session_id": chat.session_id.get(),
                 "message": message,
                 "model": model,
-                "context_scope": chat.scope.get(),
+                "access_mode": access_mode_value(chat.access_mode.get()),
                 "allow_write_proposals": true,
             }
         });
         spawn_local(async move {
             match invoke::<LocalAiChatTurn>("send_local_ai_chat_message", input).await {
                 Ok(turn) => {
+                    let mutated = turn.mutated;
                     chat.apply_turn(turn);
-                    // Pick up a freshly created session in the session list.
                     if let Ok(sessions) =
                         invoke::<Vec<LocalAiChatSession>>("list_local_ai_chat_sessions", json!({}))
                             .await
                     {
                         chat.sessions.set(sessions);
+                    }
+                    // The agent changed data in full-access mode: refresh the app.
+                    if mutated {
+                        state.refresh();
                     }
                 }
                 Err(error) => chat.error.set(Some(error)),
@@ -214,8 +204,8 @@ pub fn LocalAiChat(state: AppState, page: RwSignal<Page>) -> impl IntoView {
         chat.busy_tool.set(Some(call_id.clone()));
         chat.error.set(None);
         spawn_local(async move {
-            // Confirm marks the call ready; execute performs the known operation
-            // and appends a tool-result message. A write needs both steps.
+            // Confirm marks the call ready; execute performs the operation,
+            // resolves any name selectors, and appends a result message.
             let confirmed =
                 invoke::<LocalAiToolCall>("confirm_local_ai_tool_call", json!({ "id": call_id }))
                     .await;
@@ -259,6 +249,12 @@ pub fn LocalAiChat(state: AppState, page: RwSignal<Page>) -> impl IntoView {
         });
     };
 
+    let confirm_all = move || {
+        for call in chat.proposals.get() {
+            confirm(call.id.clone());
+        }
+    };
+
     let new_chat = move || {
         chat.error.set(None);
         chat.session_id.set(None);
@@ -274,7 +270,12 @@ pub fn LocalAiChat(state: AppState, page: RwSignal<Page>) -> impl IntoView {
                 <div class="chat-overlay" class:chat-expanded=move || chat.expanded.get()>
                     <ChatHeader chat state page />
                     <ChatSessions chat new_chat=Callback::new(move |_| new_chat()) />
-                    <ChatBody chat confirm=Callback::new(confirm) cancel=Callback::new(cancel) />
+                    <ChatBody
+                        chat
+                        confirm=Callback::new(confirm)
+                        cancel=Callback::new(cancel)
+                        confirm_all=Callback::new(move |_| confirm_all())
+                    />
                     <ChatFooter chat send=Callback::new(move |_| send()) />
                 </div>
             }
@@ -285,16 +286,55 @@ pub fn LocalAiChat(state: AppState, page: RwSignal<Page>) -> impl IntoView {
 #[component]
 fn ChatHeader(chat: ChatState, state: AppState, page: RwSignal<Page>) -> impl IntoView {
     let refresh_models = move || spawn_local(async move { chat.refresh_models().await });
+
+    // Switching to full access asks once (not per message); cancelling re-asserts
+    // the dropdown back to the real mode.
+    let on_mode_change = move |event: leptos::ev::Event| {
+        let requested = access_mode_from_value(&event_target_value(&event));
+        let current = chat.access_mode.get();
+        if requested == current {
+            return;
+        }
+        if matches!(requested, LocalAiAccessMode::FullAccess) && !confirmed(FULL_ACCESS_WARNING) {
+            chat.access_mode.set(current);
+            return;
+        }
+        chat.access_mode.set(requested);
+        if let Some(id) = chat.session_id.get() {
+            spawn_local(async move {
+                let _ = invoke::<LocalAiChatSession>(
+                    "update_local_ai_chat_session_access_mode",
+                    json!({ "id": id, "accessMode": access_mode_value(requested) }),
+                )
+                .await;
+            });
+        }
+    };
+
     view! {
         <header class="chat-head">
             <div class="chat-head-lead">
                 <span class="chat-head-title">"OpenMgmt Local AI"</span>
                 {move || {
-                    let (label, tone) = status_badge(chat.connected.get(), &chat.model.get());
+                    let (label, tone) = status_badge(chat.connected.get());
+                    view! { <Badge label=label tone=tone /> }
+                }}
+                {move || {
+                    let (label, tone) = access_mode_badge(chat.access_mode.get());
                     view! { <Badge label=label tone=tone /> }
                 }}
             </div>
             <div class="chat-head-controls">
+                <select
+                    class="chat-access"
+                    title=move || access_mode_hint(chat.access_mode.get())
+                    prop:value=move || access_mode_value(chat.access_mode.get())
+                    on:change=on_mode_change
+                >
+                    <option value="read_only">"Read only"</option>
+                    <option value="ask_before_write">"Ask first"</option>
+                    <option value="full_access">"Full access"</option>
+                </select>
                 <select
                     class="chat-model"
                     prop:value=move || chat.model.get()
@@ -327,7 +367,12 @@ fn ChatHeader(chat: ChatState, state: AppState, page: RwSignal<Page>) -> impl In
 }
 
 #[component]
-fn ChatBody(chat: ChatState, confirm: Callback<String>, cancel: Callback<String>) -> impl IntoView {
+fn ChatBody(
+    chat: ChatState,
+    confirm: Callback<String>,
+    cancel: Callback<String>,
+    confirm_all: Callback<()>,
+) -> impl IntoView {
     view! {
         <div class="chat-body">
             {move || chat.error.get().map(|message| view! {
@@ -340,7 +385,7 @@ fn ChatBody(chat: ChatState, confirm: Callback<String>, cancel: Callback<String>
             {move || (chat.connected.get() == Some(false)).then(|| view! {
                 <div class="chat-notice">
                     <strong>"Ollama is not running"</strong>
-                    <p>"Start Ollama, then refresh models. Slash commands like /board and /tasks still work without a model."</p>
+                    <p>"Start Ollama, then refresh models to chat with the local assistant."</p>
                     <code>"ollama serve"</code>
                 </div>
             })}
@@ -355,10 +400,12 @@ fn ChatBody(chat: ChatState, confirm: Callback<String>, cancel: Callback<String>
             {move || {
                 let messages = chat.messages.get();
                 if messages.is_empty() {
+                    let mode = chat.access_mode.get();
                     view! {
                         <div class="chat-empty">
-                            <p class="chat-empty-title">"Ask about your work, or run a command."</p>
-                            <p class="chat-empty-hint">"Try "<code>"/help"</code>", "<code>"/plan"</code>", or \"What should I work on next?\""</p>
+                            <p class="chat-empty-title">"Ask about your work, or tell me what to change."</p>
+                            <p class="chat-empty-hint">"Try \"What should I work on next?\" or \"Create a project called Website and add a task to draft the brief.\""</p>
+                            <p class="chat-empty-mode">{access_mode_hint(mode)}</p>
                         </div>
                     }.into_any()
                 } else {
@@ -370,7 +417,16 @@ fn ChatBody(chat: ChatState, confirm: Callback<String>, cancel: Callback<String>
                 }
             }}
 
-            // Pending proposed write actions.
+            // Pending proposed write actions (Ask First mode).
+            {move || {
+                let proposals = chat.proposals.get();
+                (proposals.len() > 1).then(|| view! {
+                    <div class="chat-plan-actions">
+                        <span class="chat-plan-label">{format!("{} proposed actions", proposals.len())}</span>
+                        <button class="btn btn-primary btn-sm" on:click=move |_| confirm_all.run(())>"Confirm all"</button>
+                    </div>
+                })
+            }}
             <For each=move || chat.proposals.get() key=|call| call.id.clone() let:call>
                 {proposal_card(call, chat, confirm, cancel)}
             </For>
@@ -392,37 +448,6 @@ fn ChatFooter(chat: ChatState, send: Callback<()>) -> impl IntoView {
     };
     view! {
         <div class="chat-foot">
-            {move || chat.input.get().starts_with('/').then(|| view! {
-                <div class="chat-slash">
-                    <For
-                        each=move || slash_matches(&chat.input.get())
-                        key=|(cmd, _)| cmd.to_string()
-                        let:item
-                    >
-                        <button
-                            class="chat-slash-item"
-                            on:click=move |_| chat.input.set(fill_command(item.0))
-                        >
-                            <code>{item.0}</code><span>{item.1}</span>
-                        </button>
-                    </For>
-                </div>
-            })}
-            <div class="chat-foot-controls">
-                <select
-                    class="chat-scope"
-                    title="Context sent to the model"
-                    prop:value=move || scope_value(chat.scope.get())
-                    on:change=move |event| chat.scope.set(scope_from_value(&event_target_value(&event)))
-                >
-                    <option value="daily">"Daily"</option>
-                    <option value="schedule">"Schedule"</option>
-                    <option value="project">"Project"</option>
-                    <option value="full_summary">"Full summary"</option>
-                    <option value="minimal">"Minimal"</option>
-                </select>
-                <span class="chat-slash-hint">"/ for commands"</span>
-            </div>
             <div class="chat-input-row">
                 <textarea
                     class="chat-input"
@@ -452,23 +477,16 @@ fn ChatSessions(chat: ChatState, new_chat: Callback<()>) -> impl IntoView {
                     {
                         let id = session.id.clone();
                         let active = move || chat.session_id.get().as_deref() == Some(id.as_str());
-                        let open_id = session.id.clone();
+                        let open_session = session.clone();
                         view! {
                             <button
                                 class="chat-session"
                                 class:active=active
                                 title=session.title.clone()
                                 on:click=move |_| {
-                                    let session_id = open_id.clone();
+                                    let session = open_session.clone();
                                     spawn_local(async move {
-                                        if let Ok(messages) = invoke::<Vec<LocalAiChatMessageRecord>>(
-                                            "list_local_ai_chat_messages",
-                                            json!({ "sessionId": session_id }),
-                                        ).await {
-                                            chat.session_id.set(Some(session_id.clone()));
-                                            chat.messages.set(messages);
-                                            chat.proposals.set(Vec::new());
-                                        }
+                                        chat.adopt_session(session).await;
                                     });
                                 }
                             >{session.title.clone()}</button>
@@ -480,23 +498,39 @@ fn ChatSessions(chat: ChatState, new_chat: Callback<()>) -> impl IntoView {
     }
 }
 
-/// One chat message bubble. Tool/JSON-ish content renders in a scrollable mono
-/// block; everything else as wrapped text.
+/// One chat message bubble. User/assistant render as wrapped text (or mono for
+/// structured fallback output); tool results render as compact action cards.
 fn message_view(message: LocalAiChatMessageRecord) -> impl IntoView {
+    if matches!(message.role, LocalAiChatRole::Tool) {
+        let tool = message
+            .metadata_json
+            .as_ref()
+            .and_then(|meta| meta.get("tool_name"))
+            .and_then(|value| value.as_str())
+            .map(humanize_tool)
+            .unwrap_or_else(|| "Action".into());
+        return view! {
+            <div class="chat-msg chat-msg-tool">
+                <span class="chat-msg-label">{format!("✓ {tool}")}</span>
+                <div class="chat-msg-text">{message.content.clone()}</div>
+            </div>
+        }
+        .into_any();
+    }
+
     let role_class = match message.role {
         LocalAiChatRole::User => "chat-msg chat-msg-user",
         LocalAiChatRole::Assistant => "chat-msg chat-msg-assistant",
         LocalAiChatRole::System => "chat-msg chat-msg-system",
-        LocalAiChatRole::Tool => "chat-msg chat-msg-tool",
+        LocalAiChatRole::Tool => unreachable!(),
     };
     let label = match message.role {
         LocalAiChatRole::User => "You",
         LocalAiChatRole::Assistant => "Local AI",
         LocalAiChatRole::System => "System",
-        LocalAiChatRole::Tool => "Result",
+        LocalAiChatRole::Tool => unreachable!(),
     };
-    let mono = matches!(message.role, LocalAiChatRole::Tool) || looks_like_data(&message.content);
-    let body = if mono {
+    let body = if looks_like_data(&message.content) {
         view! { <pre class="chat-msg-pre">{message.content.clone()}</pre> }.into_any()
     } else {
         view! { <div class="chat-msg-text">{message.content.clone()}</div> }.into_any()
@@ -507,9 +541,11 @@ fn message_view(message: LocalAiChatMessageRecord) -> impl IntoView {
             {body}
         </div>
     }
+    .into_any()
 }
 
-/// A proposed write action: tool name + arguments, with Confirm / Cancel.
+/// A proposed write action: human-readable tool + arguments, with Confirm /
+/// Cancel. Shown only in Ask First mode.
 fn proposal_card(
     call: LocalAiToolCall,
     chat: ChatState,
@@ -554,12 +590,50 @@ fn proposal_card(
 
 // --- helpers ---------------------------------------------------------------
 
-fn status_badge(connected: Option<bool>, model: &str) -> (&'static str, &'static str) {
+fn status_badge(connected: Option<bool>) -> (&'static str, &'static str) {
     match connected {
         None => ("Connecting…", "muted"),
         Some(false) => ("Ollama not running", "warn"),
-        Some(true) if model.is_empty() => ("Connected", "done"),
         Some(true) => ("Connected", "done"),
+    }
+}
+
+fn access_mode_value(mode: LocalAiAccessMode) -> &'static str {
+    match mode {
+        LocalAiAccessMode::ReadOnly => "read_only",
+        LocalAiAccessMode::AskBeforeWrite => "ask_before_write",
+        LocalAiAccessMode::FullAccess => "full_access",
+    }
+}
+
+fn access_mode_from_value(value: &str) -> LocalAiAccessMode {
+    match value {
+        "read_only" => LocalAiAccessMode::ReadOnly,
+        "full_access" => LocalAiAccessMode::FullAccess,
+        _ => LocalAiAccessMode::AskBeforeWrite,
+    }
+}
+
+/// Badge label + tone per mode: read-only looks safe, full access looks risky.
+fn access_mode_badge(mode: LocalAiAccessMode) -> (&'static str, &'static str) {
+    match mode {
+        LocalAiAccessMode::ReadOnly => ("Read only", "done"),
+        LocalAiAccessMode::AskBeforeWrite => ("Ask first", "muted"),
+        LocalAiAccessMode::FullAccess => ("Full access", "warn"),
+    }
+}
+
+fn access_mode_hint(mode: LocalAiAccessMode) -> &'static str {
+    match mode {
+        LocalAiAccessMode::ReadOnly => {
+            "Read only: Local AI can read your workspace but won't change anything."
+        }
+        LocalAiAccessMode::AskBeforeWrite => {
+            "Ask first: Local AI proposes changes and waits for your confirmation."
+        }
+        LocalAiAccessMode::FullAccess => {
+            "Full access lets Local AI create and update OpenMgmt data without confirmation."
+        }
     }
 }
 
@@ -574,7 +648,7 @@ fn model_options(models: &[String], selected: &str) -> Vec<String> {
 /// True when content looks like JSON/structured output we should render mono.
 fn looks_like_data(content: &str) -> bool {
     let trimmed = content.trim_start();
-    trimmed.starts_with('{') || trimmed.starts_with('[') || trimmed.starts_with("- ")
+    trimmed.starts_with('{') || trimmed.starts_with('[')
 }
 
 fn humanize_tool(name: &str) -> String {
@@ -585,7 +659,8 @@ fn humanize_tool(name: &str) -> String {
     text
 }
 
-/// Flatten a tool's JSON arguments object into display rows.
+/// Flatten a tool's JSON arguments into display rows. Selector keys read as the
+/// plain noun ("Organization", "Project") so cards aren't full of jargon.
 fn argument_rows(args: &serde_json::Value) -> Vec<(String, String)> {
     args.as_object()
         .map(|map| {
@@ -595,48 +670,13 @@ fn argument_rows(args: &serde_json::Value) -> Vec<(String, String)> {
                         serde_json::Value::String(text) => text.clone(),
                         other => other.to_string(),
                     };
+                    let key = key
+                        .strip_suffix("_selector")
+                        .or_else(|| key.strip_suffix("_id"))
+                        .unwrap_or(key);
                     (humanize_tool(key), display)
                 })
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn slash_matches(input: &str) -> Vec<(&'static str, &'static str)> {
-    let needle = input.trim();
-    SLASH_COMMANDS
-        .iter()
-        .filter(|(cmd, _)| cmd.starts_with(needle) || needle == "/")
-        .copied()
-        .collect()
-}
-
-/// Turn a help entry like `/use <model>` into a ready-to-edit input prefix.
-fn fill_command(command: &str) -> String {
-    match command.split_once(" <") {
-        Some((base, _)) => format!("{base} "),
-        None => command.to_owned(),
-    }
-}
-
-fn scope_value(scope: LocalAiContextScope) -> &'static str {
-    match scope {
-        LocalAiContextScope::Minimal => "minimal",
-        LocalAiContextScope::Daily => "daily",
-        LocalAiContextScope::Project => "project",
-        LocalAiContextScope::Task => "task",
-        LocalAiContextScope::Schedule => "schedule",
-        LocalAiContextScope::FullSummary => "full_summary",
-    }
-}
-
-fn scope_from_value(value: &str) -> LocalAiContextScope {
-    match value {
-        "minimal" => LocalAiContextScope::Minimal,
-        "schedule" => LocalAiContextScope::Schedule,
-        "project" => LocalAiContextScope::Project,
-        "task" => LocalAiContextScope::Task,
-        "full_summary" => LocalAiContextScope::FullSummary,
-        _ => LocalAiContextScope::Daily,
-    }
 }

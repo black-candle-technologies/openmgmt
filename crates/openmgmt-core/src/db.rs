@@ -8,13 +8,13 @@ use crate::{
     },
     models::{
         ActiveTimerInfo, BoardState, CalendarBlock, CalendarBlockSource, CalendarBlockStatus,
-        LocalAiChatMessageRecord, LocalAiChatRole, LocalAiChatSession, LocalAiSettings,
-        LocalAiSettingsPatch, LocalAiToolCall, LocalAiToolCallStatus, NewOrganization, NewProject,
-        NewSavedTaskView, NewTask, Organization, OrganizationPatch, Project, ProjectPatch,
-        RecurrenceRule, SavedTaskView, SavedTaskViewPatch, ScheduleConflict, ScheduleTaskInput,
-        ScheduledBlockCompletion, ScoringSettings, ScoringSettingsPatch, Task, TaskContext,
-        TaskPatch, TaskQueryFilter, TaskSort, TaskSortField, TaskStatus, TaskTimerSession,
-        TaskWithContext, TimeBlockSuggestion,
+        LocalAiAccessMode, LocalAiChatMessageRecord, LocalAiChatRole, LocalAiChatSession,
+        LocalAiSettings, LocalAiSettingsPatch, LocalAiToolCall, LocalAiToolCallStatus,
+        NewOrganization, NewProject, NewSavedTaskView, NewTask, Organization, OrganizationPatch,
+        Project, ProjectPatch, RecurrenceRule, SavedTaskView, SavedTaskViewPatch, ScheduleConflict,
+        ScheduleTaskInput, ScheduledBlockCompletion, ScoringSettings, ScoringSettingsPatch, Task,
+        TaskContext, TaskPatch, TaskQueryFilter, TaskSort, TaskSortField, TaskStatus,
+        TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
     },
     scheduling::{generate_schedule_ics, next_recurrence_at},
     scoring::{ScoringWeights, score_task},
@@ -238,6 +238,7 @@ impl Database {
               title TEXT NOT NULL,
               provider TEXT NOT NULL,
               model TEXT,
+              access_mode TEXT NOT NULL DEFAULT 'ask_before_write',
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL,
               archived_at TEXT
@@ -317,6 +318,7 @@ impl Database {
         )?;
         self.ensure_task_scheduling_columns()?;
         self.ensure_local_ai_settings()?;
+        self.ensure_local_ai_access_mode_column()?;
         self.ensure_sync_event_ownership_columns()?;
         self.seed_system_saved_task_views()?;
         self.ensure_default_scoring_settings()?;
@@ -442,6 +444,26 @@ impl Database {
             save_scoring_settings_with_connection(
                 &connection,
                 &default_scoring_settings(Utc::now()),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Idempotently add `access_mode` to chat sessions created before access
+    /// modes existed; existing rows default to `ask_before_write`.
+    fn ensure_local_ai_access_mode_column(&self) -> Result<()> {
+        let connection = self.connection()?;
+        let has_column = connection
+            .prepare("PRAGMA table_info(local_ai_chat_sessions)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|column| column == "access_mode");
+        if !has_column {
+            connection.execute(
+                "ALTER TABLE local_ai_chat_sessions
+                 ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'ask_before_write'",
+                [],
             )?;
         }
         Ok(())
@@ -2191,7 +2213,7 @@ impl Database {
     pub fn list_local_ai_chat_sessions(&self) -> Result<Vec<LocalAiChatSession>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id,title,provider,model,created_at,updated_at,archived_at
+            "SELECT id,title,provider,model,access_mode,created_at,updated_at,archived_at
              FROM local_ai_chat_sessions WHERE archived_at IS NULL ORDER BY updated_at DESC",
         )?;
         Ok(statement
@@ -2213,10 +2235,24 @@ impl Database {
                 .unwrap_or_else(|| "Local AI chat".into()),
             provider: "ollama".into(),
             model: model.or(settings.default_model),
+            access_mode: LocalAiAccessMode::default(),
             created_at: now,
             updated_at: now,
             archived_at: None,
         };
+        let connection = self.connection()?;
+        save_local_ai_chat_session_with_connection(&connection, &session)?;
+        Ok(session)
+    }
+
+    pub fn update_local_ai_chat_session_access_mode(
+        &self,
+        id: &str,
+        access_mode: LocalAiAccessMode,
+    ) -> Result<LocalAiChatSession> {
+        let mut session = self.get_local_ai_chat_session(id)?;
+        session.access_mode = access_mode;
+        session.updated_at = Utc::now();
         let connection = self.connection()?;
         save_local_ai_chat_session_with_connection(&connection, &session)?;
         Ok(session)
@@ -3356,9 +3392,10 @@ fn map_local_ai_chat_session(row: &Row<'_>) -> rusqlite::Result<LocalAiChatSessi
         title: row.get(1)?,
         provider: row.get(2)?,
         model: row.get(3)?,
-        created_at: parse_time(row.get(4)?)?,
-        updated_at: parse_time(row.get(5)?)?,
-        archived_at: parse_optional_time(row.get(6)?)?,
+        access_mode: parse_enum(row.get::<_, String>(4)?)?,
+        created_at: parse_time(row.get(5)?)?,
+        updated_at: parse_time(row.get(6)?)?,
+        archived_at: parse_optional_time(row.get(7)?)?,
     })
 }
 
@@ -3605,7 +3642,7 @@ fn get_local_ai_chat_session_with_connection(
 ) -> Result<LocalAiChatSession> {
     connection
         .query_row(
-            "SELECT id,title,provider,model,created_at,updated_at,archived_at
+            "SELECT id,title,provider,model,access_mode,created_at,updated_at,archived_at
              FROM local_ai_chat_sessions WHERE id=?1",
             [id],
             map_local_ai_chat_session,
@@ -3619,12 +3656,13 @@ fn save_local_ai_chat_session_with_connection(
     session: &LocalAiChatSession,
 ) -> Result<()> {
     connection.execute(
-        "INSERT INTO local_ai_chat_sessions (id,title,provider,model,created_at,updated_at,archived_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7)
+        "INSERT INTO local_ai_chat_sessions (id,title,provider,model,access_mode,created_at,updated_at,archived_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
          ON CONFLICT(id) DO UPDATE SET
             title=excluded.title,
             provider=excluded.provider,
             model=excluded.model,
+            access_mode=excluded.access_mode,
             updated_at=excluded.updated_at,
             archived_at=excluded.archived_at",
         params![
@@ -3632,6 +3670,7 @@ fn save_local_ai_chat_session_with_connection(
             session.title,
             session.provider,
             session.model,
+            session.access_mode.to_string(),
             timestamp(session.created_at),
             timestamp(session.updated_at),
             session.archived_at.map(timestamp),
@@ -4237,6 +4276,33 @@ mod tests {
             )
             .unwrap();
         assert!(calendar_blocks_exists);
+    }
+
+    #[test]
+    fn migration_backfills_access_mode_on_legacy_chat_sessions() {
+        let connection = Connection::open_in_memory().unwrap();
+        // Legacy sessions table without the access_mode column.
+        connection
+            .execute_batch(
+                "CREATE TABLE local_ai_chat_sessions (
+                    id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, provider TEXT NOT NULL,
+                    model TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, archived_at TEXT
+                 );
+                 INSERT INTO local_ai_chat_sessions (id,title,provider,model,created_at,updated_at)
+                 VALUES ('legacy','Old chat','ollama',NULL,
+                         '2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00');",
+            )
+            .unwrap();
+        let db = Database {
+            connection: Arc::new(Mutex::new(connection)),
+        };
+        db.migrate().unwrap();
+
+        // Existing rows default to ask_before_write and read back cleanly.
+        let session = db.get_local_ai_chat_session("legacy").unwrap();
+        assert_eq!(session.access_mode, LocalAiAccessMode::AskBeforeWrite);
+        // Idempotent: a second migrate must not fail or duplicate the column.
+        db.migrate().unwrap();
     }
 
     #[test]

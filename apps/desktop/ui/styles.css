@@ -1333,6 +1333,14 @@ a { color: inherit; }
 .chat-input:focus { outline: 2px solid var(--lime-deep); outline-offset: -1px; border-color: var(--lime-deep); }
 .chat-send { flex-shrink: 0; height: 38px; }
 
+/* Access-mode selector + agent extras */
+.chat-access { max-width: 108px; border: 1px solid var(--line-strong); background: #fff; padding: 5px 6px; border-radius: var(--radius-sm); font-size: 12px; }
+.chat-empty-mode { font-size: 11.5px; color: var(--text-muted); margin: 10px 0 0; }
+.chat-msg-tool .chat-msg-text { background: var(--surface-2); border: 1px solid var(--line); border-left: 3px solid var(--green); }
+.chat-plan-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 2px 2px 0; }
+.chat-plan-label { font: 600 11px var(--mono); color: var(--text-muted); }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+
 @media (max-width: 560px) {
   .chat-overlay, .chat-overlay.chat-expanded { width: 100vw; }
 }

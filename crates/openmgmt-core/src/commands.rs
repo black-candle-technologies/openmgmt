@@ -1,21 +1,23 @@
 use crate::{
     db::{Database, Result},
     local_ai::{
-        OllamaClient, SlashCommand, chat_prompt_messages, compact_task_lines, local_ai_tool,
-        local_ai_tool_registry, parse_slash_command, plan_day_prompt, prompt_messages,
-        rewrite_task_prompt, slash_help, suggest_next_task_prompt, summarize_project_prompt,
-        triage_tasks_prompt, workflow_error, workflow_response,
+        AgentDecision, MAX_AGENT_STEPS, OllamaClient, ParsedToolCall, SlashCommand, ToolDecision,
+        agent_system_prompt, build_agent_messages, build_tool_manifest_text, compact_task_lines,
+        local_ai_tool, local_ai_tool_registry, parse_agent_response, parse_slash_command,
+        plan_day_prompt, prompt_messages, rewrite_task_prompt, slash_help,
+        suggest_next_task_prompt, summarize_project_prompt, tool_decision, triage_tasks_prompt,
+        workflow_error, workflow_response,
     },
     models::{
-        BoardState, CalendarBlock, LocalAiChatMessage, LocalAiChatMessageRecord,
+        BoardState, CalendarBlock, LocalAiAccessMode, LocalAiChatMessage, LocalAiChatMessageRecord,
         LocalAiChatResponse, LocalAiChatRole, LocalAiChatSession, LocalAiChatTurn,
         LocalAiConnectionResult, LocalAiContextScope, LocalAiModelListResult, LocalAiSettings,
         LocalAiSettingsPatch, LocalAiToolCall, LocalAiToolCallStatus, LocalAiToolDefinition,
         LocalAiWorkflowResponse, NewOrganization, NewProject, NewSavedTaskView, NewTask,
-        Organization, OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch,
-        ScheduleConflict, ScheduleTaskInput, ScheduledBlockCompletion, ScoringSettings,
-        ScoringSettingsPatch, Task, TaskPatch, TaskQueryFilter, TaskSort, TaskStatus,
-        TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
+        Organization, OrganizationPatch, Project, ProjectPatch, ProjectStatus, SavedTaskView,
+        SavedTaskViewPatch, ScheduleConflict, ScheduleTaskInput, ScheduledBlockCompletion,
+        ScoringSettings, ScoringSettingsPatch, Task, TaskPatch, TaskQueryFilter, TaskSort,
+        TaskStatus, TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
     },
     sync::{SyncSettings, SyncSettingsPatch, SyncStatus},
 };
@@ -389,6 +391,14 @@ impl AppService {
     pub fn archive_local_ai_chat_session(&self, id: &str) -> Result<LocalAiChatSession> {
         self.database.archive_local_ai_chat_session(id)
     }
+    pub fn update_local_ai_chat_session_access_mode(
+        &self,
+        id: &str,
+        access_mode: LocalAiAccessMode,
+    ) -> Result<LocalAiChatSession> {
+        self.database
+            .update_local_ai_chat_session_access_mode(id, access_mode)
+    }
     pub fn list_local_ai_chat_messages(
         &self,
         session_id: &str,
@@ -471,6 +481,9 @@ impl AppService {
         }
         Ok(lines.join("\n\n"))
     }
+    /// The Local AI agent turn: build context + tool manifest, then run a bounded
+    /// reason→tool→observe loop against Ollama. Tool execution is gated by the
+    /// session's access mode (read-only / ask-first / full-access).
     pub async fn send_local_ai_chat_message(
         &self,
         input: crate::models::SendLocalAiChatMessageInput,
@@ -488,6 +501,11 @@ impl AppService {
                 .database
                 .update_local_ai_chat_session_model(&session.id, Some(model))?;
         }
+        if let Some(access_mode) = input.access_mode {
+            session = self
+                .database
+                .update_local_ai_chat_session_access_mode(&session.id, access_mode)?;
+        }
         let user = self.database.append_local_ai_chat_message(
             &session.id,
             LocalAiChatRole::User,
@@ -495,26 +513,246 @@ impl AppService {
             session.model.clone(),
             None,
         )?;
+        // Slash commands remain as a hidden power-user/debug path; normal use is
+        // natural language handled by the agent loop below.
         if let Some(command) = parse_slash_command(&input.message)? {
             self.handle_local_ai_slash_command(&mut session, &user, command)
                 .await?;
-            return self.local_ai_chat_turn(session);
+            return self.local_ai_chat_turn(session, false);
         }
+
         let context = self.build_local_ai_chat_context(input.context_scope.unwrap_or_default())?;
-        let messages = chat_prompt_messages(context, input.message);
-        let output = match self.run_ollama_chat(session.model.clone(), messages).await {
-            Ok(chat) => chat.content,
-            Err(error) => format!("Local AI unavailable: {error}"),
-        };
+        let manifest = build_tool_manifest_text();
+        let history = self.database.list_local_ai_chat_messages(&session.id)?;
+        let mut messages = build_agent_messages(
+            agent_system_prompt(session.access_mode, &manifest),
+            &context,
+            &history,
+            8,
+        );
+
+        let mut mutated = false;
+        let mut turn_complete = false;
+        let mut summaries: Vec<String> = Vec::new();
+
+        for _ in 0..MAX_AGENT_STEPS {
+            let (decision, raw) = match self.agent_step(session.model.clone(), &messages).await {
+                Ok(value) => value,
+                Err(error) => {
+                    self.append_assistant(&session, format!("Local AI unavailable: {error}"))?;
+                    return self.local_ai_chat_turn(session, mutated);
+                }
+            };
+            let Some(decision) = decision else {
+                let text = if raw.trim().is_empty() {
+                    "I couldn't produce a valid response. Please rephrase.".to_string()
+                } else {
+                    raw
+                };
+                self.append_assistant(&session, text)?;
+                turn_complete = true;
+                break;
+            };
+            match decision {
+                AgentDecision::Final { message } => {
+                    let text = if message.trim().is_empty() {
+                        "Done.".to_string()
+                    } else {
+                        message
+                    };
+                    self.append_assistant(&session, text)?;
+                    turn_complete = true;
+                    break;
+                }
+                AgentDecision::ToolCalls { message, calls } => {
+                    if let Some(note) = message.filter(|note| !note.trim().is_empty()) {
+                        self.append_assistant(&session, note.clone())?;
+                        messages.push(LocalAiChatMessage {
+                            role: "assistant".into(),
+                            content: note,
+                        });
+                    }
+                    let outcome = self.run_local_ai_tool_plan(&session, &user.id, calls)?;
+                    mutated |= outcome.mutated;
+                    summaries.extend(outcome.summaries.clone());
+                    if outcome.has_proposals {
+                        // Ask First: stop and wait for the user to confirm.
+                        turn_complete = true;
+                        break;
+                    }
+                    if outcome.executed_any {
+                        messages.push(LocalAiChatMessage {
+                            role: "user".into(),
+                            content: format!(
+                                "Tool results:\n{}\nIf the request is complete, reply with a final JSON message. Otherwise call more tools.",
+                                outcome.summaries.join("\n")
+                            ),
+                        });
+                        continue;
+                    }
+                    // Blocked / unknown / failed only: the appended messages
+                    // already explain; stop so we don't loop.
+                    turn_complete = true;
+                    break;
+                }
+            }
+        }
+
+        if !turn_complete {
+            // Step limit reached mid-work: never end silent or with raw JSON.
+            let summary = if summaries.is_empty() {
+                "I reached my step limit before finishing. Please try a smaller request."
+                    .to_string()
+            } else {
+                format!("Done. {}", summaries.join(" "))
+            };
+            self.append_assistant(&session, summary)?;
+        }
+
+        self.local_ai_chat_turn(session, mutated)
+    }
+
+    /// One Ollama round-trip, parsed into a decision. On parse failure, retries
+    /// once with a stricter "JSON only" nudge before giving up (returns `None`).
+    async fn agent_step(
+        &self,
+        model: Option<String>,
+        messages: &[LocalAiChatMessage],
+    ) -> Result<(Option<AgentDecision>, String)> {
+        let chat = self
+            .run_ollama_chat(model.clone(), messages.to_vec())
+            .await?;
+        if let Some(decision) = parse_agent_response(&chat.content) {
+            return Ok((Some(decision), chat.content));
+        }
+        let mut retry = messages.to_vec();
+        retry.push(LocalAiChatMessage {
+            role: "user".into(),
+            content: "Your previous reply was not valid. Reply with ONLY one JSON object: \
+                {\"type\":\"final\",\"message\":\"...\"} or \
+                {\"type\":\"tool_calls\",\"tool_calls\":[...]}."
+                .into(),
+        });
+        let chat = self.run_ollama_chat(model, retry).await?;
+        Ok((parse_agent_response(&chat.content), chat.content))
+    }
+
+    /// Execute a model-produced tool plan against the access gate. Reads run
+    /// immediately; writes execute (full access), are proposed (ask first), or
+    /// are blocked (read only). Every call is logged in `local_ai_tool_calls`.
+    pub fn run_local_ai_tool_plan(
+        &self,
+        session: &LocalAiChatSession,
+        user_message_id: &str,
+        calls: Vec<ParsedToolCall>,
+    ) -> Result<PlanOutcome> {
+        let mut outcome = PlanOutcome::default();
+        for call in calls {
+            let Some(tool) = local_ai_tool(&call.tool_name) else {
+                self.append_assistant(
+                    session,
+                    format!(
+                        "I don't have a tool called `{}`, so I skipped it.",
+                        call.tool_name
+                    ),
+                )?;
+                continue;
+            };
+            match tool_decision(session.access_mode, tool.write) {
+                ToolDecision::Blocked => {
+                    self.database.create_local_ai_tool_call(
+                        &session.id,
+                        Some(user_message_id.to_owned()),
+                        tool.name.clone(),
+                        call.arguments.clone(),
+                        LocalAiToolCallStatus::BlockedByAccessMode,
+                    )?;
+                    self.append_assistant(
+                        session,
+                        format!(
+                            "This chat is in read-only mode, so I can't run {}. Switch to Ask First or Full Access and I'll do it.",
+                            humanize_tool_name(&tool.name)
+                        ),
+                    )?;
+                    outcome.blocked_any = true;
+                }
+                ToolDecision::Propose => {
+                    self.database.create_local_ai_tool_call(
+                        &session.id,
+                        Some(user_message_id.to_owned()),
+                        tool.name.clone(),
+                        call.arguments.clone(),
+                        LocalAiToolCallStatus::Proposed,
+                    )?;
+                    outcome.has_proposals = true;
+                }
+                ToolDecision::Execute => {
+                    let status = if tool.write {
+                        LocalAiToolCallStatus::Confirmed
+                    } else {
+                        LocalAiToolCallStatus::Proposed
+                    };
+                    let mut record = self.database.create_local_ai_tool_call(
+                        &session.id,
+                        Some(user_message_id.to_owned()),
+                        tool.name.clone(),
+                        call.arguments.clone(),
+                        status,
+                    )?;
+                    match self.run_tool(&tool.name, &call.arguments) {
+                        Ok(result) => {
+                            record.result_json = Some(result.clone());
+                            record.status = LocalAiToolCallStatus::Executed;
+                            record.updated_at = Utc::now();
+                            self.database.save_local_ai_tool_call(&record)?;
+                            let summary = summarize_tool_result(&tool.name, &result);
+                            self.database.append_local_ai_chat_message(
+                                &session.id,
+                                LocalAiChatRole::Tool,
+                                summary.clone(),
+                                None,
+                                Some(serde_json::json!({
+                                    "tool_call_id": record.id,
+                                    "tool_name": tool.name,
+                                    "result": result,
+                                })),
+                            )?;
+                            outcome.executed_any = true;
+                            outcome.mutated |= tool.write;
+                            outcome.summaries.push(summary);
+                        }
+                        Err(error) => {
+                            record.status = LocalAiToolCallStatus::Failed;
+                            record.error_message = Some(error.to_string());
+                            record.updated_at = Utc::now();
+                            self.database.save_local_ai_tool_call(&record)?;
+                            self.append_assistant(
+                                session,
+                                format!(
+                                    "I couldn't run {}: {error}",
+                                    humanize_tool_name(&tool.name)
+                                ),
+                            )?;
+                            outcome.failed_any = true;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn append_assistant(&self, session: &LocalAiChatSession, content: String) -> Result<()> {
         self.database.append_local_ai_chat_message(
             &session.id,
             LocalAiChatRole::Assistant,
-            output,
+            content,
             session.model.clone(),
             None,
         )?;
-        self.local_ai_chat_turn(session)
+        Ok(())
     }
+
     pub async fn run_local_ai_slash_command(
         &self,
         session_id: Option<String>,
@@ -525,6 +763,7 @@ impl AppService {
             message: command,
             model: None,
             context_scope: Some(LocalAiContextScope::Daily),
+            access_mode: None,
             allow_write_proposals: true,
         })
         .await
@@ -562,7 +801,7 @@ impl AppService {
                 "write tool calls require confirmation before execution".into(),
             ));
         }
-        match self.execute_known_local_ai_tool(&call) {
+        match self.run_tool(&call.tool_name, &call.arguments_json) {
             Ok(result) => {
                 call.result_json = Some(result.clone());
                 call.status = LocalAiToolCallStatus::Executed;
@@ -572,9 +811,13 @@ impl AppService {
                 let _ = self.database.append_local_ai_chat_message(
                     &call.session_id,
                     LocalAiChatRole::Tool,
-                    result.to_string(),
+                    summarize_tool_result(&call.tool_name, &result),
                     None,
-                    Some(serde_json::json!({"tool_call_id": call.id})),
+                    Some(serde_json::json!({
+                        "tool_call_id": call.id,
+                        "tool_name": call.tool_name,
+                        "result": result,
+                    })),
                 )?;
                 Ok(call)
             }
@@ -684,7 +927,11 @@ impl AppService {
         Ok(())
     }
 
-    fn local_ai_chat_turn(&self, session: LocalAiChatSession) -> Result<LocalAiChatTurn> {
+    fn local_ai_chat_turn(
+        &self,
+        session: LocalAiChatSession,
+        mutated: bool,
+    ) -> Result<LocalAiChatTurn> {
         let messages = self.database.list_local_ai_chat_messages(&session.id)?;
         let proposed_tool_calls = self
             .database
@@ -707,37 +954,43 @@ impl AppService {
             messages,
             proposed_tool_calls,
             assistant_output,
+            mutated,
         })
     }
 
-    fn execute_known_local_ai_tool(&self, call: &LocalAiToolCall) -> Result<serde_json::Value> {
-        let args = &call.arguments_json;
-        let result = match call.tool_name.as_str() {
-            "get_summary" => serde_json::json!({
+    /// Dispatch one validated, resolved tool against the typed service layer.
+    /// Natural-language `*_selector` args are resolved to ids here (at execution
+    /// time), so proposals that depend on each other resolve once their
+    /// prerequisites exist. There is no shell/SQL/filesystem escape hatch.
+    fn run_tool(&self, tool_name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
+        use serde_json::{json, to_value};
+        let result = match tool_name {
+            // --- reads ------------------------------------------------------
+            "get_workspace_summary" => json!({
                 "organizations": self.database.list_organizations()?.len(),
                 "projects": self.database.list_projects()?.len(),
                 "tasks": self.database.list_tasks()?.len(),
             }),
-            "get_board" => serde_json::to_value(self.database.board_state()?)?,
-            "get_daily_operations" => serde_json::json!({
+            "list_organizations" => to_value(self.database.list_organizations()?)?,
+            "list_projects" => to_value(self.database.list_projects()?)?,
+            "list_tasks" => to_value(self.database.list_tasks()?)?,
+            "get_board" => to_value(self.database.board_state()?)?,
+            "get_daily_operations" => json!({
                 "board": self.database.board_state()?,
                 "overdue": self.database.get_overdue_tasks()?,
                 "unscheduled": self.database.get_unscheduled_tasks()?,
             }),
-            "get_schedule_day" => serde_json::to_value(self.database.get_schedule_today()?)?,
-            "get_schedule_week" => serde_json::to_value(self.database.get_schedule_week()?)?,
-            "list_tasks" => serde_json::to_value(self.database.list_tasks()?)?,
-            "list_projects" => serde_json::to_value(self.database.list_projects()?)?,
-            "list_organizations" => serde_json::to_value(self.database.list_organizations()?)?,
-            "get_task" => {
-                serde_json::to_value(self.database.get_task(required_arg(args, "task_id")?)?)?
-            }
-            "get_project" => serde_json::to_value(
-                self.database
-                    .get_project(required_arg(args, "project_id")?)?,
-            )?,
+            "get_schedule_today" => to_value(self.database.get_schedule_today()?)?,
+            "get_schedule_week" => to_value(self.database.get_schedule_week()?)?,
+            "get_unscheduled_tasks" => to_value(self.database.get_unscheduled_tasks()?)?,
+            "get_overdue_tasks" => to_value(self.database.get_overdue_tasks()?)?,
+            "get_task" => to_value(self.database.get_task(&self.resolve_task_id(args)?)?)?,
+            "get_project" => to_value(self.database.get_project(&self.resolve_project_id(args)?)?)?,
+            "get_scoring_settings" => to_value(self.database.get_scoring_settings()?)?,
+            "get_sync_status" => to_value(self.database.get_sync_status()?)?,
+            // --- writes -----------------------------------------------------
             "create_organization" => {
-                serde_json::to_value(self.database.create_organization(NewOrganization {
+                to_value(self.database.create_organization(NewOrganization {
                     name: required_arg(args, "name")?.into(),
                     slug: None,
                     description: optional_arg(args, "description").map(str::to_owned),
@@ -745,104 +998,235 @@ impl AppService {
                     icon: None,
                 })?)?
             }
-            "create_project" => serde_json::to_value(
-                self.database.create_project(NewProject {
-                    organization_id: optional_arg(args, "organization_id")
-                        .map(str::to_owned)
-                        .or_else(|| {
-                            self.database
-                                .list_organizations()
-                                .ok()?
-                                .first()
-                                .map(|org| org.id.clone())
-                        })
-                        .ok_or(crate::db::CoreError::Validation(
-                            "organization_id is required".into(),
-                        ))?,
-                    name: required_arg(args, "name")?.into(),
-                    slug: None,
-                    description: optional_arg(args, "description").map(str::to_owned),
-                    project_type: Default::default(),
-                    status: Default::default(),
-                    priority: 3,
-                    deadline: None,
-                    repo_url: None,
-                    notes: None,
-                })?,
-            )?,
-            "create_task" => serde_json::to_value(
-                self.database.create_task(NewTask {
-                    project_id: optional_arg(args, "project_id")
-                        .map(str::to_owned)
-                        .or_else(|| {
-                            self.database
-                                .list_projects()
-                                .ok()?
-                                .first()
-                                .map(|project| project.id.clone())
-                        })
-                        .ok_or(crate::db::CoreError::Validation(
-                            "project_id is required".into(),
-                        ))?,
-                    title: required_arg(args, "title")?.into(),
-                    description: optional_arg(args, "description").map(str::to_owned),
-                    status: Default::default(),
-                    priority: optional_i32_arg(args, "priority").unwrap_or(3),
-                    due_at: None,
-                    scheduled_at: None,
-                    estimated_minutes: None,
-                    time_limit_minutes: None,
-                    pinned: false,
-                    tags: Vec::new(),
-                })?,
-            )?,
-            "update_task" => serde_json::to_value(
-                self.database.update_task(
-                    required_arg(args, "task_id")?,
+            "update_organization" => {
+                let id = self.resolve_org_id(args)?;
+                to_value(self.database.update_organization(
+                    &id,
+                    OrganizationPatch {
+                        name: optional_arg(args, "name").map(str::to_owned),
+                        description: optional_opt_str(args, "description"),
+                        ..Default::default()
+                    },
+                )?)?
+            }
+            "archive_organization" => {
+                let id = self.resolve_org_id(args)?;
+                self.database.archive_organization(&id)?;
+                json!({ "archived_organization_id": id })
+            }
+            "create_project" => to_value(self.database.create_project(NewProject {
+                organization_id: self.resolve_org_id(args)?,
+                name: required_arg(args, "name")?.into(),
+                slug: None,
+                description: optional_arg(args, "description").map(str::to_owned),
+                project_type: Default::default(),
+                status: Default::default(),
+                priority: optional_i32_arg(args, "priority").unwrap_or(3),
+                deadline: None,
+                repo_url: None,
+                notes: None,
+            })?)?,
+            "update_project" => {
+                let id = self.resolve_project_id(args)?;
+                to_value(self.database.update_project(
+                    &id,
+                    ProjectPatch {
+                        name: optional_arg(args, "name").map(str::to_owned),
+                        description: optional_opt_str(args, "description"),
+                        priority: optional_i32_arg(args, "priority"),
+                        status: optional_enum_arg::<ProjectStatus>(args, "status"),
+                        ..Default::default()
+                    },
+                )?)?
+            }
+            "archive_project" => {
+                let id = self.resolve_project_id(args)?;
+                self.database.archive_project(&id)?;
+                json!({ "archived_project_id": id })
+            }
+            "create_task" => to_value(self.database.create_task(NewTask {
+                project_id: self.resolve_project_id(args)?,
+                title: required_arg(args, "title")?.into(),
+                description: optional_arg(args, "description").map(str::to_owned),
+                status: Default::default(),
+                priority: optional_i32_arg(args, "priority").unwrap_or(3),
+                due_at: None,
+                scheduled_at: None,
+                estimated_minutes: None,
+                time_limit_minutes: None,
+                pinned: false,
+                tags: Vec::new(),
+            })?)?,
+            "update_task" => {
+                let id = self.resolve_task_id(args)?;
+                to_value(self.database.update_task(
+                    &id,
                     TaskPatch {
                         title: optional_arg(args, "title").map(str::to_owned),
-                        description: args
-                            .get("description")
-                            .and_then(|value| value.as_str())
-                            .map(|value| Some(value.to_owned())),
-                        status: None,
+                        description: optional_opt_str(args, "description"),
+                        status: optional_enum_arg::<TaskStatus>(args, "status"),
                         priority: optional_i32_arg(args, "priority"),
                         ..Default::default()
                     },
-                )?,
-            )?,
-            "schedule_task" => serde_json::to_value(self.database.schedule_task(
-                required_arg(args, "task_id")?,
-                schedule_input_from_args(args)?,
-            )?)?,
-            "reschedule_task" => serde_json::to_value(self.database.reschedule_task(
-                required_arg(args, "task_id")?,
-                schedule_input_from_args(args)?,
-            )?)?,
-            "start_task" => serde_json::to_value(self.database.transition_task(
-                required_arg(args, "task_id")?,
+                )?)?
+            }
+            "start_task" => to_value(self.database.transition_task(
+                &self.resolve_task_id(args)?,
                 TaskStatus::InProgress,
                 None,
             )?)?,
-            "block_task" => serde_json::to_value(
+            "block_task" => to_value(
                 self.database.transition_task(
-                    required_arg(args, "task_id")?,
+                    &self.resolve_task_id(args)?,
                     TaskStatus::Blocked,
                     Some(
                         optional_arg(args, "reason")
-                            .unwrap_or("Blocked by local AI proposal")
+                            .unwrap_or("Blocked by Local AI")
                             .into(),
                     ),
                 )?,
             )?,
-            "complete_task" => serde_json::to_value(self.database.transition_task(
-                required_arg(args, "task_id")?,
+            "unblock_task" => to_value(self.database.transition_task(
+                &self.resolve_task_id(args)?,
+                TaskStatus::Ready,
+                None,
+            )?)?,
+            "complete_task" => to_value(self.database.transition_task(
+                &self.resolve_task_id(args)?,
                 TaskStatus::Done,
                 None,
             )?)?,
+            "cancel_task" => to_value(self.database.transition_task(
+                &self.resolve_task_id(args)?,
+                TaskStatus::Canceled,
+                None,
+            )?)?,
+            "schedule_task" => to_value(self.database.schedule_task(
+                &self.resolve_task_id(args)?,
+                schedule_input_from_args(args)?,
+            )?)?,
+            "reschedule_task" => to_value(self.database.reschedule_task(
+                &self.resolve_task_id(args)?,
+                schedule_input_from_args(args)?,
+            )?)?,
+            "clear_task_schedule" => to_value(
+                self.database
+                    .clear_task_schedule(&self.resolve_task_id(args)?)?,
+            )?,
+            "start_task_timer" => to_value(
+                self.database
+                    .start_task_timer(&self.resolve_task_id(args)?)?,
+            )?,
+            "pause_task_timer" => to_value(
+                self.database
+                    .pause_task_timer(&self.resolve_task_id(args)?)?,
+            )?,
+            "resume_task_timer" => to_value(
+                self.database
+                    .resume_task_timer(&self.resolve_task_id(args)?)?,
+            )?,
+            "stop_task_timer" => to_value(
+                self.database
+                    .stop_task_timer(&self.resolve_task_id(args)?)?,
+            )?,
+            "complete_task_with_timer" => to_value(
+                self.database
+                    .complete_task_with_timer(&self.resolve_task_id(args)?)?,
+            )?,
+            "update_scoring_settings" => to_value(self.database.update_scoring_settings(
+                ScoringSettingsPatch {
+                    priority_weight: optional_i32_arg(args, "priority_weight"),
+                    overdue_boost: optional_i32_arg(args, "overdue_boost"),
+                    due_soon_boost: optional_i32_arg(args, "due_soon_boost"),
+                    in_progress_boost: optional_i32_arg(args, "in_progress_boost"),
+                    pinned_boost: optional_i32_arg(args, "pinned_boost"),
+                    blocked_penalty: optional_i32_arg(args, "blocked_penalty"),
+                    waiting_penalty: optional_i32_arg(args, "waiting_penalty"),
+                    paused_project_penalty: optional_i32_arg(args, "paused_project_penalty"),
+                    due_soon_window_hours: optional_i32_arg(args, "due_soon_window_hours"),
+                },
+            )?)?,
+            "reset_scoring_settings" => to_value(self.database.reset_scoring_settings()?)?,
             _ => return Err(crate::db::CoreError::NotFound("local AI tool")),
         };
         Ok(result)
+    }
+
+    /// Resolve an organization id from `organization_id`, `organization_selector`
+    /// / `organization` (a name, or "any" → first active org), defaulting to the
+    /// first active org when nothing is given.
+    fn resolve_org_id(&self, args: &serde_json::Value) -> Result<String> {
+        if let Some(id) = selector_arg(args, "organization_id") {
+            return Ok(id.to_owned());
+        }
+        let selector = selector_arg(args, "organization_selector")
+            .or_else(|| selector_arg(args, "organization"))
+            .unwrap_or("any");
+        let orgs = self.database.list_organizations()?;
+        if orgs.is_empty() {
+            return Err(crate::db::CoreError::Validation(
+                "there are no organizations yet — create one first".into(),
+            ));
+        }
+        if is_any_selector(selector) {
+            return Ok(orgs[0].id.clone());
+        }
+        resolve_by_name(
+            orgs.iter().map(|org| (org.id.clone(), org.name.clone())),
+            selector,
+            "organization",
+        )
+    }
+
+    /// Resolve a project id from `project_id`, `project_selector` / `project` (a
+    /// name, or "any" → first active project), defaulting to the first project.
+    fn resolve_project_id(&self, args: &serde_json::Value) -> Result<String> {
+        if let Some(id) = selector_arg(args, "project_id") {
+            return Ok(id.to_owned());
+        }
+        let selector = selector_arg(args, "project_selector")
+            .or_else(|| selector_arg(args, "project"))
+            .unwrap_or("any");
+        let projects = self.database.list_projects()?;
+        if projects.is_empty() {
+            return Err(crate::db::CoreError::Validation(
+                "there are no projects yet — create one first".into(),
+            ));
+        }
+        if is_any_selector(selector) {
+            return Ok(projects[0].id.clone());
+        }
+        resolve_by_name(
+            projects
+                .iter()
+                .map(|project| (project.id.clone(), project.name.clone())),
+            selector,
+            "project",
+        )
+    }
+
+    /// Resolve a task id from `task_id` or `task_selector` / `task` (matched by
+    /// title). Unlike orgs/projects there is no "any" default — acting on a task
+    /// requires naming one.
+    fn resolve_task_id(&self, args: &serde_json::Value) -> Result<String> {
+        if let Some(id) = selector_arg(args, "task_id") {
+            return Ok(id.to_owned());
+        }
+        let Some(selector) =
+            selector_arg(args, "task_selector").or_else(|| selector_arg(args, "task"))
+        else {
+            return Err(crate::db::CoreError::Validation(
+                "which task? give a task title or id".into(),
+            ));
+        };
+        resolve_by_name(
+            self.database
+                .list_tasks()?
+                .iter()
+                .map(|task| (task.id.clone(), task.title.clone())),
+            selector,
+            "task",
+        )
     }
     pub fn export_tasks_json(&self) -> Result<String> {
         self.database.export_tasks_json()
@@ -924,6 +1308,125 @@ fn optional_i32_arg(args: &serde_json::Value, key: &str) -> Option<i32> {
     args.get(key)
         .and_then(|value| value.as_i64())
         .and_then(|value| i32::try_from(value).ok())
+}
+
+/// For `Option<Option<String>>` patch fields: `Some(Some(text))` when the key is
+/// present with a string, `None` (leave unchanged) when absent.
+fn optional_opt_str(args: &serde_json::Value, key: &str) -> Option<Option<String>> {
+    args.get(key)
+        .and_then(|value| value.as_str())
+        .map(|value| Some(value.to_owned()))
+}
+
+fn optional_enum_arg<T: std::str::FromStr>(args: &serde_json::Value, key: &str) -> Option<T> {
+    optional_arg(args, key).and_then(|value| value.parse::<T>().ok())
+}
+
+/// A non-empty, trimmed string argument (used for id/selector lookups).
+fn selector_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    args.get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn is_any_selector(selector: &str) -> bool {
+    matches!(
+        selector.trim().to_lowercase().as_str(),
+        "any" | "*" | "first" | "any organization" | "any org" | "any project"
+    )
+}
+
+/// Case-insensitive name resolution: exact matches win, else substring matches.
+/// One match → its id; several → ask which; none → say so.
+fn resolve_by_name<I>(candidates: I, selector: &str, kind: &str) -> Result<String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let needle = selector.trim().to_lowercase();
+    let all = candidates.into_iter().collect::<Vec<_>>();
+    let exact = all
+        .iter()
+        .filter(|(_, name)| name.to_lowercase() == needle)
+        .collect::<Vec<_>>();
+    let chosen = if exact.is_empty() {
+        all.iter()
+            .filter(|(_, name)| name.to_lowercase().contains(&needle))
+            .collect::<Vec<_>>()
+    } else {
+        exact
+    };
+    match chosen.as_slice() {
+        [(id, _)] => Ok(id.clone()),
+        [] => Err(crate::db::CoreError::Validation(format!(
+            "no {kind} matches \"{selector}\""
+        ))),
+        many => {
+            let names = many
+                .iter()
+                .map(|(_, name)| name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(crate::db::CoreError::Validation(format!(
+                "multiple {kind}s match \"{selector}\": {names}. Which one?"
+            )))
+        }
+    }
+}
+
+fn humanize_tool_name(name: &str) -> String {
+    let mut text = name.replace('_', " ");
+    if let Some(first) = text.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    text
+}
+
+/// Turn a tool result into one human-readable line for the transcript and the
+/// model's follow-up context. Writes get a friendly verb; reads/timers get
+/// compact JSON, truncated to keep the prompt small.
+fn summarize_tool_result(tool_name: &str, result: &serde_json::Value) -> String {
+    let label = result
+        .get("name")
+        .and_then(|value| value.as_str())
+        .or_else(|| result.get("title").and_then(|value| value.as_str()));
+    let labeled = |verb: &str, kind: &str| match label {
+        Some(name) => format!("{verb} {kind} \"{name}\"."),
+        None => format!("{verb} {kind}."),
+    };
+    match tool_name {
+        "create_organization" => labeled("Created", "organization"),
+        "create_project" => labeled("Created", "project"),
+        "create_task" => labeled("Created", "task"),
+        "update_organization" => labeled("Updated", "organization"),
+        "update_project" => labeled("Updated", "project"),
+        "update_task" => labeled("Updated", "task"),
+        "start_task" => labeled("Started", "task"),
+        "complete_task" | "complete_task_with_timer" => labeled("Completed", "task"),
+        "block_task" => labeled("Blocked", "task"),
+        "unblock_task" => labeled("Unblocked", "task"),
+        "cancel_task" => labeled("Canceled", "task"),
+        "archive_organization" => "Archived the organization.".into(),
+        "archive_project" => "Archived the project.".into(),
+        "schedule_task" => "Scheduled the task.".into(),
+        "reschedule_task" => "Rescheduled the task.".into(),
+        "clear_task_schedule" => labeled("Cleared schedule for", "task"),
+        _ => {
+            let compact = result.to_string().chars().take(600).collect::<String>();
+            format!("{tool_name}: {compact}")
+        }
+    }
+}
+
+/// Result of running a model tool plan through the access gate.
+#[derive(Debug, Default, Clone)]
+pub struct PlanOutcome {
+    pub executed_any: bool,
+    pub blocked_any: bool,
+    pub has_proposals: bool,
+    pub failed_any: bool,
+    pub mutated: bool,
+    pub summaries: Vec<String>,
 }
 
 fn schedule_input_from_args(args: &serde_json::Value) -> Result<ScheduleTaskInput> {
@@ -1046,6 +1549,7 @@ mod tests {
                 message: "/help".into(),
                 model: None,
                 context_scope: None,
+                access_mode: None,
                 allow_write_proposals: true,
             })
             .await
@@ -1058,6 +1562,7 @@ mod tests {
                 message: "/board".into(),
                 model: None,
                 context_scope: None,
+                access_mode: None,
                 allow_write_proposals: true,
             })
             .await
@@ -1179,6 +1684,7 @@ mod tests {
                 message: "Plan my day".into(),
                 model: None,
                 context_scope: Some(LocalAiContextScope::Daily),
+                access_mode: None,
                 allow_write_proposals: false,
             })
             .await
@@ -1187,6 +1693,240 @@ mod tests {
             turn.assistant_output
                 .unwrap()
                 .contains("Local AI unavailable")
+        );
+    }
+
+    fn service_with_org() -> AppService {
+        let database = Database::in_memory().unwrap();
+        database
+            .create_organization(NewOrganization {
+                name: "Black Candle".into(),
+                slug: None,
+                description: None,
+                color: None,
+                icon: None,
+            })
+            .unwrap();
+        AppService::new(database)
+    }
+
+    fn plan_session(service: &AppService, mode: LocalAiAccessMode) -> (LocalAiChatSession, String) {
+        let session = service
+            .create_local_ai_chat_session(Some("Agent".into()), None)
+            .unwrap();
+        let session = service
+            .update_local_ai_chat_session_access_mode(&session.id, mode)
+            .unwrap();
+        let user = service
+            .database
+            .append_local_ai_chat_message(
+                &session.id,
+                LocalAiChatRole::User,
+                "go".into(),
+                None,
+                None,
+            )
+            .unwrap();
+        (session, user.id)
+    }
+
+    fn project_task_plan() -> Vec<ParsedToolCall> {
+        vec![
+            ParsedToolCall {
+                tool_name: "create_project".into(),
+                arguments: serde_json::json!({ "name": "localtest", "organization_selector": "any" }),
+            },
+            ParsedToolCall {
+                tool_name: "create_task".into(),
+                arguments: serde_json::json!({ "title": "do things", "project_selector": "localtest" }),
+            },
+        ]
+    }
+
+    #[test]
+    fn new_session_defaults_to_ask_before_write() {
+        let service = AppService::new(Database::in_memory().unwrap());
+        let session = service.create_local_ai_chat_session(None, None).unwrap();
+        assert_eq!(session.access_mode, LocalAiAccessMode::AskBeforeWrite);
+    }
+
+    #[test]
+    fn switching_access_mode_persists() {
+        let service = AppService::new(Database::in_memory().unwrap());
+        let session = service.create_local_ai_chat_session(None, None).unwrap();
+        service
+            .update_local_ai_chat_session_access_mode(&session.id, LocalAiAccessMode::FullAccess)
+            .unwrap();
+        let reloaded = service
+            .database
+            .get_local_ai_chat_session(&session.id)
+            .unwrap();
+        assert_eq!(reloaded.access_mode, LocalAiAccessMode::FullAccess);
+    }
+
+    #[test]
+    fn full_access_plan_creates_project_and_task() {
+        let service = service_with_org();
+        let (session, user_id) = plan_session(&service, LocalAiAccessMode::FullAccess);
+
+        let outcome = service
+            .run_local_ai_tool_plan(&session, &user_id, project_task_plan())
+            .unwrap();
+        assert!(outcome.executed_any && outcome.mutated);
+        assert!(!outcome.has_proposals && !outcome.blocked_any);
+
+        let projects = service.database.list_projects().unwrap();
+        let project = projects.iter().find(|p| p.name == "localtest").unwrap();
+        let tasks = service.database.list_tasks().unwrap();
+        let task = tasks.iter().find(|t| t.title == "do things").unwrap();
+        assert_eq!(task.project_id, project.id);
+    }
+
+    #[test]
+    fn ask_before_write_plan_proposes_then_confirms() {
+        let service = service_with_org();
+        let (session, user_id) = plan_session(&service, LocalAiAccessMode::AskBeforeWrite);
+
+        let outcome = service
+            .run_local_ai_tool_plan(&session, &user_id, project_task_plan())
+            .unwrap();
+        assert!(outcome.has_proposals && !outcome.executed_any && !outcome.mutated);
+        // Nothing created yet.
+        assert!(service.database.list_projects().unwrap().is_empty());
+
+        // Confirm + execute each proposal in order; the task resolves the
+        // project created by the first proposal.
+        let proposals = service
+            .database
+            .list_local_ai_tool_calls(&session.id)
+            .unwrap();
+        assert_eq!(proposals.len(), 2);
+        for call in proposals {
+            service.confirm_local_ai_tool_call(&call.id).unwrap();
+            service.execute_local_ai_tool_call(&call.id).unwrap();
+        }
+
+        let project = service
+            .database
+            .list_projects()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "localtest")
+            .unwrap();
+        let task = service
+            .database
+            .list_tasks()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.title == "do things")
+            .unwrap();
+        assert_eq!(task.project_id, project.id);
+    }
+
+    #[test]
+    fn read_only_plan_blocks_writes() {
+        let service = service_with_org();
+        let (session, user_id) = plan_session(&service, LocalAiAccessMode::ReadOnly);
+
+        let outcome = service
+            .run_local_ai_tool_plan(&session, &user_id, project_task_plan())
+            .unwrap();
+        assert!(outcome.blocked_any && !outcome.executed_any && !outcome.mutated);
+        assert!(service.database.list_projects().unwrap().is_empty());
+        assert!(service.database.list_tasks().unwrap().is_empty());
+
+        // A blocked tool call is logged and the user is told write access is needed.
+        let calls = service
+            .database
+            .list_local_ai_tool_calls(&session.id)
+            .unwrap();
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.status == LocalAiToolCallStatus::BlockedByAccessMode)
+        );
+        let messages = service
+            .database
+            .list_local_ai_chat_messages(&session.id)
+            .unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.content.contains("read-only mode"))
+        );
+    }
+
+    #[test]
+    fn resolver_handles_id_name_case_any_and_clarifications() {
+        let service = service_with_org();
+        let org = service.database.list_organizations().unwrap()[0].clone();
+
+        // By id, exact name, case-insensitive name, and "any".
+        assert_eq!(
+            service
+                .resolve_org_id(&serde_json::json!({ "organization_id": org.id }))
+                .unwrap(),
+            org.id
+        );
+        assert_eq!(
+            service
+                .resolve_org_id(&serde_json::json!({ "organization_selector": "Black Candle" }))
+                .unwrap(),
+            org.id
+        );
+        assert_eq!(
+            service
+                .resolve_org_id(&serde_json::json!({ "organization_selector": "black candle" }))
+                .unwrap(),
+            org.id
+        );
+        assert_eq!(
+            service
+                .resolve_org_id(&serde_json::json!({ "organization_selector": "any" }))
+                .unwrap(),
+            org.id
+        );
+
+        // Two projects sharing a prefix → ambiguous; unknown name → no match.
+        service
+            .database
+            .create_project(NewProject {
+                organization_id: org.id.clone(),
+                name: "Alpha One".into(),
+                slug: None,
+                description: None,
+                project_type: Default::default(),
+                status: Default::default(),
+                priority: 3,
+                deadline: None,
+                repo_url: None,
+                notes: None,
+            })
+            .unwrap();
+        service
+            .database
+            .create_project(NewProject {
+                organization_id: org.id.clone(),
+                name: "Alpha Two".into(),
+                slug: None,
+                description: None,
+                project_type: Default::default(),
+                status: Default::default(),
+                priority: 3,
+                deadline: None,
+                repo_url: None,
+                notes: None,
+            })
+            .unwrap();
+        assert!(
+            service
+                .resolve_project_id(&serde_json::json!({ "project_selector": "Alpha" }))
+                .is_err()
+        );
+        assert!(
+            service
+                .resolve_project_id(&serde_json::json!({ "project_selector": "Nope" }))
+                .is_err()
         );
     }
 

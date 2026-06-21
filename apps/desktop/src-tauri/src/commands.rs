@@ -1,13 +1,14 @@
 use chrono::{DateTime, Utc};
 use openmgmt_core::{
-    AppService, BoardState, CalendarBlock, LocalAiChatMessageRecord, LocalAiChatResponse,
-    LocalAiChatSession, LocalAiChatTurn, LocalAiConnectionResult, LocalAiModelListResult,
-    LocalAiSettings, LocalAiSettingsPatch, LocalAiToolCall, LocalAiToolDefinition,
-    LocalAiWorkflowResponse, NewOrganization, NewProject, NewSavedTaskView, NewTask, Organization,
-    OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch, ScheduleConflict,
-    ScheduleTaskInput, ScheduledBlockCompletion, ScoringSettings, ScoringSettingsPatch,
-    SendLocalAiChatMessageInput, SyncSettings, SyncSettingsPatch, SyncStatus, Task, TaskPatch,
-    TaskQueryFilter, TaskSort, TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
+    AppService, BoardState, CalendarBlock, LocalAiAccessMode, LocalAiChatMessageRecord,
+    LocalAiChatResponse, LocalAiChatSession, LocalAiChatTurn, LocalAiConnectionResult,
+    LocalAiModelListResult, LocalAiSettings, LocalAiSettingsPatch, LocalAiToolCall,
+    LocalAiToolDefinition, LocalAiWorkflowResponse, NewOrganization, NewProject, NewSavedTaskView,
+    NewTask, Organization, OrganizationPatch, Project, ProjectPatch, SavedTaskView,
+    SavedTaskViewPatch, ScheduleConflict, ScheduleTaskInput, ScheduledBlockCompletion,
+    ScoringSettings, ScoringSettingsPatch, SendLocalAiChatMessageInput, SyncSettings,
+    SyncSettingsPatch, SyncStatus, Task, TaskPatch, TaskQueryFilter, TaskSort, TaskTimerSession,
+    TaskWithContext, TimeBlockSuggestion,
 };
 use openmgmt_sync_client::{SyncConnectionTestResult, SyncOnceResult};
 use std::path::{Component, Path, PathBuf};
@@ -483,6 +484,15 @@ pub fn archive_local_ai_chat_session(
     id: String,
 ) -> CommandResult<LocalAiChatSession> {
     core(service.archive_local_ai_chat_session(&id))
+}
+
+#[tauri::command]
+pub fn update_local_ai_chat_session_access_mode(
+    service: State<'_, AppService>,
+    id: String,
+    access_mode: LocalAiAccessMode,
+) -> CommandResult<LocalAiChatSession> {
+    core(service.update_local_ai_chat_session_access_mode(&id, access_mode))
 }
 
 #[tauri::command]

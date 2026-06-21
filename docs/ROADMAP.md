@@ -8,6 +8,8 @@
 - Leptos desktop views and fullscreen TV window
 - Active timers and time-limit display
 - rmcp stdio server with guarded writes
+- Local AI agent chat over Ollama: natural language, typed OpenMgmt tools, and
+  per-chat access modes (read only / ask first / full access)
 
 ## Next
 
@@ -17,7 +19,6 @@
 - Configurable workday boundaries and scoring weights
 - Recurring tasks, dependencies, and saved filters
 - SQLite backup, restore, and JSON/CSV export
-- Local model integration through Ollama
 - Tauri end-to-end tests and accessibility audit
 
 ## Scheduling and Calendar Integration

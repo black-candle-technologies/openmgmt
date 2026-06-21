@@ -106,6 +106,7 @@ string_enum!(LocalAiToolCallStatus {
     Executed => "executed",
     Failed => "failed",
     Canceled => "canceled",
+    BlockedByAccessMode => "blocked_by_access_mode",
 });
 
 string_enum!(LocalAiContextScope {
@@ -116,6 +117,20 @@ string_enum!(LocalAiContextScope {
     Schedule => "schedule",
     FullSummary => "full_summary",
 });
+
+// How much the chat is allowed to mutate OpenMgmt data. The single user-facing
+// control for the Local AI agent (replaces the old context-scope selector).
+string_enum!(LocalAiAccessMode {
+    ReadOnly => "read_only",
+    AskBeforeWrite => "ask_before_write",
+    FullAccess => "full_access",
+});
+
+impl Default for LocalAiAccessMode {
+    fn default() -> Self {
+        Self::AskBeforeWrite
+    }
+}
 
 string_enum!(AiProviderKind {
     OpenAi => "openai",
@@ -266,6 +281,8 @@ pub struct LocalAiChatSession {
     pub title: String,
     pub provider: String,
     pub model: Option<String>,
+    #[serde(default)]
+    pub access_mode: LocalAiAccessMode,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub archived_at: Option<DateTime<Utc>>,
@@ -300,7 +317,20 @@ pub struct LocalAiToolCall {
 pub struct LocalAiToolDefinition {
     pub name: String,
     pub description: String,
+    /// `true` for tools that mutate data. The access gate keys off this bit.
     pub write: bool,
+    /// `true` for irreversible writes (archive/reset) — surfaced for warnings.
+    #[serde(default)]
+    pub destructive: bool,
+    /// JSON schema-ish object describing the tool's arguments.
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
+    /// Example natural-language phrasings that map to this tool.
+    #[serde(default)]
+    pub examples: Vec<String>,
+    /// Alternate names the model might use; resolved to `name` before dispatch.
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,7 +338,10 @@ pub struct SendLocalAiChatMessageInput {
     pub session_id: Option<String>,
     pub message: String,
     pub model: Option<String>,
+    /// Internal context-building hint (no longer user-facing). Defaults to daily.
     pub context_scope: Option<LocalAiContextScope>,
+    /// When set, the session's access mode is updated to this value first.
+    pub access_mode: Option<LocalAiAccessMode>,
     #[serde(default)]
     pub allow_write_proposals: bool,
 }
@@ -319,6 +352,9 @@ pub struct LocalAiChatTurn {
     pub messages: Vec<LocalAiChatMessageRecord>,
     pub proposed_tool_calls: Vec<LocalAiToolCall>,
     pub assistant_output: Option<String>,
+    /// `true` when this turn actually mutated OpenMgmt data, so the UI refreshes.
+    #[serde(default)]
+    pub mutated: bool,
 }
 
 impl Default for LocalAiContextScope {

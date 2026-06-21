@@ -79,6 +79,7 @@ fn main() {
             commands::list_local_ai_chat_sessions,
             commands::create_local_ai_chat_session,
             commands::archive_local_ai_chat_session,
+            commands::update_local_ai_chat_session_access_mode,
             commands::list_local_ai_chat_messages,
             commands::send_local_ai_chat_message,
             commands::confirm_local_ai_tool_call,
