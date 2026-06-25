@@ -31,10 +31,25 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; wasm-src 'self'; connect-src 'self' ipc: http://ipc.localhost"
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "OpenMgmt",
+    "copyright": "Copyright (c) 2026 OpenMgmt",
+    "category": "Productivity",
+    "shortDescription": "Local-first project and task manager",
+    "longDescription": "OpenMgmt is a local-first desktop project and task manager with SQLite storage, task scheduling, daily operations, board views, and sync support.",
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "startMenuFolder": "OpenMgmt"
+      }
+    }
   }
 }

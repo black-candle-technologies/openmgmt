@@ -31,6 +31,21 @@
           );
         } catch (e) {}
       })();
+      (function () {
+        window.setTimeout(function () {
+          var boot = document.getElementById("om-boot");
+          if (!boot) return;
+          boot.classList.add("failed");
+          var details = document.getElementById("om-boot-details");
+          if (details) {
+            details.textContent = [
+              "URL: " + window.location.href,
+              "Tauri: " + (typeof window.__TAURI__ !== "undefined"),
+              "User agent: " + window.navigator.userAgent
+            ].join("\n");
+          }
+        }, 9000);
+      })();
     </script>
     <style>
       /* Critical bootstrap styles: applied before styles.css loads so neither
@@ -47,6 +62,20 @@
       }
       html[data-board] #om-boot { color: #aeb7ab; }
       .om-boot-inner { display: flex; align-items: center; gap: 10px; opacity: 0.78; }
+      #om-boot.failed .om-boot-inner {
+        align-items: flex-start;
+        background: rgba(255, 255, 255, 0.84);
+        border: 1px solid rgba(24, 32, 23, 0.12);
+        border-radius: 8px;
+        box-shadow: 0 18px 50px rgba(24, 32, 23, 0.12);
+        flex-direction: column;
+        max-width: min(560px, calc(100vw - 48px));
+        padding: 18px;
+      }
+      html[data-board] #om-boot.failed .om-boot-inner {
+        background: rgba(20, 25, 21, 0.92);
+        border-color: rgba(201, 239, 106, 0.18);
+      }
       .om-boot-mark {
         background: #c9ef6a;
         color: #182017;
@@ -58,6 +87,37 @@
       .om-boot-text-board { display: none; }
       html[data-board] .om-boot-text { display: none; }
       html[data-board] .om-boot-text-board { display: inline; }
+      .om-boot-failure { display: none; }
+      #om-boot.failed .om-boot-failure { display: block; }
+      .om-boot-failure-title {
+        color: #283025;
+        font-size: 18px;
+        font-weight: 700;
+        margin: 4px 0 6px;
+      }
+      html[data-board] .om-boot-failure-title { color: #f3f2ed; }
+      .om-boot-failure-copy {
+        color: #596256;
+        font-size: 14px;
+        line-height: 1.45;
+        margin: 0 0 10px;
+      }
+      html[data-board] .om-boot-failure-copy { color: #cbd4c8; }
+      .om-boot-debug summary {
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 650;
+      }
+      .om-boot-debug pre {
+        background: rgba(24, 32, 23, 0.07);
+        border-radius: 6px;
+        font: 12px ui-monospace, "SFMono-Regular", Consolas, monospace;
+        margin: 8px 0 0;
+        overflow-wrap: anywhere;
+        padding: 10px;
+        white-space: pre-wrap;
+      }
+      html[data-board] .om-boot-debug pre { background: rgba(255, 255, 255, 0.08); }
     </style>
   </head>
   <body>
@@ -68,8 +128,19 @@
     <div id="om-boot">
       <div class="om-boot-inner">
         <span class="om-boot-mark">OM</span>
-        <span class="om-boot-text">Loading OpenMgmt…</span>
-        <span class="om-boot-text-board">Loading OpenMgmt Board…</span>
+        <span class="om-boot-text">Loading OpenMgmt...</span>
+        <span class="om-boot-text-board">Loading OpenMgmt Board...</span>
+        <div class="om-boot-failure">
+          <div class="om-boot-failure-title">OpenMgmt failed to start.</div>
+          <p class="om-boot-failure-copy">
+            The packaged frontend failed before the app mounted. Check WebView
+            console or reinstall.
+          </p>
+          <details class="om-boot-debug">
+            <summary>Debug details</summary>
+            <pre id="om-boot-details"></pre>
+          </details>
+        </div>
       </div>
     </div>
     <!-- Dedicated mount root. Leptos mounts here (never directly into <body>) so

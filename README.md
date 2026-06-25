@@ -27,7 +27,8 @@ is no Node.js, npm, pnpm, Corepack, React, Vite, Electron, or hosted service.
 - Dedicated TV board that opens in a normal, movable, resizable window with
   manual refresh and 10-second auto-refresh (kiosk/fullscreen reserved for a
   later option)
-- Local SQLite database at `data/openmgmt.sqlite`
+- Local SQLite database: `data/openmgmt.sqlite` in development, per-user app
+  data in installed builds
 - Claude and MCP-compatible AI access through a separate rmcp server
 - Read-only MCP by default, with explicit opt-in writes
 
@@ -57,15 +58,17 @@ Set-Location apps/desktop/src-tauri
 cargo tauri dev
 ```
 
-On first launch, the app creates and migrates an empty local SQLite database at
-`data/openmgmt.sqlite`. It does not create sample organizations, projects, or
-tasks; users create their own workspace records. Select **Open TV Board** in the
+On first development launch, the app creates and migrates an empty local SQLite
+database at `data/openmgmt.sqlite`. Packaged installs use
+`%LOCALAPPDATA%\OpenMgmt\openmgmt.sqlite` instead, so the app never needs to write
+into its install directory. It does not create sample organizations, projects,
+or tasks; users create their own workspace records. Select **Open TV Board** in the
 top bar to open the board in a separate, normal Tauri window (decorated,
 movable, and resizable; centered at 1440x900). The board window renders a dark
 operations layout and never shows a blank white screen. In development it loads
 the Trunk dev server with the board query string (`http://127.0.0.1:1420/?board=1`);
 in a packaged build it loads the bundled asset (`tauri://localhost/index.html?board=1`).
-The main app and TV board use the same repository-local `data/openmgmt.sqlite` file.
+The main app and TV board use the same database for the current run mode.
 
 The left sidebar navigates Dashboard, Daily Operations, Tasks, Schedule,
 Projects, Organizations, and an embedded Board. Daily Operations is the daily
@@ -103,9 +106,19 @@ Set-Location apps/desktop/src-tauri
 cargo tauri build
 ```
 
+Build the Windows installer:
+
+```powershell
+Set-Location apps/desktop/src-tauri
+cargo tauri build
+```
+
+See [Windows installer](docs/INSTALLER.md) for installer prerequisites,
+artifact locations, install steps, and packaged data locations.
+
 ## MCP server
 
-The MCP server uses the same `data/openmgmt.sqlite` database:
+The MCP server uses the development `data/openmgmt.sqlite` database by default:
 
 ```powershell
 cargo run -p openmgmt-mcp
