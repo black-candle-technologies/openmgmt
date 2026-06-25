@@ -107,6 +107,14 @@ data, delete that folder manually after uninstalling.
   missing. Rebuild with `trunk build --release` in `apps\desktop\ui`, then rerun
   `cargo tauri build`. For the TV Board specifically, see the board-URL notes in
   `apps/desktop/src-tauri/src/commands.rs`.
+- **Stuck on "Loading OpenMgmt"** - the packaged frontend failed before the
+  Leptos app mounted. Common causes are WebAssembly blocked by CSP, missing
+  bundled JS/WASM/CSS assets, a frontend panic during mount, or a stale
+  installed app. Uninstall the old build, rebuild with `cargo tauri build`,
+  reinstall the new NSIS installer, and launch again. Confirm
+  `%APPDATA%\OpenMgmt\openmgmt.sqlite` is created, try running
+  `%LOCALAPPDATA%\OpenMgmt\openmgmt-desktop.exe` directly, and inspect the
+  WebView console if the boot screen shows its failure diagnostics.
 - **Installer blocked by SmartScreen** — expected for the unsigned beta. Click
   "More info" → "Run anyway", or sign the installer (see below).
 
