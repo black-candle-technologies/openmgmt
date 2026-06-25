@@ -1,6 +1,13 @@
+// Hide the console window for release builds; keep it in dev for log output.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod commands;
 
 use openmgmt_core::{AppService, Database, default_database_path};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -8,8 +15,8 @@ fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let database =
-        Database::open(default_database_path()).expect("failed to open OpenMgmt database");
+    let database_path = desktop_database_path().expect("failed to resolve OpenMgmt database path");
+    let database = Database::open(database_path).expect("failed to open OpenMgmt database");
 
     tauri::Builder::default()
         .manage(AppService::new(database))
@@ -80,4 +87,56 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running OpenMgmt");
+}
+
+fn desktop_database_path() -> Result<PathBuf, String> {
+    if env::var_os("OPENMGMT_DATABASE_PATH").is_some() || cfg!(debug_assertions) {
+        return Ok(default_database_path());
+    }
+
+    installed_database_path()
+}
+
+fn installed_database_path() -> Result<PathBuf, String> {
+    let base = env::var_os("APPDATA")
+        .or_else(|| env::var_os("LOCALAPPDATA"))
+        .map(PathBuf::from)
+        .ok_or_else(|| "APPDATA or LOCALAPPDATA must be set for installed OpenMgmt".to_string())?;
+
+    Ok(installed_database_path_from_base(&base))
+}
+
+fn installed_database_path_from_base(base: &Path) -> PathBuf {
+    base.join("OpenMgmt").join("openmgmt.sqlite")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installed_database_path_uses_openmgmt_app_data_folder() {
+        let base = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            installed_database_path_from_base(base.path()),
+            base.path().join("OpenMgmt").join("openmgmt.sqlite")
+        );
+    }
+
+    #[test]
+    fn installed_database_parent_is_created_and_starts_empty() {
+        let base = tempfile::tempdir().unwrap();
+        let path = installed_database_path_from_base(base.path());
+        let parent = path.parent().unwrap();
+
+        assert!(!parent.exists());
+
+        let database = Database::open(&path).unwrap();
+
+        assert!(parent.exists());
+        assert!(database.list_organizations().unwrap().is_empty());
+        assert!(database.list_projects().unwrap().is_empty());
+        assert!(database.list_tasks().unwrap().is_empty());
+    }
 }
