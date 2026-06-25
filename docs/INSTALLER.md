@@ -36,7 +36,7 @@ not use `http://127.0.0.1:1420` or require a dev server.
 
 Expected artifacts from this workspace (paths relative to the repository root):
 
-- NSIS installer: `target\release\bundle\nsis\OpenMgmt_0.1.0_x64-setup.exe` (~3.6 MB)
+- NSIS installer: `target\release\bundle\nsis\OpenMgmt_<version>_x64-setup.exe` (~3.6 MB)
 - Desktop executable: `target\release\openmgmt-desktop.exe` (~11 MB)
 
 The installer filename tracks the `version` in `tauri.conf.json`. MSI packaging
@@ -60,9 +60,10 @@ Not automatable in CI; run by hand on a clean Windows 10/11 machine:
 3. Create org `Installer Test Org`, project `Installer Test Project`, task
    `Installer Test Task`.
 4. Close and reopen the app; confirm the data persists.
-5. Confirm the DB exists at `%APPDATA%\OpenMgmt\openmgmt.sqlite`.
+5. Confirm the DB exists at `%LOCALAPPDATA%\OpenMgmt\openmgmt.sqlite` or
+   `%APPDATA%\OpenMgmt\openmgmt.sqlite`, depending on the machine.
 6. Open the TV Board; confirm it renders the board (not a white screen).
-7. Uninstall via Settings → Apps; confirm `%APPDATA%\OpenMgmt\` data remains.
+7. Uninstall via Settings → Apps; confirm the app data folder remains.
 
 ## Data locations
 
@@ -75,10 +76,10 @@ data\openmgmt.sqlite
 Installed release builds use a per-user writable database:
 
 ```text
-%APPDATA%\OpenMgmt\openmgmt.sqlite
+%LOCALAPPDATA%\OpenMgmt\openmgmt.sqlite
 ```
 
-If `%APPDATA%` is unavailable, OpenMgmt falls back to `%LOCALAPPDATA%` as the
+If `%LOCALAPPDATA%` is unavailable, OpenMgmt falls back to `%APPDATA%` as the
 base directory. The app creates the directory and runs migrations on first
 launch. It does not create sample organizations, projects, or tasks.
 
@@ -93,8 +94,9 @@ silently overwriting installed user data.
 
 Use Windows Settings (Apps) or the generated uninstaller to remove the installed
 application. The uninstaller removes the program files but leaves user data in
-`%APPDATA%\OpenMgmt\` intact, so reinstalling preserves existing data. To wipe
-data, delete that folder manually after uninstalling.
+`%LOCALAPPDATA%\OpenMgmt\` or `%APPDATA%\OpenMgmt\` intact, so reinstalling
+preserves existing data. To wipe data, delete that folder manually after
+uninstalling.
 
 ## Troubleshooting
 
@@ -112,6 +114,7 @@ data, delete that folder manually after uninstalling.
   bundled JS/WASM/CSS assets, a frontend panic during mount, or a stale
   installed app. Uninstall the old build, rebuild with `cargo tauri build`,
   reinstall the new NSIS installer, and launch again. Confirm
+  `%LOCALAPPDATA%\OpenMgmt\openmgmt.sqlite` or
   `%APPDATA%\OpenMgmt\openmgmt.sqlite` is created, try running
   `%LOCALAPPDATA%\OpenMgmt\openmgmt-desktop.exe` directly, and inspect the
   WebView console if the boot screen shows its failure diagnostics.

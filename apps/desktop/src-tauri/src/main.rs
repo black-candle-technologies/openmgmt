@@ -6,10 +6,12 @@ mod commands;
 use openmgmt_core::{AppService, Database, default_database_path};
 use std::{
     env,
+    ffi::OsString,
     path::{Path, PathBuf},
 };
 use tracing_subscriber::EnvFilter;
 
+/// Starts the Tauri desktop shell with the resolved SQLite database.
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -89,23 +91,40 @@ fn main() {
         .expect("error while running OpenMgmt");
 }
 
+/// Returns the SQLite database path for the desktop shell.
+///
+/// Debug builds and explicit overrides keep the development path. Packaged
+/// Windows release builds use per-user local app data.
 fn desktop_database_path() -> Result<PathBuf, String> {
-    if env::var_os("OPENMGMT_DATABASE_PATH").is_some() || cfg!(debug_assertions) {
+    if env::var_os("OPENMGMT_DATABASE_PATH").is_some()
+        || cfg!(debug_assertions)
+        || !cfg!(target_os = "windows")
+    {
         return Ok(default_database_path());
     }
 
     installed_database_path()
 }
 
+/// Returns the installed Windows database path from per-user app data.
 fn installed_database_path() -> Result<PathBuf, String> {
-    let base = env::var_os("APPDATA")
-        .or_else(|| env::var_os("LOCALAPPDATA"))
+    installed_database_path_from_env(env::var_os("LOCALAPPDATA"), env::var_os("APPDATA"))
+}
+
+/// Chooses local app data first, falling back to roaming app data.
+fn installed_database_path_from_env(
+    local_app_data: Option<OsString>,
+    roaming_app_data: Option<OsString>,
+) -> Result<PathBuf, String> {
+    let base = local_app_data
+        .or(roaming_app_data)
         .map(PathBuf::from)
-        .ok_or_else(|| "APPDATA or LOCALAPPDATA must be set for installed OpenMgmt".to_string())?;
+        .ok_or_else(|| "LOCALAPPDATA or APPDATA must be set for installed OpenMgmt".to_string())?;
 
     Ok(installed_database_path_from_base(&base))
 }
 
+/// Appends the OpenMgmt SQLite filename to an app data base directory.
 fn installed_database_path_from_base(base: &Path) -> PathBuf {
     base.join("OpenMgmt").join("openmgmt.sqlite")
 }
@@ -114,6 +133,7 @@ fn installed_database_path_from_base(base: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// Verifies the installed path stays under the OpenMgmt app data folder.
     #[test]
     fn installed_database_path_uses_openmgmt_app_data_folder() {
         let base = tempfile::tempdir().unwrap();
@@ -124,6 +144,20 @@ mod tests {
         );
     }
 
+    /// Verifies local app data wins over roaming app data for SQLite storage.
+    #[test]
+    fn installed_database_path_prefers_local_app_data() {
+        let local = PathBuf::from("local");
+        let roaming = PathBuf::from("roaming");
+
+        assert_eq!(
+            installed_database_path_from_env(Some(local.clone().into()), Some(roaming.into()))
+                .unwrap(),
+            local.join("OpenMgmt").join("openmgmt.sqlite")
+        );
+    }
+
+    /// Verifies a fresh installed database is created and has no user records.
     #[test]
     fn installed_database_parent_is_created_and_starts_empty() {
         let base = tempfile::tempdir().unwrap();

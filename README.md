@@ -60,7 +60,7 @@ cargo tauri dev
 
 On first development launch, the app creates and migrates an empty local SQLite
 database at `data/openmgmt.sqlite`. Packaged installs use
-`%APPDATA%\OpenMgmt\openmgmt.sqlite` instead, so the app never needs to write
+`%LOCALAPPDATA%\OpenMgmt\openmgmt.sqlite` instead, so the app never needs to write
 into its install directory. It does not create sample organizations, projects,
 or tasks; users create their own workspace records. Select **Open TV Board** in the
 top bar to open the board in a separate, normal Tauri window (decorated,
