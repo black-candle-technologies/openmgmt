@@ -3,6 +3,30 @@ use crate::{
     scoring::{ScoringWeights, score_task},
 };
 use chrono::{DateTime, Duration, Utc};
+use std::cmp::Ordering;
+
+/// A scored task's effective scheduled start (explicit block start, else the
+/// legacy single `scheduled_at`), used to order the upcoming sections by time.
+fn scheduled_start(task: &ScoredTask) -> Option<DateTime<Utc>> {
+    task.context
+        .task
+        .scheduled_start_at
+        .or(task.context.task.scheduled_at)
+}
+
+/// Ordering for the "upcoming" sections (Up Next, Later Today): scheduled tasks
+/// come first, earliest scheduled time wins, and urgency (higher first) breaks
+/// ties — including between two unscheduled tasks, so P1 still outranks P5.
+fn upcoming_cmp(a: &ScoredTask, b: &ScoredTask) -> Ordering {
+    match (scheduled_start(a), scheduled_start(b)) {
+        (Some(a_start), Some(b_start)) => a_start
+            .cmp(&b_start)
+            .then_with(|| b.urgency_score.cmp(&a.urgency_score)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => b.urgency_score.cmp(&a.urgency_score),
+    }
+}
 
 pub fn build_board(tasks: Vec<TaskContext>, now: DateTime<Utc>) -> BoardState {
     let mut board = BoardState {
@@ -58,17 +82,20 @@ pub fn build_board(tasks: Vec<TaskContext>, now: DateTime<Utc>) -> BoardState {
         }
     }
 
+    // Most columns rank by raw urgency. The upcoming sections instead lead with
+    // scheduled work in time order (see `upcoming_cmp`) so a task with a clear
+    // upcoming time is never buried behind a higher-priority unscheduled task.
     for column in [
         &mut board.now,
-        &mut board.next_up,
         &mut board.due_soon,
         &mut board.waiting_blocked,
-        &mut board.later_today,
         &mut board.overdue,
         &mut board.done_today,
     ] {
         column.sort_by(|a, b| b.urgency_score.cmp(&a.urgency_score));
     }
+    board.next_up.sort_by(upcoming_cmp);
+    board.later_today.sort_by(upcoming_cmp);
     board
 }
 
@@ -231,5 +258,71 @@ mod tests {
         let board = build_board(vec![p5, p1], now);
         assert_eq!(board.now[0].context.task.id, "p1");
         assert_eq!(board.now[1].context.task.id, "p5");
+    }
+
+    /// Up Next leads with scheduled work in time order, then ranks the rest by
+    /// priority/urgency: a scheduled 9 AM P3 beats a scheduled 10 AM P1, both beat
+    /// an unscheduled P1, and unscheduled P1 still beats unscheduled P5.
+    #[test]
+    fn up_next_orders_scheduled_by_time_then_priority() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 19, 12, 0, 0)
+            .single()
+            .unwrap();
+        let nine = Utc.with_ymd_and_hms(2026, 6, 20, 9, 0, 0).single().unwrap();
+        let ten = Utc
+            .with_ymd_and_hms(2026, 6, 20, 10, 0, 0)
+            .single()
+            .unwrap();
+
+        let mut sched_9_p3 = task("sched-9-p3", TaskStatus::Scheduled, now);
+        sched_9_p3.task.priority = 3;
+        sched_9_p3.task.scheduled_start_at = Some(nine);
+        sched_9_p3.task.scheduled_end_at = Some(nine + Duration::hours(1));
+
+        let mut sched_10_p1 = task("sched-10-p1", TaskStatus::Scheduled, now);
+        sched_10_p1.task.priority = 1;
+        sched_10_p1.task.scheduled_start_at = Some(ten);
+        sched_10_p1.task.scheduled_end_at = Some(ten + Duration::hours(1));
+
+        let mut unsched_p1 = task("unsched-p1", TaskStatus::Ready, now);
+        unsched_p1.task.priority = 1;
+        let mut unsched_p5 = task("unsched-p5", TaskStatus::Ready, now);
+        unsched_p5.task.priority = 5;
+
+        // Inserted out of final order so ordering can only come from the sort.
+        let board = build_board(vec![unsched_p5, sched_10_p1, unsched_p1, sched_9_p3], now);
+        let order: Vec<&str> = board
+            .next_up
+            .iter()
+            .map(|t| t.context.task.id.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["sched-9-p3", "sched-10-p1", "unsched-p1", "unsched-p5"]
+        );
+    }
+
+    /// Two tasks scheduled at the same time fall back to priority/urgency: P1 first.
+    #[test]
+    fn up_next_breaks_scheduled_ties_by_priority() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 19, 12, 0, 0)
+            .single()
+            .unwrap();
+        let nine = Utc.with_ymd_and_hms(2026, 6, 20, 9, 0, 0).single().unwrap();
+
+        let mut tie_p3 = task("tie-p3", TaskStatus::Scheduled, now);
+        tie_p3.task.priority = 3;
+        tie_p3.task.scheduled_start_at = Some(nine);
+        tie_p3.task.scheduled_end_at = Some(nine + Duration::hours(1));
+        let mut tie_p1 = task("tie-p1", TaskStatus::Scheduled, now);
+        tie_p1.task.priority = 1;
+        tie_p1.task.scheduled_start_at = Some(nine);
+        tie_p1.task.scheduled_end_at = Some(nine + Duration::hours(1));
+
+        let board = build_board(vec![tie_p3, tie_p1], now);
+        assert_eq!(board.next_up[0].context.task.id, "tie-p1");
+        assert_eq!(board.next_up[1].context.task.id, "tie-p3");
     }
 }

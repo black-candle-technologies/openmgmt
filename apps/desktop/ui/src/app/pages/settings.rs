@@ -8,6 +8,16 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::app::components::*;
 use crate::app::state::*;
+use serde::Deserialize;
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DatabaseInfo {
+    path: String,
+    exists: bool,
+    profile: String,
+    app_version: String,
+}
 
 /// String mirror of the editable scoring weights, so the inputs stay controlled
 /// and a reset/load can repopulate every field at once.
@@ -71,6 +81,7 @@ fn parse_score(label: &str, value: &str) -> Result<i32, String> {
 pub fn SettingsPage(state: AppState) -> impl IntoView {
     let form = RwSignal::new(ScoringForm::default());
     let loaded = RwSignal::new(false);
+    let database_info = RwSignal::new(None::<DatabaseInfo>);
 
     spawn_local(async move {
         match invoke::<ScoringSettings>("get_scoring_settings", json!({})).await {
@@ -82,6 +93,13 @@ pub fn SettingsPage(state: AppState) -> impl IntoView {
                 loaded.set(true);
                 state.fail("Load scoring settings failed", error);
             }
+        }
+    });
+
+    spawn_local(async move {
+        match invoke::<DatabaseInfo>("get_database_info", json!({})).await {
+            Ok(info) => database_info.set(Some(info)),
+            Err(error) => state.fail("Load database info failed", error),
         }
     });
 
@@ -174,6 +192,28 @@ pub fn SettingsPage(state: AppState) -> impl IntoView {
                 }.into_any()
             } else {
                 view! { <LoadingState label="Loading scoring settings…" /> }.into_any()
+            }}
+        </Section>
+
+        <Section title="Local database">
+            {move || match database_info.get() {
+                Some(info) => view! {
+                    <div class="settings-facts">
+                        <div class="settings-fact">
+                            <span class="settings-fact-label">"Path"</span>
+                            <span class="settings-fact-value">{info.path}</span>
+                        </div>
+                        <div class="settings-fact">
+                            <span class="settings-fact-label">"File"</span>
+                            <span class="settings-fact-value">{if info.exists { "Present" } else { "Missing" }}</span>
+                        </div>
+                        <div class="settings-fact">
+                            <span class="settings-fact-label">"Build"</span>
+                            <span class="settings-fact-value">{format!("{} {}", info.profile, info.app_version)}</span>
+                        </div>
+                    </div>
+                }.into_any(),
+                None => view! { <LoadingState label="Loading database info..." /> }.into_any(),
             }}
         </Section>
 
