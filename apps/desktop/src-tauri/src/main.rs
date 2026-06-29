@@ -18,12 +18,15 @@ fn main() {
         .init();
 
     let database_path = desktop_database_path().expect("failed to resolve OpenMgmt database path");
-    let database = Database::open(database_path).expect("failed to open OpenMgmt database");
+    let database = Database::open(database_path.clone()).expect("failed to open OpenMgmt database");
+    let database_info = commands::DatabaseInfo::from_path(&database_path);
 
     tauri::Builder::default()
         .manage(AppService::new(database))
+        .manage(database_info)
         .manage(commands::SyncRuntimeState::default())
         .invoke_handler(tauri::generate_handler![
+            commands::get_database_info,
             commands::list_organizations,
             commands::create_organization,
             commands::update_organization,

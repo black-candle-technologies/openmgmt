@@ -7,11 +7,46 @@ use openmgmt_core::{
     TaskPatch, TaskQueryFilter, TaskSort, TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
 };
 use openmgmt_sync_client::{SyncConnectionTestResult, SyncOnceResult};
+use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
 use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::{Mutex, MutexGuard};
 
 type CommandResult<T> = Result<T, String>;
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseInfo {
+    pub path: String,
+    pub exists: bool,
+    pub profile: &'static str,
+    pub app_version: &'static str,
+}
+
+impl DatabaseInfo {
+    pub fn from_path(path: &Path) -> Self {
+        let absolute = path.canonicalize().unwrap_or_else(|_| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(path)
+            }
+        });
+
+        Self {
+            exists: absolute.exists(),
+            path: absolute.display().to_string(),
+            profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            app_version: env!("CARGO_PKG_VERSION"),
+        }
+    }
+}
 
 fn core<T>(result: openmgmt_core::db::Result<T>) -> CommandResult<T> {
     result.map_err(|error| {
@@ -36,6 +71,11 @@ impl SyncRuntimeState {
 #[tauri::command]
 pub fn list_organizations(service: State<'_, AppService>) -> CommandResult<Vec<Organization>> {
     core(service.list_organizations())
+}
+
+#[tauri::command]
+pub fn get_database_info(info: State<'_, DatabaseInfo>) -> DatabaseInfo {
+    info.inner().clone()
 }
 
 #[tauri::command]
