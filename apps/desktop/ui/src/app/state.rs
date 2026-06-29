@@ -404,6 +404,13 @@ pub fn local_hour(value: DateTime<Utc>) -> u32 {
     js_date(value).get_hours()
 }
 
+/// Local minutes-from-midnight (0–1439) for a UTC instant. Used to position
+/// scheduled blocks on the day timeline by their real start/end.
+pub fn local_minutes_of_day(value: DateTime<Utc>) -> i64 {
+    let date = js_date(value);
+    i64::from(date.get_hours()) * 60 + i64::from(date.get_minutes())
+}
+
 /// Local `(year, month, day)` for a UTC instant.
 pub fn local_ymd(value: DateTime<Utc>) -> (i32, u32, u32) {
     let date = js_date(value);

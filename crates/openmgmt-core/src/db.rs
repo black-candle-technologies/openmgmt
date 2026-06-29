@@ -6,9 +6,9 @@ use crate::{
         ActiveTimerInfo, BoardState, CalendarBlock, CalendarBlockSource, CalendarBlockStatus,
         NewOrganization, NewProject, NewSavedTaskView, NewTask, Organization, OrganizationPatch,
         Project, ProjectPatch, RecurrenceRule, SavedTaskView, SavedTaskViewPatch, ScheduleConflict,
-        ScheduleTaskInput, ScheduledBlockCompletion, ScoringSettings, ScoringSettingsPatch, Task,
-        TaskContext, TaskPatch, TaskQueryFilter, TaskSort, TaskSortField, TaskStatus,
-        TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
+        ScheduleTaskInput, ScheduledBlockCompletion, ScheduledBlockHold, ScoringSettings,
+        ScoringSettingsPatch, Task, TaskContext, TaskPatch, TaskQueryFilter, TaskSort,
+        TaskSortField, TaskStatus, TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
     },
     scheduling::{generate_schedule_ics, next_recurrence_at},
     scoring::{ScoringWeights, score_task},
@@ -1789,6 +1789,71 @@ impl Database {
             transaction.commit()?;
         }
         Ok(block)
+    }
+
+    /// Put a scheduled work session on hold without completing its task.
+    ///
+    /// The block is marked `on_hold` (so the board/schedule stop treating it as
+    /// active or upcoming), any running timer for the task is stopped, and the
+    /// task is detached from the block and returned to an open `Ready` state — it
+    /// is never completed, canceled, or archived. When `continuation` is supplied
+    /// a fresh planned block is scheduled for the same task at that time so the
+    /// work can continue on another day; otherwise the task simply becomes
+    /// unscheduled and open.
+    pub fn hold_scheduled_block(
+        &self,
+        block_id: &str,
+        continuation: Option<ScheduleTaskInput>,
+    ) -> Result<ScheduledBlockHold> {
+        let mut block = self.get_calendar_block(block_id)?;
+        block.status = CalendarBlockStatus::OnHold;
+        block.updated_at = Utc::now();
+        self.save_calendar_block(&block)?;
+
+        let mut task = None;
+        let mut continuation_block = None;
+        if let Some(task_id) = block.task_id.clone() {
+            // Stop an in-progress session so the task leaves the active/NOW state.
+            if self.get_active_timer_session(&task_id)?.is_some() {
+                self.stop_task_timer(&task_id)?;
+            }
+            // Detach the held block and clear the schedule so it no longer reads as
+            // upcoming work; keep the task open (Scheduled/InProgress → Ready).
+            {
+                let mut connection = self.connection()?;
+                let transaction = connection.transaction()?;
+                let mut held_task = get_task_with_connection(&transaction, &task_id)?;
+                clear_task_schedule_fields(&mut held_task);
+                if matches!(
+                    held_task.status,
+                    TaskStatus::Scheduled | TaskStatus::InProgress
+                ) {
+                    held_task.status = TaskStatus::Ready;
+                }
+                held_task.updated_at = Utc::now();
+                save_task_with_connection(&transaction, &held_task)?;
+                append_sync_event_with_connection(
+                    &transaction,
+                    SyncEntityType::Task,
+                    &held_task.id,
+                    SyncOperation::Updated,
+                    serde_json::json!({ "entity": &held_task }),
+                )?;
+                transaction.commit()?;
+            }
+            // Optionally schedule the same task to continue later. The block was
+            // detached above, so `schedule_task` creates a new one without touching
+            // the held block.
+            if let Some(input) = continuation {
+                continuation_block = Some(self.schedule_task(&task_id, input)?);
+            }
+            task = Some(self.get_task(&task_id)?);
+        }
+        Ok(ScheduledBlockHold {
+            block,
+            task,
+            continuation_block,
+        })
     }
 
     pub fn generate_schedule_ics(&self) -> Result<String> {
@@ -3735,6 +3800,112 @@ mod tests {
         assert!(cleared.deadline_at.is_none());
         assert!(cleared.calendar_block_id.is_none());
         assert_eq!(cleared.status, TaskStatus::Ready);
+    }
+
+    #[test]
+    fn hold_without_continuation_keeps_task_open_and_unscheduled() {
+        let db = Database::in_memory().unwrap();
+        let task = scheduling_task(&db, "Hold me", 2, 60);
+        let start = Utc::now() + ChronoDuration::hours(1);
+        let block = db
+            .schedule_task(
+                &task.id,
+                schedule_input(start, start + ChronoDuration::hours(1)),
+            )
+            .unwrap();
+
+        let result = db.hold_scheduled_block(&block.id, None).unwrap();
+
+        // The block is on hold; the task stays open and is no longer scheduled.
+        assert_eq!(result.block.status, CalendarBlockStatus::OnHold);
+        assert!(result.continuation_block.is_none());
+        let held_task = result.task.expect("task is returned");
+        assert_ne!(held_task.status, TaskStatus::Done);
+        assert_eq!(held_task.status, TaskStatus::Ready);
+        assert!(held_task.scheduled_start_at.is_none());
+        assert!(held_task.calendar_block_id.is_none());
+        // The held block drops out of the (task-based) schedule view.
+        assert!(
+            db.scheduled_tasks_between(
+                start - ChronoDuration::hours(1),
+                start + ChronoDuration::hours(2),
+            )
+            .unwrap()
+            .iter()
+            .all(|row| row.task.id != task.id)
+        );
+    }
+
+    #[test]
+    fn hold_with_continuation_creates_new_block_for_same_task() {
+        let db = Database::in_memory().unwrap();
+        let task = scheduling_task(&db, "Continue tomorrow", 2, 60);
+        let start = Utc::now() + ChronoDuration::hours(1);
+        let block = db
+            .schedule_task(
+                &task.id,
+                schedule_input(start, start + ChronoDuration::hours(1)),
+            )
+            .unwrap();
+
+        let next_start = start + ChronoDuration::days(1);
+        let result = db
+            .hold_scheduled_block(
+                &block.id,
+                Some(schedule_input(
+                    next_start,
+                    next_start + ChronoDuration::hours(1),
+                )),
+            )
+            .unwrap();
+
+        assert_eq!(result.block.status, CalendarBlockStatus::OnHold);
+        let continuation = result.continuation_block.expect("continuation scheduled");
+        assert_ne!(continuation.id, block.id);
+        assert_eq!(continuation.task_id.as_deref(), Some(task.id.as_str()));
+        // The task itself is still open and now points at the continuation block.
+        let held_task = result.task.expect("task is returned");
+        assert_ne!(held_task.status, TaskStatus::Done);
+        assert_eq!(held_task.scheduled_start_at, Some(next_start));
+        assert_eq!(
+            held_task.calendar_block_id.as_deref(),
+            Some(continuation.id.as_str())
+        );
+    }
+
+    #[test]
+    fn held_block_leaves_the_board_now_section() {
+        let db = Database::in_memory().unwrap();
+        let task = scheduling_task(&db, "Active then held", 1, 60);
+        let now = Utc::now();
+        let block = db
+            .schedule_task(
+                &task.id,
+                schedule_input(
+                    now - ChronoDuration::minutes(15),
+                    now + ChronoDuration::minutes(45),
+                ),
+            )
+            .unwrap();
+        // The active block places the task in NOW before it is held.
+        assert!(
+            db.board_state()
+                .unwrap()
+                .now
+                .iter()
+                .any(|t| t.context.task.id == task.id)
+        );
+
+        db.hold_scheduled_block(&block.id, None).unwrap();
+
+        let board = db.board_state().unwrap();
+        assert!(!board.now.iter().any(|t| t.context.task.id == task.id));
+        assert!(
+            !board
+                .done_today
+                .iter()
+                .any(|t| t.context.task.id == task.id)
+        );
     }
 
     #[test]

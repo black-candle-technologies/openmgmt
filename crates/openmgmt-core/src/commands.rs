@@ -3,9 +3,9 @@ use crate::{
     models::{
         BoardState, CalendarBlock, NewOrganization, NewProject, NewSavedTaskView, NewTask,
         Organization, OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch,
-        ScheduleConflict, ScheduleTaskInput, ScheduledBlockCompletion, ScoringSettings,
-        ScoringSettingsPatch, Task, TaskPatch, TaskQueryFilter, TaskSort, TaskStatus,
-        TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
+        ScheduleConflict, ScheduleTaskInput, ScheduledBlockCompletion, ScheduledBlockHold,
+        ScoringSettings, ScoringSettingsPatch, Task, TaskPatch, TaskQueryFilter, TaskSort,
+        TaskStatus, TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
     },
     sync::{SyncSettings, SyncSettingsPatch, SyncStatus},
 };
@@ -166,6 +166,13 @@ impl AppService {
     }
     pub fn skip_scheduled_block(&self, block_id: &str) -> Result<CalendarBlock> {
         self.database.skip_scheduled_block(block_id)
+    }
+    pub fn hold_scheduled_block(
+        &self,
+        block_id: &str,
+        continuation: Option<ScheduleTaskInput>,
+    ) -> Result<ScheduledBlockHold> {
+        self.database.hold_scheduled_block(block_id, continuation)
     }
     pub fn generate_schedule_ics(&self) -> Result<String> {
         self.database.generate_schedule_ics()

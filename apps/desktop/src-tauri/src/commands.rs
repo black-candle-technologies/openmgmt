@@ -2,9 +2,9 @@ use chrono::{DateTime, Utc};
 use openmgmt_core::{
     AppService, BoardState, CalendarBlock, NewOrganization, NewProject, NewSavedTaskView, NewTask,
     Organization, OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch,
-    ScheduleConflict, ScheduleTaskInput, ScheduledBlockCompletion, ScoringSettings,
-    ScoringSettingsPatch, SyncSettings, SyncSettingsPatch, SyncStatus, Task, TaskPatch,
-    TaskQueryFilter, TaskSort, TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
+    ScheduleConflict, ScheduleTaskInput, ScheduledBlockCompletion, ScheduledBlockHold,
+    ScoringSettings, ScoringSettingsPatch, SyncSettings, SyncSettingsPatch, SyncStatus, Task,
+    TaskPatch, TaskQueryFilter, TaskSort, TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
 };
 use openmgmt_sync_client::{SyncConnectionTestResult, SyncOnceResult};
 use std::path::{Component, Path, PathBuf};
@@ -302,6 +302,18 @@ pub fn skip_scheduled_block(
     block_id: String,
 ) -> CommandResult<CalendarBlock> {
     core(service.skip_scheduled_block(&block_id))
+}
+
+/// Put a scheduled block on hold (keeps the task open), optionally scheduling a
+/// continuation block. Top-level invoke args are camelCase (`blockId`,
+/// `continuation`) to match Tauri's snake_case parameter mapping.
+#[tauri::command]
+pub fn hold_scheduled_block(
+    service: State<'_, AppService>,
+    block_id: String,
+    continuation: Option<ScheduleTaskInput>,
+) -> CommandResult<ScheduledBlockHold> {
+    core(service.hold_scheduled_block(&block_id, continuation))
 }
 
 #[tauri::command]

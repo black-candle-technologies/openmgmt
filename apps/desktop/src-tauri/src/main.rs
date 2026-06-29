@@ -53,6 +53,7 @@ fn main() {
             commands::suggest_tasks_for_time_window,
             commands::complete_scheduled_block,
             commands::skip_scheduled_block,
+            commands::hold_scheduled_block,
             commands::generate_schedule_ics,
             commands::start_task,
             commands::complete_task,

@@ -368,7 +368,9 @@ a { color: inherit; }
 .record-card-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: auto; }
 .record-card-actions { display: flex; gap: 6px; }
 
-.org-card { position: relative; overflow: hidden; padding-top: 22px; }
+/* The organization colour reads three ways so it is never missed: a top strip,
+   a left border, and the avatar fill (see .org-icon). */
+.org-card { position: relative; overflow: hidden; padding-top: 22px; border-left: 4px solid var(--accent, var(--line-strong)); }
 /* Prominent organization-colour header strip. */
 .org-accent-bar { position: absolute; left: 0; right: 0; top: 0; height: 6px; background: var(--accent, var(--line-strong)); }
 .org-card-head { display: flex; align-items: center; justify-content: space-between; }
@@ -387,10 +389,13 @@ a { color: inherit; }
 .task-table { display: flex; flex-direction: column; }
 .task-row {
   display: grid;
-  grid-template-columns: 48px minmax(0, 1fr) auto auto auto auto;
+  /* minmax(0, …) on every flexible track (incl. the action column) so a wrapping
+     action cluster shrinks/wraps instead of forcing the whole app to scroll. */
+  grid-template-columns: 48px minmax(0, 1fr) minmax(0, auto) minmax(0, auto) minmax(0, auto) minmax(0, auto);
   align-items: center; gap: 14px;
   padding: 12px 6px; border-bottom: 1px solid var(--line);
 }
+.task-row-actions { flex-wrap: wrap; }
 .task-row:last-child { border-bottom: 0; }
 .task-row-pri { display: flex; align-items: center; }
 .task-row-head { font: 600 10px var(--mono); letter-spacing: 0.06em; color: var(--text-muted); text-transform: uppercase; }
@@ -751,25 +756,44 @@ a { color: inherit; }
 .qtask-summary { display: flex; align-items: center; gap: 9px; margin-bottom: 12px; }
 .qtask-summary-label { color: var(--text-muted); font-size: 13px; }
 .qtask-summary-busy { display: inline-flex; align-items: center; gap: 7px; margin-left: auto; color: var(--text-muted); font: 11px var(--mono); text-transform: uppercase; letter-spacing: 0.06em; }
-.qtask-table { display: flex; flex-direction: column; }
+/* Query-backed task table. It is a size container, so the row layout switches on
+   the TABLE's own width (sidebar-independent) rather than the viewport — fixing
+   the band where the old viewport breakpoint still showed the fixed grid in a
+   too-narrow content area and clipped the action buttons. Default = stacked card;
+   a wide container upgrades to the efficient table grid. If container queries are
+   unavailable the card layout simply applies everywhere (still clip-free). */
+.qtask-table { display: flex; flex-direction: column; container-type: inline-size; }
 .qtask-row {
-  display: grid;
-  grid-template-columns: 44px minmax(0, 1fr) 104px 132px 128px 132px 50px minmax(216px, auto);
-  align-items: center; gap: 12px; padding: 11px 6px; border-bottom: 1px solid var(--line);
+  display: flex; flex-wrap: wrap; align-items: center;
+  gap: 8px 12px; padding: 12px 8px; border-bottom: 1px solid var(--line);
 }
 .qtask-row:last-child { border-bottom: 0; }
-.qtask-row-head { font: 600 10px var(--mono); letter-spacing: 0.06em; color: var(--text-muted); text-transform: uppercase; }
+.qtask-row-head { display: none; font: 600 10px var(--mono); letter-spacing: 0.06em; color: var(--text-muted); text-transform: uppercase; }
 .qtask-row-head span { white-space: nowrap; }
-.qtask-main { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.qtask-pri { flex: 0 0 auto; }
+.qtask-main { flex: 1 1 200px; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
 .qtask-tags { display: flex; flex-wrap: wrap; gap: 5px; }
 .qtask-pin { color: #c79a2a; }
+.qtask-status, .qtask-org, .qtask-project, .qtask-due, .qtask-urgency { flex: 0 0 auto; }
 .qtask-org { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.qtask-org-name { font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.qtask-project { font-size: 13px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.qtask-org-name { font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 14rem; }
+.qtask-project { font-size: 13px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 16rem; }
 .qtask-due { font: 12px var(--mono); color: var(--text-muted); white-space: nowrap; }
 .qtask-urgency { font: 700 13px var(--mono); color: var(--green); text-align: center; }
-.qtask-timer { display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
+.qtask-timer { display: flex; align-items: center; justify-content: flex-start; gap: 6px; flex-wrap: wrap; flex: 1 1 100%; }
 .qtask-cancel { flex-shrink: 0; }
+
+@container (min-width: 900px) {
+  .qtask-row {
+    display: grid;
+    grid-template-columns: 44px minmax(0, 1.7fr) minmax(82px, 0.8fr) minmax(0, 0.9fr) minmax(0, 0.9fr) minmax(0, 0.8fr) 46px minmax(0, 1.7fr);
+    gap: 12px; padding: 11px 6px;
+  }
+  .qtask-row-head { display: grid; }
+  .qtask-main, .qtask-status, .qtask-org, .qtask-project, .qtask-due, .qtask-urgency, .qtask-timer { flex: initial; }
+  .qtask-org-name, .qtask-project { max-width: none; }
+  .qtask-timer { justify-content: flex-end; }
+}
 
 /* Timer controls (shared) */
 .timer-controls { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
@@ -855,10 +879,6 @@ a { color: inherit; }
 }
 @media (max-width: 1000px) {
   .daily-grid { grid-template-columns: 1fr; }
-  .qtask-row { grid-template-columns: 40px 1fr; row-gap: 6px; }
-  .qtask-row-head { display: none; }
-  .qtask-status, .qtask-org, .qtask-project, .qtask-due, .qtask-urgency { grid-column: 2 / -1; }
-  .qtask-timer { grid-column: 1 / -1; justify-content: flex-start; }
 }
 
 /* 18. Sync page ----------------------------------------------------------- */
@@ -990,18 +1010,64 @@ a { color: inherit; }
   border-radius: var(--radius-sm); background: var(--surface-2);
   color: var(--text-muted); font-size: 13px; text-align: center;
 }
-.sched-timeline { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: var(--radius-sm); overflow: hidden; }
+/* Today timeline: a fixed hour grid (background) with absolutely-positioned
+   blocks layered on top, so a block spans the real number of hours it covers.
+   `--hour-px` and the overall height are set inline from the Rust layout. */
+.sched-timeline {
+  position: relative; overflow: hidden;
+  border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface);
+}
+.sched-hours { position: absolute; inset: 0; display: flex; flex-direction: column; }
 .sched-slot {
   position: relative;
-  display: grid; grid-template-columns: 66px minmax(0, 1fr); gap: 12px;
-  padding: 8px 12px; border-bottom: 1px solid var(--line); min-height: 50px;
+  display: grid; grid-template-columns: 64px minmax(0, 1fr);
+  height: var(--hour-px, 56px); padding: 0 10px;
+  border-bottom: 1px solid var(--line);
   transition: background 0.12s ease, box-shadow 0.12s ease;
 }
 .sched-slot:last-child { border-bottom: 0; }
-.sched-slot-label { font: 600 11px var(--mono); color: var(--text-muted); text-transform: uppercase; padding-top: 6px; text-align: right; }
-.sched-slot-body { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-.sched-slot-empty { display: block; min-height: 16px; }
+.sched-slot-label { font: 600 11px var(--mono); color: var(--text-muted); text-transform: uppercase; padding-top: 4px; text-align: right; }
+.sched-slot-cell { display: block; }
 .sched-slot.drop-active { background: rgba(201, 239, 106, 0.18); box-shadow: inset 0 0 0 2px var(--lime-deep); }
+
+/* Block layer over the hour grid. Gaps pass pointer events through to the hour
+   rows (for drop/place); only the cards themselves catch them. Left offset
+   matches the hour-label gutter (10px padding + 64px label). */
+.sched-blocks { position: absolute; top: 0; bottom: 0; left: 74px; right: 10px; pointer-events: none; }
+/* A block is exactly as tall as its duration and never grows past it (no
+   hover/content expansion that would jump the layout). Taller-than-the-block
+   content is simply clipped; drag an edge to make room or open it to act. */
+.sched-block {
+  position: absolute; pointer-events: auto; overflow: hidden;
+  margin: 0; gap: 3px; padding: 8px 9px 6px; box-shadow: var(--shadow-sm);
+  touch-action: none;
+}
+.sched-block .sched-card-time { font-size: 11px; }
+.sched-block .sched-card-actions { gap: 5px; margin-top: auto; }
+.sched-block .sched-mini { padding: 3px 8px; font-size: 11px; }
+/* The grabbed card lifts above its neighbours; the timeline freezes hover and
+   text selection while any drag is live so the preview can't jump. */
+.sched-block.is-dragging { z-index: 20; box-shadow: var(--shadow); cursor: grabbing; }
+.sched-timeline.is-dragging { cursor: ns-resize; user-select: none; }
+.sched-timeline.is-dragging .sched-block:not(.is-dragging) { opacity: 0.82; }
+/* Non-interactive move-grip hint in the card head. */
+.sched-grip { margin-left: auto; color: var(--text-muted); font-size: 13px; line-height: 1; pointer-events: none; }
+
+/* Top/bottom edge resize handles. */
+.sched-resize {
+  position: absolute; left: 0; right: 0; height: 9px; z-index: 6;
+  cursor: ns-resize; touch-action: none;
+}
+.sched-resize-top { top: 0; }
+.sched-resize-bottom { bottom: 0; }
+.sched-resize::after {
+  content: ""; position: absolute; left: 50%; transform: translateX(-50%);
+  top: 3px; width: 28px; height: 2px; border-radius: 2px;
+  background: var(--line-strong); opacity: 0; transition: opacity 0.12s ease;
+}
+.sched-resize-bottom::after { top: auto; bottom: 3px; }
+.sched-block:hover .sched-resize::after, .sched-block.is-dragging .sched-resize::after { opacity: 0.9; }
+.sched-resize:hover::after { background: var(--green); opacity: 1; }
 
 /* Scheduled / queued task cards */
 .sched-card {
@@ -1205,3 +1271,20 @@ a { color: inherit; }
   margin-left: 7px; font: 700 10px var(--mono); letter-spacing: 0.03em;
   color: #9fb46a; white-space: nowrap;
 }
+
+/* ---------------------------------------------------------------------------
+   Organization colour on board task rows/cards (set inline as `--org`)
+   A light left stripe shows which organization a task belongs to without
+   overpowering the urgency colour coding. The dense ER row gets an inset stripe;
+   the spaced board cards/lines use a ::before bar inside the urgency border.
+   --------------------------------------------------------------------------- */
+.er-row:not(.er-head-row) { box-shadow: inset 3px 0 0 var(--org, transparent); }
+.board-card, .board-line { position: relative; }
+.board-card::before, .board-line::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: var(--org, transparent);
+}
+
+/* On-hold dialog: stacked, full-width choices so the three options read clearly. */
+.sched-hold-choices { flex-direction: column; align-items: stretch; border-top: 0; padding-top: 6px; }
+.sched-hold-choices .btn { width: 100%; }

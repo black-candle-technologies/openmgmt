@@ -164,7 +164,7 @@ fn ErRow(item: ScoredTask, tone: &'static str, now: Signal<DateTime<Utc>>) -> im
     };
 
     view! {
-        <div class=format!("er-row er-row-{tone}")>
+        <div class=format!("er-row er-row-{tone}") style=format!("--org:{org_color}")>
             <span class="er-col-pri"><PriorityBadge value=priority /></span>
             <span class="er-col-task">
                 {pinned.then(|| view! { <span class="er-pin" title="Pinned">"★"</span> })}
@@ -291,7 +291,7 @@ fn BoardCard(
     if size == "lower" {
         let recurrence_line = recurrence;
         return view! {
-            <div class=format!("board-line board-line-{tone}")>
+            <div class=format!("board-line board-line-{tone}") style=format!("--org:{org_color}")>
                 <span class=format!("bc-pri bc-pri-p{priority}") title=title_attr>{format!("P{priority}")}</span>
                 <span class="bc-line-title">
                     {pinned.then(|| view! { <span class="bc-pin">"★"</span> })}
@@ -307,7 +307,7 @@ fn BoardCard(
     }
 
     view! {
-        <article class=format!("board-card board-card-{size} board-card-{tone}")>
+        <article class=format!("board-card board-card-{size} board-card-{tone}") style=format!("--org:{org_color}")>
             <div class="bc-head">
                 <span class=format!("bc-pri bc-pri-p{priority}") title=title_attr>{format!("P{priority}")}</span>
                 <span class=format!("bc-status bc-status-{tone}")>{status_label}</span>

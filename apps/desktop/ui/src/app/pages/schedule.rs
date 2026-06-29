@@ -21,12 +21,13 @@
 use chrono::{DateTime, Duration, Utc};
 use leptos::prelude::*;
 use openmgmt_core::{
-    CalendarBlock, RecurrenceRule, ScheduleConflict, ScheduleTaskInput, ScheduledBlockCompletion,
-    Task, TaskWithContext,
+    BlockEdge, CalendarBlock, RecurrenceRule, ScheduleConflict, ScheduleTaskInput,
+    ScheduledBlockCompletion, ScheduledBlockHold, Task, TaskWithContext, block_pixel_layout,
+    layout_columns, move_block, pixels_to_minutes, resize_block,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
-use wasm_bindgen::JsValue;
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::app::components::*;
@@ -35,6 +36,107 @@ use crate::app::tags::TagChip;
 
 /// Custom MIME used to carry the full drag payload through `DataTransfer`.
 const DRAG_MIME: &str = "application/x-openmgmt-schedule-drag";
+
+/// Pixels per hour on the day timeline. The single source of truth for hour
+/// height: it drives the block geometry math here AND is published to CSS as the
+/// `--hour-px` custom property on `.sched-timeline`, so the hour rows and the
+/// absolutely-positioned blocks always agree.
+const HOUR_PX: f64 = 56.0;
+/// Floor height for very short blocks so their time + title stay readable.
+const MIN_CARD_PX: f64 = 46.0;
+
+/// What a pointer drag on a scheduled block is doing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DragMode {
+    /// Dragging the card body moves the whole block (duration preserved).
+    Move,
+    /// Dragging the top edge changes the start time only.
+    ResizeTop,
+    /// Dragging the bottom edge changes the end time only.
+    ResizeBottom,
+}
+
+/// Live state of an in-progress move/resize drag on a scheduled block. One drag
+/// is active at a time; the preview times drive the card geometry until commit.
+#[derive(Clone)]
+struct BlockDrag {
+    task_id: String,
+    /// `Some` when the task already has a calendar block (so a commit reschedules).
+    block_id: Option<String>,
+    mode: DragMode,
+    orig_start: DateTime<Utc>,
+    orig_end: DateTime<Utc>,
+    /// Pointer Y at drag start, in client px, to measure the drag delta against.
+    start_client_y: f64,
+    /// Snapped preview times shown live while dragging; committed on pointer-up.
+    preview_start: DateTime<Utc>,
+    preview_end: DateTime<Utc>,
+    // Metadata preserved across the reschedule the commit performs.
+    reminder_at: Option<DateTime<Utc>>,
+    deadline_at: Option<DateTime<Utc>>,
+    recurrence_rule: Option<RecurrenceRule>,
+    recurrence_timezone: Option<String>,
+}
+
+impl BlockDrag {
+    /// Begin a drag for `task` in `mode` at pointer position `client_y`. Returns
+    /// `None` for a task with no start time (nothing to drag).
+    fn start(task: &Task, mode: DragMode, client_y: f64) -> Option<Self> {
+        let orig_start = task.scheduled_start_at?;
+        let orig_end = task
+            .scheduled_end_at
+            .unwrap_or(orig_start + Duration::hours(1));
+        Some(Self {
+            task_id: task.id.clone(),
+            block_id: task.calendar_block_id.clone(),
+            mode,
+            orig_start,
+            orig_end,
+            start_client_y: client_y,
+            preview_start: orig_start,
+            preview_end: orig_end,
+            reminder_at: task.reminder_at,
+            deadline_at: task.deadline_at,
+            recurrence_rule: task.recurrence_rule,
+            recurrence_timezone: task.recurrence_timezone.clone(),
+        })
+    }
+
+    fn changed(&self) -> bool {
+        self.preview_start != self.orig_start || self.preview_end != self.orig_end
+    }
+}
+
+/// The scheduled block targeted by the "On hold" dialog.
+#[derive(Clone)]
+struct HoldTarget {
+    task: Task,
+    block_id: String,
+}
+
+/// Capture the pointer on the dragged element so move/up events keep firing even
+/// if the pointer leaves it (or the window) mid-drag.
+fn capture_pointer(ev: &web_sys::PointerEvent) {
+    if let Some(target) = ev.current_target()
+        && let Ok(element) = target.dyn_into::<web_sys::Element>()
+    {
+        let _ = element.set_pointer_capture(ev.pointer_id());
+    }
+}
+
+/// Whether a pointerdown landed on an interactive child (button/link/field or a
+/// resize edge), so a card-body move drag must not start and steal the click.
+fn target_is_interactive(ev: &web_sys::PointerEvent) -> bool {
+    ev.target()
+        .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+        .and_then(|element| {
+            element
+                .closest("button, a, input, select, textarea, .sched-resize")
+                .ok()
+                .flatten()
+        })
+        .is_some()
+}
 
 /// Recurrence choices offered in the schedule modal.
 const RECURRENCE_OPTIONS: [(RecurrenceRule, &str); 5] = [
@@ -124,6 +226,10 @@ struct Sched {
     moving: RwSignal<Option<DragData>>,
     active_zone: RwSignal<Option<String>>,
     modal: RwSignal<Option<ScheduleTarget>>,
+    /// In-progress move/resize of a timeline block (drives the live preview).
+    block_drag: RwSignal<Option<BlockDrag>>,
+    /// The block whose "On hold" dialog is open, if any.
+    hold: RwSignal<Option<HoldTarget>>,
     ics: RwSignal<Option<String>>,
     now: Signal<DateTime<Utc>>,
     /// The local day the timeline + week view are focused on, as `(year, month, day)`.
@@ -284,6 +390,57 @@ impl Sched {
         });
     }
 
+    /// Update the live drag preview from the current pointer Y. Shared by move and
+    /// both resize edges so preview and commit always use identical math.
+    fn block_drag_update(self, client_y: f64) {
+        let Some(drag) = self.block_drag.get_untracked() else {
+            return;
+        };
+        let delta = pixels_to_minutes(client_y - drag.start_client_y, HOUR_PX);
+        let (preview_start, preview_end) = match drag.mode {
+            DragMode::Move => move_block(drag.orig_start, drag.orig_end, delta),
+            DragMode::ResizeTop => {
+                resize_block(drag.orig_start, drag.orig_end, BlockEdge::Start, delta)
+            }
+            DragMode::ResizeBottom => {
+                resize_block(drag.orig_start, drag.orig_end, BlockEdge::End, delta)
+            }
+        };
+        self.block_drag.set(Some(BlockDrag {
+            preview_start,
+            preview_end,
+            ..drag
+        }));
+    }
+
+    /// Commit the drag once on pointer-up: reschedule only if the time changed,
+    /// then clear the drag state. Idempotent — a second call is a no-op.
+    fn block_drag_commit(self) {
+        let Some(drag) = self.block_drag.get_untracked() else {
+            return;
+        };
+        self.block_drag.set(None);
+        if !drag.changed() {
+            return;
+        }
+        let input = ScheduleTaskInput {
+            start_at: drag.preview_start,
+            end_at: drag.preview_end,
+            timezone: None,
+            reminder_at: drag.reminder_at,
+            deadline_at: drag.deadline_at,
+            recurrence_rule: drag.recurrence_rule,
+            recurrence_anchor_at: None,
+            recurrence_timezone: drag.recurrence_timezone.clone(),
+        };
+        self.run(drag.task_id.clone(), input, drag.block_id.is_some());
+    }
+
+    /// Abandon an in-progress drag without committing (pointer canceled/lost).
+    fn block_drag_cancel(self) {
+        self.block_drag.set(None);
+    }
+
     fn skip_block(self, block_id: String) {
         spawn_local(async move {
             match invoke_schedule::<CalendarBlock>(
@@ -297,6 +454,33 @@ impl Sched {
                     self.state.refresh();
                 }
                 Err(error) => self.state.fail("Skip block failed", error),
+            }
+        });
+    }
+
+    /// Put a scheduled block on hold (keeping the task open), optionally with a
+    /// continuation block. Args are camelCase to match the Tauri command.
+    fn hold_block(self, block_id: String, continuation: Option<ScheduleTaskInput>) {
+        spawn_local(async move {
+            match invoke_schedule::<ScheduledBlockHold>(
+                "hold_scheduled_block",
+                json!({ "blockId": block_id, "continuation": continuation }),
+            )
+            .await
+            {
+                Ok(result) => {
+                    self.state.notice.set(Some(
+                        if result.continuation_block.is_some() {
+                            "Task put on hold — continuation scheduled."
+                        } else {
+                            "Task put on hold."
+                        }
+                        .to_string(),
+                    ));
+                    self.hold.set(None);
+                    self.state.refresh();
+                }
+                Err(error) => self.state.fail("Hold failed", error),
             }
         });
     }
@@ -677,6 +861,8 @@ pub fn SchedulePage(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoV
         moving: RwSignal::new(None),
         active_zone: RwSignal::new(None),
         modal: RwSignal::new(None),
+        block_drag: RwSignal::new(None),
+        hold: RwSignal::new(None),
         ics: RwSignal::new(None),
         now: now.into(),
         selected_day: RwSignal::new(local_ymd(Utc::now())),
@@ -780,6 +966,7 @@ pub fn SchedulePage(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoV
             <ConflictsPanel ctx />
 
             <ScheduleModal ctx />
+            <HoldModal ctx />
             <IcsModal ctx />
         </div>
     }
@@ -849,19 +1036,47 @@ fn TodayTimeline(ctx: Sched) -> impl IntoView {
                 }
                 let hours: Vec<u32> = (min_h..max_h.min(24)).collect();
                 let empty = day.is_empty();
+                let day_start_hour = min_h;
+                let timeline_px = hours.len() as f64 * HOUR_PX;
+
+                // Lay every scheduled block out absolutely so it spans its real
+                // duration, packing overlaps into side-by-side columns.
+                let blocks: Vec<TaskWithContext> = day
+                    .iter()
+                    .filter(|row| row.task.scheduled_start_at.is_some())
+                    .cloned()
+                    .collect();
+                let intervals: Vec<(i64, i64)> = blocks
+                    .iter()
+                    .map(|row| {
+                        let s =
+                            local_minutes_of_day(row.task.scheduled_start_at.expect("filtered above"));
+                        let e = row
+                            .task
+                            .scheduled_end_at
+                            .map(local_minutes_of_day)
+                            .unwrap_or(s + 60)
+                            .max(s + 15);
+                        (s, e)
+                    })
+                    .collect();
+                let positioned: Vec<(TaskWithContext, usize, usize)> = blocks
+                    .into_iter()
+                    .zip(layout_columns(&intervals))
+                    .map(|(row, (col, cols))| (row, col, cols))
+                    .collect();
 
                 view! {
                     {empty.then(|| view! {
-                        <p class="sched-empty-hint">"Nothing scheduled for this day. Drag an unscheduled task here to plan it."</p>
+                        <p class="sched-empty-hint">"Nothing scheduled for this day. Drag an unscheduled task here to plan it, then drag a block's top or bottom edge to change its time."</p>
                     })}
-                    <div class="sched-timeline">
-                        {hours.into_iter().map(|h| {
-                            let blocks: Vec<TaskWithContext> = day
-                                .iter()
-                                .filter(|row| row.task.scheduled_start_at.map(local_hour) == Some(h))
-                                .cloned()
-                                .collect();
-                            view! {
+                    <div
+                        class="sched-timeline"
+                        class:is-dragging=move || ctx.block_drag.get().is_some()
+                        style=format!("height:{timeline_px}px;--hour-px:{HOUR_PX}px")
+                    >
+                        <div class="sched-hours">
+                            {hours.into_iter().map(|h| view! {
                                 <div
                                     class="sched-slot"
                                     class:drop-active=move || ctx.active_zone.get().as_deref() == Some(format!("today-{h}").as_str())
@@ -882,13 +1097,7 @@ fn TodayTimeline(ctx: Sched) -> impl IntoView {
                                     on:drop=move |ev| { ev.prevent_default(); ev.stop_propagation(); ctx.drop_at(&ev, ty, tmo, td, h); }
                                 >
                                     <span class="sched-slot-label">{hour_label(h)}</span>
-                                    <div class="sched-slot-body">
-                                        {if blocks.is_empty() {
-                                            view! { <span class="sched-slot-empty"></span> }.into_any()
-                                        } else {
-                                            blocks.into_iter().map(|row| view! { <ScheduledCard ctx row /> }).collect_view().into_any()
-                                        }}
-                                    </div>
+                                    <span class="sched-slot-cell"></span>
                                     <button
                                         class="sched-move-target"
                                         type="button"
@@ -896,8 +1105,13 @@ fn TodayTimeline(ctx: Sched) -> impl IntoView {
                                         on:click=move |_| ctx.place_at(ty, tmo, td, h)
                                     ></button>
                                 </div>
-                            }
-                        }).collect_view()}
+                            }).collect_view()}
+                        </div>
+                        <div class="sched-blocks">
+                            {positioned.into_iter().map(|(row, col, cols)| view! {
+                                <ScheduledCard ctx row day_start_hour=day_start_hour column=col columns=cols />
+                            }).collect_view()}
+                        </div>
                     </div>
                 }.into_any()
             }}
@@ -906,7 +1120,16 @@ fn TodayTimeline(ctx: Sched) -> impl IntoView {
 }
 
 #[component]
-fn ScheduledCard(ctx: Sched, row: TaskWithContext) -> impl IntoView {
+fn ScheduledCard(
+    ctx: Sched,
+    row: TaskWithContext,
+    /// First hour shown on the timeline, so the block can offset from the top.
+    day_start_hour: u32,
+    /// This block's column and the column count of its overlap cluster, for
+    /// laying overlapping blocks out side by side.
+    column: usize,
+    columns: usize,
+) -> impl IntoView {
     let task = row.task.clone();
     let start = task.scheduled_start_at;
     let end = task.scheduled_end_at;
@@ -923,38 +1146,90 @@ fn ScheduledCard(ctx: Sched, row: TaskWithContext) -> impl IntoView {
     let recurrence = task
         .recurrence_rule
         .filter(|rule| *rule != RecurrenceRule::None);
-    let time_label = match (start, end) {
-        (Some(s), Some(e)) => fmt_time_range(s, e),
-        (Some(s), None) => fmt_time(s),
-        _ => "—".to_string(),
-    };
     let block_id = task.calendar_block_id.clone();
 
-    let drag_task = task.clone();
-    let handle_task = task.clone();
     let title_task = task.clone();
     let resched_task = task.clone();
+    let hold_task = task.clone();
+    let top_task = task.clone();
+    let bottom_task = task.clone();
+    let move_task = task.clone();
     let clear_id = task.id.clone();
+    let id_for_class = task.id.clone();
+    let id_for_style = task.id.clone();
+    let id_for_label = task.id.clone();
+
+    // Effective times: the live move/resize preview while this block is being
+    // dragged, otherwise its stored times. Shared by the geometry and the label.
+    let effective_times = move |task_id: &str| -> (DateTime<Utc>, DateTime<Utc>) {
+        if let Some(drag) = ctx.block_drag.get()
+            && drag.task_id == task_id
+        {
+            return (drag.preview_start, drag.preview_end);
+        }
+        let s = start.unwrap_or_else(Utc::now);
+        let e = end.unwrap_or(s + Duration::hours(1));
+        (s, e)
+    };
 
     let card_class = move || {
+        let dragging = ctx
+            .block_drag
+            .get()
+            .is_some_and(|drag| drag.task_id == id_for_class);
         format!(
-            "sched-card sched-card-{}",
-            block_state(start, end, ctx.now.get())
+            "sched-card sched-block sched-card-{}{}",
+            block_state(start, end, ctx.now.get()),
+            if dragging { " is-dragging" } else { "" }
         )
+    };
+    let card_style = move || {
+        let (s, e) = effective_times(&id_for_style);
+        let start_min = local_minutes_of_day(s);
+        let end_min = local_minutes_of_day(e).max(start_min + 15);
+        let (top, height) = block_pixel_layout(
+            start_min,
+            end_min,
+            day_start_hour as i64,
+            HOUR_PX,
+            MIN_CARD_PX,
+        );
+        let count = columns.max(1) as f64;
+        let left = column as f64 / count * 100.0;
+        let width = 100.0 / count;
+        format!("top:{top}px;height:{height}px;left:calc({left}% + 2px);width:calc({width}% - 6px)")
+    };
+    let time_label = move || {
+        let (s, e) = effective_times(&id_for_label);
+        fmt_time_range(s, e)
     };
 
     view! {
+        // The card body is the move grip: pointerdown starts a Move drag unless it
+        // lands on a button/title/resize edge (then that control handles it). The
+        // edges are separate ResizeEdge targets. All share one captured pointer so
+        // move and resize can never run at once.
         <article
             class=card_class
-            draggable="true"
-            on:dragstart=move |ev| begin_drag(&ev, ctx, drag_from_task(&drag_task))
-            on:dragend=move |_| ctx.active_zone.set(None)
+            style=card_style
+            on:pointerdown=move |ev: web_sys::PointerEvent| {
+                if ev.button() != 0 || target_is_interactive(&ev) { return; }
+                ev.prevent_default();
+                capture_pointer(&ev);
+                if let Some(drag) = BlockDrag::start(&move_task, DragMode::Move, f64::from(ev.client_y())) {
+                    ctx.block_drag.set(Some(drag));
+                }
+            }
+            on:pointermove=move |ev: web_sys::PointerEvent| ctx.block_drag_update(f64::from(ev.client_y()))
+            on:pointerup=move |_| ctx.block_drag_commit()
+            on:pointercancel=move |_| ctx.block_drag_cancel()
         >
+            <ResizeEdge ctx task=top_task mode=DragMode::ResizeTop class="sched-resize-top" />
             <div class="sched-card-head">
                 <PriorityBadge value=priority />
                 <span class="sched-card-time">{time_label}</span>
                 {recurrence.map(|rule| view! { <span class="sched-recur" title="Repeats">{"↻ "}{recurrence_label(rule)}</span> })}
-                <DragHandle ctx task=handle_task />
+                <span class="sched-grip" aria-hidden="true" title="Drag the card to move; drag an edge to resize">"⠿"</span>
             </div>
             <button class="sched-card-title" on:click=move |_| ctx.modal.set(Some(ScheduleTarget::new(title_task.clone())))>{title}</button>
             <div class="sched-card-meta">
@@ -969,9 +1244,12 @@ fn ScheduledCard(ctx: Sched, row: TaskWithContext) -> impl IntoView {
                 <button class="btn btn-subtle sched-mini" type="button" on:click=move |_| ctx.modal.set(Some(ScheduleTarget::new(resched_task.clone())))>"Reschedule"</button>
                 {block_id.clone().map(|id| {
                     let complete_id = id.clone();
+                    let hold_id = id.clone();
                     let skip_id = id;
+                    let hold_task = hold_task.clone();
                     view! {
                         <button class="btn btn-primary sched-mini" type="button" on:click=move |_| ctx.complete_block(complete_id.clone())>"Complete"</button>
+                        <button class="btn btn-subtle sched-mini" type="button" title="Pause this session and keep the task open" on:click=move |_| ctx.hold.set(Some(HoldTarget { task: hold_task.clone(), block_id: hold_id.clone() }))>"On hold"</button>
                         <button class="btn btn-subtle sched-mini" type="button" on:click=move |_| ctx.skip_block(skip_id.clone())>"Skip"</button>
                     }
                 })}
@@ -979,7 +1257,37 @@ fn ScheduledCard(ctx: Sched, row: TaskWithContext) -> impl IntoView {
                     <button class="btn btn-danger-soft sched-mini" type="button" on:click=move |_| ctx.clear(clear_id.clone())>"Clear"</button>
                 })}
             </div>
+            <ResizeEdge ctx task=bottom_task mode=DragMode::ResizeBottom class="sched-resize-bottom" />
         </article>
+    }
+}
+
+/// A thin drag target on the top or bottom edge of a scheduled block. Dragging it
+/// resizes the block (snapped to [`openmgmt_core::SCHEDULE_SNAP_MINUTES`]) with a
+/// live preview, committing via `reschedule_task` on release. It stops propagation
+/// so an edge drag never also starts a card-body move.
+#[component]
+fn ResizeEdge(ctx: Sched, task: Task, mode: DragMode, class: &'static str) -> impl IntoView {
+    let down_task = task;
+    view! {
+        <span
+            class=format!("sched-resize {class}")
+            title="Drag to change the time"
+            aria-label="Resize scheduled block"
+            on:dragstart=move |ev| { ev.prevent_default(); ev.stop_propagation(); }
+            on:pointerdown=move |ev: web_sys::PointerEvent| {
+                if ev.button() != 0 { return; }
+                ev.prevent_default();
+                ev.stop_propagation();
+                capture_pointer(&ev);
+                if let Some(drag) = BlockDrag::start(&down_task, mode, f64::from(ev.client_y())) {
+                    ctx.block_drag.set(Some(drag));
+                }
+            }
+            on:pointermove=move |ev: web_sys::PointerEvent| ctx.block_drag_update(f64::from(ev.client_y()))
+            on:pointerup=move |_| ctx.block_drag_commit()
+            on:pointercancel=move |_| ctx.block_drag_cancel()
+        ></span>
     }
 }
 
@@ -1444,6 +1752,132 @@ fn ScheduleModal(ctx: Sched) -> impl IntoView {
                                 <button class="btn btn-subtle" type="button" on:click=move |_| ctx.modal.set(None)>"Cancel"</button>
                             </div>
                         </form>
+                    </div>
+                </div>
+            }
+        })
+    }
+}
+
+// --- On-hold modal ---------------------------------------------------------
+
+#[component]
+fn HoldModal(ctx: Sched) -> impl IntoView {
+    move || {
+        ctx.hold.get().map(|target| {
+            let task = target.task.clone();
+            let task_title = task.title.clone();
+            let block_id_just = target.block_id.clone();
+            let block_id_cont = target.block_id.clone();
+            let deadline = task.deadline_at;
+
+            // Default the continuation to the same time of day, one day later.
+            let default_minutes = task
+                .estimated_minutes
+                .or(task.time_limit_minutes)
+                .map(i64::from)
+                .unwrap_or(60)
+                .clamp(5, 24 * 60);
+            let base_start = task.scheduled_start_at;
+            let next_start = base_start
+                .map(|start| start + Duration::days(1))
+                .unwrap_or_else(|| Utc::now() + Duration::days(1));
+            let init_date = local_date_str(next_start);
+            let init_start = base_start
+                .map(local_time_str)
+                .unwrap_or_else(|| "09:00".to_string());
+            let init_end = match (base_start, task.scheduled_end_at) {
+                (_, Some(end)) => local_time_str(end),
+                (Some(start), None) => local_time_str(start + Duration::minutes(default_minutes)),
+                _ => "10:00".to_string(),
+            };
+
+            let show_continuation = RwSignal::new(false);
+            let date_ref = NodeRef::<leptos::html::Input>::new();
+            let start_ref = NodeRef::<leptos::html::Input>::new();
+            let end_ref = NodeRef::<leptos::html::Input>::new();
+
+            view! {
+                <div class="sched-modal-layer">
+                    <div class="sched-modal-backdrop" on:click=move |_| ctx.hold.set(None)></div>
+                    <div class="sched-modal sched-hold-modal">
+                        <header class="sched-modal-head">
+                            <h2>"Put this task on hold?"</h2>
+                            <button class="icon-btn" type="button" on:click=move |_| ctx.hold.set(None)>"✕"</button>
+                        </header>
+                        <p class="sched-modal-task">{task_title}</p>
+                        <p class="sched-modal-hint">"This keeps the task open and ends this scheduled work session. You can optionally schedule another session to continue it on another day."</p>
+                        {move || {
+                            // Clone the owned values per render so this reactive
+                            // closure stays `FnMut` (the inner handlers move them).
+                            let block_id_just = block_id_just.clone();
+                            let block_id_cont = block_id_cont.clone();
+                            let init_date = init_date.clone();
+                            let init_start = init_start.clone();
+                            let init_end = init_end.clone();
+                            if show_continuation.get() {
+                            view! {
+                                <form class="sched-modal-form" on:submit=move |event| {
+                                    event.prevent_default();
+                                    let date = input_value(date_ref);
+                                    let start_t = input_value(start_ref);
+                                    let end_t = input_value(end_ref);
+                                    if date.is_empty() || start_t.is_empty() || end_t.is_empty() {
+                                        ctx.state.fail("Hold failed", "Date, start time, and end time are required.".into());
+                                        return;
+                                    }
+                                    let start_at = match combine_local(&date, &start_t) {
+                                        Ok(value) => value,
+                                        Err(error) => { ctx.state.fail("Hold failed", error); return; }
+                                    };
+                                    let end_at = match combine_local(&date, &end_t) {
+                                        Ok(value) => value,
+                                        Err(error) => { ctx.state.fail("Hold failed", error); return; }
+                                    };
+                                    if end_at <= start_at {
+                                        ctx.state.fail("Hold failed", "End time must be after start time.".into());
+                                        return;
+                                    }
+                                    let input = ScheduleTaskInput {
+                                        start_at,
+                                        end_at,
+                                        timezone: None,
+                                        reminder_at: None,
+                                        deadline_at: deadline,
+                                        recurrence_rule: None,
+                                        recurrence_anchor_at: None,
+                                        recurrence_timezone: None,
+                                    };
+                                    ctx.hold_block(block_id_cont.clone(), Some(input));
+                                }>
+                                    <FormField label="Continuation date">
+                                        <input node_ref=date_ref type="date" value=init_date.clone() required />
+                                    </FormField>
+                                    <div class="form-row">
+                                        <FormField label="Start">
+                                            <input node_ref=start_ref type="time" value=init_start.clone() required />
+                                        </FormField>
+                                        <FormField label="End">
+                                            <input node_ref=end_ref type="time" value=init_end.clone() required />
+                                        </FormField>
+                                    </div>
+                                    <div class="sched-modal-actions">
+                                        <button class="btn btn-primary" type="submit">"Schedule continuation"</button>
+                                        <button class="btn btn-subtle" type="button" on:click=move |_| show_continuation.set(false)>"Back"</button>
+                                        <button class="btn btn-ghost" type="button" on:click=move |_| ctx.hold.set(None)>"Cancel"</button>
+                                    </div>
+                                </form>
+                            }.into_any()
+                        } else {
+                            view! {
+                                <div class="sched-modal-actions sched-hold-choices">
+                                    <button class="btn btn-primary" type="button" on:click=move |_| ctx.hold_block(block_id_just.clone(), None)>"Just put on hold"</button>
+                                    <button class="btn btn-subtle" type="button" on:click=move |_| show_continuation.set(true)>"Schedule continuation"</button>
+                                    <button class="btn btn-ghost" type="button" on:click=move |_| ctx.hold.set(None)>"Cancel"</button>
+                                </div>
+                            }.into_any()
+                            }
+                        }}
                     </div>
                 </div>
             }

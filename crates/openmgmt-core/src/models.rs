@@ -91,6 +91,7 @@ string_enum!(CalendarBlockStatus {
     Skipped => "skipped",
     Moved => "moved",
     Canceled => "canceled",
+    OnHold => "on_hold",
 });
 
 string_enum!(AiProviderKind {
@@ -275,6 +276,16 @@ pub struct ScheduledBlockCompletion {
     pub block: CalendarBlock,
     pub task: Option<Task>,
     pub next_occurrence_task: Option<Task>,
+}
+
+/// Result of putting a scheduled work session on hold: the now-`on_hold` block,
+/// the task (kept open/incomplete), and an optional continuation block when the
+/// user chose to schedule the task to continue at another time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledBlockHold {
+    pub block: CalendarBlock,
+    pub task: Option<Task>,
+    pub continuation_block: Option<CalendarBlock>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
