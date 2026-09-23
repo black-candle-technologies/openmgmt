@@ -517,14 +517,23 @@ fn desktop_sync_client() -> OpenMgmtSyncClient {
 }
 
 /// Interactive Black Candle sign-in: opens the system browser for the OAuth
-/// flow and stores the access token in the OS keychain. Returns the access
-/// token.
+/// flow. Returns a user-facing completion message, never the access token.
 #[tauri::command]
 pub async fn sign_in() -> CommandResult<String> {
-    desktop_sync_client().sign_in().await.map_err(|error| {
-        tracing::error!(%error, "sign-in failed");
-        error.to_string()
-    })
+    desktop_sync_client()
+        .sign_in()
+        .await
+        .map(|_| {
+            openmgmt_sync_client::oauth::desktop_token_store()
+                .warning()
+                .unwrap_or_else(|| {
+                    "Signed in. Your next sync will register this device to your account.".into()
+                })
+        })
+        .map_err(|error| {
+            tracing::error!(%error, "sign-in failed");
+            error.to_string()
+        })
 }
 
 /// Forget the stored Black Candle access token.

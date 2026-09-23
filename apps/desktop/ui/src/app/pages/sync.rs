@@ -181,11 +181,8 @@ pub fn SyncPage() -> impl IntoView {
         state.start_action("signin");
         spawn_local(async move {
             match api::sign_in().await {
-                Ok(_) => {
-                    state.notice.set(Some(
-                        "Signed in. Your next sync will register this device to your account."
-                            .into(),
-                    ));
+                Ok(message) => {
+                    state.notice.set(Some(message));
                 }
                 Err(error) => state.error.set(Some(format!("Sign-in failed: {error}"))),
             }

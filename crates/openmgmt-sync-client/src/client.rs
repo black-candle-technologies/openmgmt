@@ -84,12 +84,12 @@ impl OpenMgmtSyncClient {
     /// when no bearer token is configured.
     pub async fn sign_in(&self) -> SyncClientResult<String> {
         let oauth = self.config.oauth.clone().unwrap_or_default();
-        crate::oauth::login(&oauth, &crate::oauth::KeyringTokenStore::new()).await
+        crate::oauth::login(&oauth, crate::oauth::desktop_token_store()).await
     }
 
     /// Forget the stored Black Candle access token.
     pub fn sign_out(&self) -> SyncClientResult<()> {
-        crate::oauth::clear_access_token(&crate::oauth::KeyringTokenStore::new())
+        crate::oauth::clear_access_token(crate::oauth::desktop_token_store())
     }
 
     /// Register (or re-register) this device. A re-registration passes the
@@ -140,7 +140,7 @@ impl OpenMgmtSyncClient {
         let bearer_token = match &self.config.oauth {
             Some(_) => crate::oauth::resolve_bearer_token(
                 self.config.bearer_token.as_deref(),
-                &crate::oauth::KeyringTokenStore::new(),
+                crate::oauth::desktop_token_store(),
             )?,
             None => self.config.bearer_token.clone(),
         };

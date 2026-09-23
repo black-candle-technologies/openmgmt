@@ -24,7 +24,7 @@ use rand::{TryRngCore, rngs::OsRng};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -117,6 +117,73 @@ impl TokenStore for KeyringTokenStore {
             ))),
         }
     }
+}
+
+/// A process-lived store shared by separate desktop command clients. Never
+/// serializes tokens to the UI or database. Persistence failures retain the
+/// current login in memory and are reported to the caller as a warning.
+pub struct SessionTokenStore {
+    persistent: Box<dyn TokenStore>,
+    session: Mutex<Option<String>>,
+    warning: Mutex<Option<String>>,
+}
+
+impl SessionTokenStore {
+    pub fn new(persistent: Box<dyn TokenStore>) -> Self {
+        Self {
+            persistent,
+            session: Mutex::new(None),
+            warning: Mutex::new(None),
+        }
+    }
+
+    pub fn warning(&self) -> Option<String> {
+        self.warning.lock().unwrap().clone()
+    }
+}
+
+impl TokenStore for SessionTokenStore {
+    fn get(&self, account: &str) -> SyncClientResult<Option<String>> {
+        if account == ACCESS_TOKEN_ACCOUNT {
+            if let Some(token) = self.session.lock().unwrap().clone() {
+                return Ok(Some(token));
+            }
+        }
+        self.persistent.get(account)
+    }
+
+    fn set(&self, account: &str, token: &str) -> SyncClientResult<()> {
+        if account != ACCESS_TOKEN_ACCOUNT {
+            return self.persistent.set(account, token);
+        }
+        *self.session.lock().unwrap() = Some(token.to_owned());
+        let persisted = self.persistent.set(account, token).and_then(|()| {
+            match self.persistent.get(account)? {
+                Some(stored) if stored == token => Ok(()),
+                _ => Err(SyncClientError::Other(
+                    "keychain write could not be verified".into(),
+                )),
+            }
+        });
+        *self.warning.lock().unwrap() = persisted.err().map(|_| {
+            tracing::warn!("OAuth token persistence failed; using session memory");
+            "Signed in for this app session only. Secure storage could not be verified; sign in again after restarting the app.".into()
+        });
+        Ok(())
+    }
+
+    fn delete(&self, account: &str) -> SyncClientResult<()> {
+        if account == ACCESS_TOKEN_ACCOUNT {
+            *self.session.lock().unwrap() = None;
+            *self.warning.lock().unwrap() = None;
+        }
+        self.persistent.delete(account)
+    }
+}
+
+pub fn desktop_token_store() -> &'static SessionTokenStore {
+    static STORE: OnceLock<SessionTokenStore> = OnceLock::new();
+    STORE.get_or_init(|| SessionTokenStore::new(Box::new(KeyringTokenStore::new())))
 }
 
 /// In-memory token store for tests.
@@ -227,7 +294,8 @@ pub async fn exchange_code(
             ("code_verifier", verifier),
         ])
         .send()
-        .await?
+        .await
+        .map_err(|e| SyncClientError::Other(format!("token exchange request failed: {e}")))?
         .error_for_status()
         .map_err(|e| SyncClientError::Other(format!("token exchange failed: {e}")))?
         .json()
@@ -294,8 +362,8 @@ async fn await_callback(
     let (status, title, body): (&str, &str, String) = match &result {
         Ok(_) => (
             "200 OK",
-            "Signed in",
-            "Signed in to OpenMGMT. You can close this tab and return to the app.".to_string(),
+            "Finishing sign-in",
+            "Authorization received. Return to OpenMGMT and wait for sign-in to finish. The app will report any token exchange or storage problem.".to_string(),
         ),
         Err(message) => ("400 Bad Request", "Sign-in failed", message.to_string()),
     };
@@ -393,7 +461,12 @@ pub fn resolve_bearer_token(
     if let Some(token) = configured {
         return Ok(Some(token.to_string()));
     }
-    load_access_token(store)
+    let token = load_access_token(store)?;
+    tracing::info!(
+        token_present = token.is_some(),
+        "Resolved OAuth token for sync"
+    );
+    Ok(token)
 }
 
 #[cfg(test)]
@@ -407,6 +480,155 @@ mod tests {
             redirect_ports: vec![0],
             login_timeout: Duration::from_secs(5),
         }
+    }
+
+    struct UnreliableStore {
+        fail_write: bool,
+        fail_read: bool,
+    }
+
+    impl TokenStore for UnreliableStore {
+        fn get(&self, _: &str) -> SyncClientResult<Option<String>> {
+            if self.fail_read {
+                Err(SyncClientError::Other("read failed".into()))
+            } else {
+                Ok(None)
+            }
+        }
+        fn set(&self, _: &str, _: &str) -> SyncClientResult<()> {
+            if self.fail_write {
+                Err(SyncClientError::Other("write failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+        fn delete(&self, _: &str) -> SyncClientResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn session_survives_failed_or_silently_lost_keychain_writes() {
+        for (fail_write, fail_read) in [(true, false), (false, false), (false, true)] {
+            let store = SessionTokenStore::new(Box::new(UnreliableStore {
+                fail_write,
+                fail_read,
+            }));
+            store.set(ACCESS_TOKEN_ACCOUNT, "session-token").unwrap();
+            assert!(store.warning().is_some());
+            assert_eq!(
+                resolve_bearer_token(None, &store).unwrap().as_deref(),
+                Some("session-token")
+            );
+            assert_eq!(
+                resolve_bearer_token(Some("configured"), &store)
+                    .unwrap()
+                    .as_deref(),
+                Some("configured")
+            );
+            clear_access_token(&store).unwrap();
+            assert!(store.session.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn verified_persistence_and_sign_out() {
+        let store = SessionTokenStore::new(Box::new(MemoryTokenStore::default()));
+        store.set(ACCESS_TOKEN_ACCOUNT, "saved-token").unwrap();
+        assert!(store.warning().is_none());
+        assert_eq!(
+            store
+                .persistent
+                .get(ACCESS_TOKEN_ACCOUNT)
+                .unwrap()
+                .as_deref(),
+            Some("saved-token")
+        );
+        clear_access_token(&store).unwrap();
+        assert_eq!(resolve_bearer_token(None, &store).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn session_fallback_reaches_registration_authorization_header() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            assert!(headers.starts_with("POST /omgp/v1/devices/register "));
+            assert!(
+                headers
+                    .to_lowercase()
+                    .contains("authorization: bearer session-token\r\n")
+            );
+            stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        let store = SessionTokenStore::new(Box::new(UnreliableStore {
+            fail_write: false,
+            fail_read: false,
+        }));
+        store.set(ACCESS_TOKEN_ACCOUNT, "session-token").unwrap();
+        let http = crate::http::OmgpHttpClient::new(&format!("http://{address}"), 5)
+            .unwrap()
+            .with_bearer_token(resolve_bearer_token(None, &store).unwrap());
+        let _ = http
+            .register_device(openmgmt_protocol::DeviceRegistrationRequest {
+                protocol_version: openmgmt_protocol::PROTOCOL_VERSION.into(),
+                device_id: "test-device".into(),
+                device_name: "Test".into(),
+                previous_device_token: None,
+                user_hint: None,
+            })
+            .await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_exchange_is_reported_without_storing_a_token() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/oauth/token",
+                    axum::routing::post(|| async { axum::http::StatusCode::BAD_REQUEST }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let mut config = test_config();
+        config.issuer = format!("http://{address}");
+        let store = SessionTokenStore::new(Box::new(MemoryTokenStore::default()));
+        let result = login_with_opener(&config, &store, &|auth_url| {
+            let url = url::Url::parse(auth_url).unwrap();
+            let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
+            let mut callback = url::Url::parse(&params["redirect_uri"]).unwrap();
+            callback
+                .query_pairs_mut()
+                .append_pair("state", &params["state"])
+                .append_pair("code", "rejected-code");
+            tokio::spawn(async move {
+                reqwest::get(callback).await.unwrap();
+            });
+            Ok(())
+        })
+        .await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("token exchange failed"));
+        assert!(error.contains("400"));
+        assert_eq!(resolve_bearer_token(None, &store).unwrap(), None);
+        server.abort();
     }
 
     #[test]
@@ -551,7 +773,8 @@ mod tests {
         assert_eq!(code, "mock-code");
         let page = drive.await.unwrap();
         assert!(page.contains("200 OK"));
-        assert!(page.contains("Signed in"));
+        assert!(page.contains("Finishing sign-in"));
+        assert!(!page.contains("Signed in to OpenMGMT"));
 
         let (verifier, _) = pkce_pair();
         let token = exchange_code(&config, &code, &redirect_uri, &verifier)
