@@ -95,17 +95,29 @@ fn main() {
 
 /// Returns the SQLite database path for the desktop shell.
 ///
-/// Debug builds and explicit overrides keep the development path. Packaged
-/// Windows release builds use per-user local app data.
+/// Explicit overrides win. macOS uses Application Support in both debug and
+/// release builds; Windows release builds use per-user local app data.
 fn desktop_database_path() -> Result<PathBuf, String> {
-    if env::var_os("OPENMGMT_DATABASE_PATH").is_some()
-        || cfg!(debug_assertions)
-        || !cfg!(target_os = "windows")
-    {
+    if env::var_os("OPENMGMT_DATABASE_PATH").is_some() {
         return Ok(default_database_path());
     }
-
+    if cfg!(target_os = "macos") {
+        return macos_database_path(env::var_os("HOME"));
+    }
+    if cfg!(debug_assertions) || !cfg!(target_os = "windows") {
+        return Ok(default_database_path());
+    }
     installed_database_path()
+}
+
+fn macos_database_path(home: Option<OsString>) -> Result<PathBuf, String> {
+    let home = home
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| "HOME must be an absolute path for OpenMgmt on macOS".to_string())?;
+    Ok(installed_database_path_from_base(
+        &home.join("Library").join("Application Support"),
+    ))
 }
 
 /// Returns the installed Windows database path from per-user app data.

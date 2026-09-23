@@ -58,10 +58,11 @@ Set-Location apps/desktop/src-tauri
 cargo tauri dev
 ```
 
-On first development launch, the app creates and migrates an empty local SQLite
-database at `data/openmgmt.sqlite`. Packaged installs use
-`%LOCALAPPDATA%\OpenMgmt\openmgmt.sqlite` instead, so the app never needs to write
-into its install directory. It does not create sample organizations, projects,
+On macOS, development and installed builds use
+`~/Library/Application Support/OpenMgmt/openmgmt.sqlite`. Windows development
+builds use `data/openmgmt.sqlite`; packaged Windows installs use
+`%LOCALAPPDATA%\OpenMgmt\openmgmt.sqlite`. The app creates and migrates an empty
+SQLite database when none exists. It does not create sample organizations, projects,
 or tasks; users create their own workspace records. Select **Open TV Board** in the
 top bar to open the board in a separate, normal Tauri window (decorated,
 movable, and resizable; centered at 1440x900). The board window renders a dark
@@ -205,3 +206,11 @@ apps/desktop/ui/src/app    UI modules: state, components, records, forms,
 docs                       product and integration documentation
 data                       local SQLite database
 ```
+
+### macOS database location
+
+The desktop app uses `~/Library/Application Support/OpenMgmt/openmgmt.sqlite`
+in both development and installed macOS builds. `OPENMGMT_DATABASE_PATH`
+overrides this location. Existing repository databases are not automatically
+moved; use SQLite's backup command to migrate `data/openmgmt.sqlite` before
+launching the updated app, and do not overwrite an existing destination database.
