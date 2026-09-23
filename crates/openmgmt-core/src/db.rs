@@ -3,12 +3,13 @@ use crate::models::{ProjectStatus, ProjectType};
 use crate::{
     board::build_board,
     models::{
-        ActiveTimerInfo, BoardState, CalendarBlock, CalendarBlockSource, CalendarBlockStatus,
-        NewOrganization, NewProject, NewSavedTaskView, NewTask, Organization, OrganizationPatch,
-        Project, ProjectPatch, RecurrenceRule, SavedTaskView, SavedTaskViewPatch, ScheduleConflict,
-        ScheduleTaskInput, ScheduledBlockCompletion, ScoringSettings, ScoringSettingsPatch, Task,
-        TaskContext, TaskPatch, TaskQueryFilter, TaskSort, TaskSortField, TaskStatus,
-        TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
+        ActiveTimerInfo, AiSettings, AiSettingsPatch, BoardState, CalendarBlock,
+        CalendarBlockSource, CalendarBlockStatus, NewOrganization, NewProject, NewSavedTaskView,
+        NewTask, Organization, OrganizationPatch, Project, ProjectPatch, RecurrenceRule,
+        SavedTaskView, SavedTaskViewPatch, ScheduleConflict, ScheduleTaskInput,
+        ScheduledBlockCompletion, ScoringSettings, ScoringSettingsPatch, Task, TaskContext,
+        TaskPatch, TaskQueryFilter, TaskSort, TaskSortField, TaskStatus, TaskTimerSession,
+        TaskWithContext, TimeBlockSuggestion,
     },
     scheduling::{generate_schedule_ics, next_recurrence_at},
     scoring::{ScoringWeights, score_task},
@@ -51,6 +52,50 @@ pub enum CoreError {
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
+
+const AI_READ_ENABLED_KEY: &str = "ai.read_enabled";
+const AI_WRITE_ENABLED_KEY: &str = "ai.write_enabled";
+const AI_DESTRUCTIVE_TOOLS_ENABLED_KEY: &str = "ai.destructive_tools_enabled";
+
+fn get_bool_state(connection: &Connection, key: &str, default: bool) -> Result<bool> {
+    let value: Option<String> = connection
+        .query_row("SELECT value FROM sync_state WHERE key=?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    match value.as_deref() {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(other) => Err(CoreError::InvalidValue(format!("invalid {key}: {other}"))),
+    }
+}
+
+fn set_bool_state(connection: &Connection, key: &str, value: bool) -> Result<()> {
+    connection.execute(
+        "INSERT INTO sync_state (key,value) VALUES (?1,?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, if value { "true" } else { "false" }],
+    )?;
+    Ok(())
+}
+
+fn get_ai_settings_with_connection(connection: &Connection) -> Result<AiSettings> {
+    Ok(AiSettings {
+        read_enabled: get_bool_state(connection, AI_READ_ENABLED_KEY, true)?,
+        write_enabled: get_bool_state(connection, AI_WRITE_ENABLED_KEY, true)?,
+        destructive_tools_enabled: get_bool_state(
+            connection,
+            AI_DESTRUCTIVE_TOOLS_ENABLED_KEY,
+            false,
+        )?,
+        default_provider_id: None,
+        default_model_id: None,
+        local_only_mode: false,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    })
+}
 
 #[derive(Clone)]
 pub struct Database {
@@ -679,6 +724,29 @@ impl Database {
         )?;
         transaction.commit()?;
         Ok(settings)
+    }
+
+    pub fn get_ai_settings(&self) -> Result<AiSettings> {
+        let connection = self.connection()?;
+        get_ai_settings_with_connection(&connection)
+    }
+
+    pub fn update_ai_settings(&self, patch: AiSettingsPatch) -> Result<AiSettings> {
+        let connection = self.connection()?;
+        if let Some(read_enabled) = patch.read_enabled {
+            set_bool_state(&connection, AI_READ_ENABLED_KEY, read_enabled)?;
+        }
+        if let Some(write_enabled) = patch.write_enabled {
+            set_bool_state(&connection, AI_WRITE_ENABLED_KEY, write_enabled)?;
+        }
+        if let Some(destructive_tools_enabled) = patch.destructive_tools_enabled {
+            set_bool_state(
+                &connection,
+                AI_DESTRUCTIVE_TOOLS_ENABLED_KEY,
+                destructive_tools_enabled,
+            )?;
+        }
+        get_ai_settings_with_connection(&connection)
     }
 
     pub fn get_sync_status(&self) -> Result<SyncStatus> {

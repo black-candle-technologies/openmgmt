@@ -1,11 +1,12 @@
 use crate::{
     db::{Database, Result},
     models::{
-        BoardState, CalendarBlock, NewOrganization, NewProject, NewSavedTaskView, NewTask,
-        Organization, OrganizationPatch, Project, ProjectPatch, SavedTaskView, SavedTaskViewPatch,
-        ScheduleConflict, ScheduleTaskInput, ScheduledBlockCompletion, ScoringSettings,
-        ScoringSettingsPatch, Task, TaskPatch, TaskQueryFilter, TaskSort, TaskStatus,
-        TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
+        AiSettings, AiSettingsPatch, BoardState, CalendarBlock, NewOrganization, NewProject,
+        NewSavedTaskView, NewTask, Organization, OrganizationPatch, Project, ProjectPatch,
+        SavedTaskView, SavedTaskViewPatch, ScheduleConflict, ScheduleTaskInput,
+        ScheduledBlockCompletion, ScoringSettings, ScoringSettingsPatch, Task, TaskPatch,
+        TaskQueryFilter, TaskSort, TaskStatus, TaskTimerSession, TaskWithContext,
+        TimeBlockSuggestion,
     },
     sync::{SyncSettings, SyncSettingsPatch, SyncStatus},
 };
@@ -204,6 +205,12 @@ impl AppService {
     }
     pub fn reset_scoring_settings(&self) -> Result<ScoringSettings> {
         self.database.reset_scoring_settings()
+    }
+    pub fn get_ai_settings(&self) -> Result<AiSettings> {
+        self.database.get_ai_settings()
+    }
+    pub fn update_ai_settings(&self, patch: AiSettingsPatch) -> Result<AiSettings> {
+        self.database.update_ai_settings(patch)
     }
     pub fn export_tasks_json(&self) -> Result<String> {
         self.database.export_tasks_json()

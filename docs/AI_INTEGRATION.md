@@ -15,15 +15,28 @@ The server writes protocol messages to stdout and logs to stderr.
 
 ## Tools
 
-Always enabled:
+Tool availability is governed by the core AI permission model
+(`openmgmt-core/src/ai.rs`): the persisted `AiSettings` (read/write/
+destructive toggles, shared with the desktop app's AI settings) plus the
+per-launcher `OPENMGMT_MCP_WRITE_ENABLED` env gate. Writes require both.
+
+Always enabled (read tools):
 
 - `list_organizations`
 - `list_projects`
 - `get_project`
 - `list_tasks`
 - `get_task`
+- `query_tasks` (filtered/sorted task queries)
 - `get_board_state`
 - `get_today_plan`
+- `plan_today`
+- `suggest_next_task`
+- `triage_backlog`
+- `summarize_project`
+- `list_saved_task_views`
+- `list_timer_sessions`
+- `get_scoring_settings`
 
 Disabled and hidden unless `OPENMGMT_MCP_WRITE_ENABLED=true`:
 
@@ -31,6 +44,10 @@ Disabled and hidden unless `OPENMGMT_MCP_WRITE_ENABLED=true`:
 - `update_task`
 - `complete_task`
 - `create_project`
+- `start_task_timer`
+- `pause_task_timer`
+- `resume_task_timer`
+- `stop_task_timer`
 
 The MVP exposes no destructive delete or archive tools.
 
