@@ -144,10 +144,10 @@ impl SessionTokenStore {
 
 impl TokenStore for SessionTokenStore {
     fn get(&self, account: &str) -> SyncClientResult<Option<String>> {
-        if account == ACCESS_TOKEN_ACCOUNT {
-            if let Some(token) = self.session.lock().unwrap().clone() {
-                return Ok(Some(token));
-            }
+        if account == ACCESS_TOKEN_ACCOUNT
+            && let Some(token) = self.session.lock().unwrap().clone()
+        {
+            return Ok(Some(token));
         }
         self.persistent.get(account)
     }
