@@ -12,6 +12,8 @@ pub enum SyncClientError {
     Http(#[from] reqwest::Error),
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
     #[error("unexpected sync error: {0}")]
     Other(String),
 }

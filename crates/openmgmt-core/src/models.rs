@@ -142,6 +142,31 @@ pub struct AiSettings {
     pub updated_at: DateTime<Utc>,
 }
 
+impl Default for AiSettings {
+    /// Defaults preserve the historical MCP behavior: reads on, writes
+    /// available (the per-launcher `OPENMGMT_MCP_WRITE_ENABLED` env gate
+    /// remains the kill switch), destructive tools off.
+    fn default() -> Self {
+        Self {
+            read_enabled: true,
+            write_enabled: true,
+            destructive_tools_enabled: false,
+            default_provider_id: None,
+            default_model_id: None,
+            local_only_mode: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AiSettingsPatch {
+    pub read_enabled: Option<bool>,
+    pub write_enabled: Option<bool>,
+    pub destructive_tools_enabled: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiToolMetadata {
     pub name: String,
@@ -441,6 +466,39 @@ pub struct BoardState {
     pub later_today: Vec<ScoredTask>,
     pub overdue: Vec<ScoredTask>,
     pub done_today: Vec<ScoredTask>,
+}
+
+/// Deterministic backlog triage: stale, blocked, and overdue tasks grouped
+/// for review. Produced by the `triage_backlog` AI tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacklogTriage {
+    pub generated_at: DateTime<Utc>,
+    pub stale: Vec<TaskWithContext>,
+    pub blocked: Vec<TaskWithContext>,
+    pub overdue: Vec<TaskWithContext>,
+}
+
+/// Deterministic "what should I work on" plan. Produced by the `plan_today`
+/// AI tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodayPlan {
+    pub generated_at: DateTime<Utc>,
+    pub focus: Vec<ScoredTask>,
+    pub overdue_count: usize,
+    pub due_soon_count: usize,
+}
+
+/// Deterministic per-project summary. Produced by the `summarize_project`
+/// AI tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectSummary {
+    pub project_id: String,
+    pub project_name: String,
+    pub total_tasks: usize,
+    pub by_status: std::collections::BTreeMap<String, usize>,
+    pub overdue_count: usize,
+    pub blocked_count: usize,
+    pub suggested_next: Option<ScoredTask>,
 }
 
 impl Default for ProjectType {

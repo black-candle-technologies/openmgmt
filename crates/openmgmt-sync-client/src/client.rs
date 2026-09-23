@@ -78,6 +78,51 @@ impl OpenMgmtSyncClient {
         result
     }
 
+    /// Interactive native-app sign-in: opens the system browser for the
+    /// Black Candle OAuth flow and stores the access token in the OS
+    /// keychain. Needed before syncing against a server with account auth
+    /// when no bearer token is configured.
+    pub async fn sign_in(&self) -> SyncClientResult<String> {
+        let oauth = self.config.oauth.clone().unwrap_or_default();
+        crate::oauth::login(&oauth, &crate::oauth::KeyringTokenStore::new()).await
+    }
+
+    /// Forget the stored Black Candle access token.
+    pub fn sign_out(&self) -> SyncClientResult<()> {
+        crate::oauth::clear_access_token(&crate::oauth::KeyringTokenStore::new())
+    }
+
+    /// Register (or re-register) this device. A re-registration passes the
+    /// stored device token as proof of possession, so the server keeps the
+    /// same token instead of treating the request as a hostile takeover.
+    async fn register_device(
+        &self,
+        http: &OmgpHttpClient,
+        database: &Database,
+        settings: &openmgmt_core::SyncSettings,
+        device_id: &str,
+        previous_device_token: Option<String>,
+    ) -> SyncClientResult<openmgmt_core::SyncSettings> {
+        let registration = http
+            .register_device(DeviceRegistrationRequest {
+                protocol_version: PROTOCOL_VERSION.into(),
+                device_id: device_id.to_string(),
+                device_name: settings.device_name.clone(),
+                previous_device_token,
+                user_hint: settings.user_id.clone(),
+            })
+            .await?;
+        let token = registration.device_token.ok_or_else(|| {
+            SyncClientError::Protocol("device registration succeeded without a device token".into())
+        })?;
+        Ok(database.update_sync_settings(SyncSettingsPatch {
+            account_id: Some(registration.account_id),
+            user_id: Some(registration.user_id),
+            device_token: Some(Some(token)),
+            ..Default::default()
+        })?)
+    }
+
     async fn sync_after_attempt(
         &self,
         database: &Database,
@@ -89,7 +134,18 @@ impl OpenMgmtSyncClient {
             SyncPhase::Settings,
             Some("Sync is enabled and configured.".into()),
         )];
-        let http = OmgpHttpClient::new(&server_url, self.config.timeout_seconds)?;
+        // The account bearer token is only needed for device registration:
+        // an explicitly configured token wins, otherwise the keychain-held
+        // token from a previous interactive sign-in.
+        let bearer_token = match &self.config.oauth {
+            Some(_) => crate::oauth::resolve_bearer_token(
+                self.config.bearer_token.as_deref(),
+                &crate::oauth::KeyringTokenStore::new(),
+            )?,
+            None => self.config.bearer_token.clone(),
+        };
+        let http = OmgpHttpClient::new(&server_url, self.config.timeout_seconds)?
+            .with_bearer_token(bearer_token);
 
         http.hello(SyncHelloRequest {
             protocol_version: PROTOCOL_VERSION.into(),
@@ -104,25 +160,9 @@ impl OpenMgmtSyncClient {
         ));
 
         if settings.device_token.is_none() {
-            let registration = http
-                .register_device(DeviceRegistrationRequest {
-                    protocol_version: PROTOCOL_VERSION.into(),
-                    device_id: device_id.clone(),
-                    device_name: settings.device_name.clone(),
-                    user_hint: settings.user_id.clone(),
-                })
+            settings = self
+                .register_device(&http, database, &settings, &device_id, None)
                 .await?;
-            let token = registration.device_token.ok_or_else(|| {
-                SyncClientError::Protocol(
-                    "device registration succeeded without a device token".into(),
-                )
-            })?;
-            settings = database.update_sync_settings(SyncSettingsPatch {
-                account_id: Some(registration.account_id),
-                user_id: Some(registration.user_id),
-                device_token: Some(Some(token)),
-                ..Default::default()
-            })?;
             phases.push(SyncPhaseResult::ok(
                 SyncPhase::DeviceRegistration,
                 Some("Device registered.".into()),
@@ -134,10 +174,10 @@ impl OpenMgmtSyncClient {
             ));
         }
 
-        let auth = AuthContext {
+        let mut auth = AuthContext {
             account_id: settings.account_id.clone(),
             user_id: settings.user_id.clone(),
-            device_id,
+            device_id: device_id.clone(),
             device_token: settings.device_token.clone(),
         };
         let checkpoint = database.get_sync_state(SERVER_CHECKPOINT_KEY)?;
@@ -151,14 +191,40 @@ impl OpenMgmtSyncClient {
             .iter()
             .map(|event| event.event_id.clone())
             .collect::<HashSet<_>>();
-        let push = http
-            .push(SyncPushRequest {
-                protocol_version: PROTOCOL_VERSION.into(),
-                auth: auth.clone(),
-                base_checkpoint: checkpoint.clone(),
-                events,
-            })
-            .await?;
+        // If the server no longer recognizes the device token (e.g. its
+        // database was recreated), re-register once -- proving possession
+        // with the stored token -- and retry the push.
+        let mut reregistered = false;
+        let push = loop {
+            let attempt = http
+                .push(SyncPushRequest {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    auth: auth.clone(),
+                    base_checkpoint: checkpoint.clone(),
+                    events: events.clone(),
+                })
+                .await;
+            match attempt {
+                Err(SyncClientError::Unauthorized(_)) if !reregistered => {
+                    settings = self
+                        .register_device(
+                            &http,
+                            database,
+                            &settings,
+                            &device_id,
+                            settings.device_token.clone(),
+                        )
+                        .await?;
+                    auth.device_token = settings.device_token.clone();
+                    reregistered = true;
+                    phases.push(SyncPhaseResult::ok(
+                        SyncPhase::DeviceRegistration,
+                        Some("Device re-registered after the server rejected its token.".into()),
+                    ));
+                }
+                result => break result?,
+            }
+        };
         let mut seen_accepted_ids = HashSet::new();
         let accepted_event_ids = push
             .accepted_event_ids
@@ -180,14 +246,36 @@ impl OpenMgmtSyncClient {
             }),
         ));
 
-        let pull = http
-            .pull(SyncPullRequest {
-                protocol_version: PROTOCOL_VERSION.into(),
-                auth: auth.clone(),
-                after_checkpoint: checkpoint,
-                limit: Some(self.config.pull_limit),
-            })
-            .await?;
+        let pull = loop {
+            let attempt = http
+                .pull(SyncPullRequest {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    auth: auth.clone(),
+                    after_checkpoint: checkpoint.clone(),
+                    limit: Some(self.config.pull_limit),
+                })
+                .await;
+            match attempt {
+                Err(SyncClientError::Unauthorized(_)) if !reregistered => {
+                    settings = self
+                        .register_device(
+                            &http,
+                            database,
+                            &settings,
+                            &device_id,
+                            settings.device_token.clone(),
+                        )
+                        .await?;
+                    auth.device_token = settings.device_token.clone();
+                    reregistered = true;
+                    phases.push(SyncPhaseResult::ok(
+                        SyncPhase::DeviceRegistration,
+                        Some("Device re-registered after the server rejected its token.".into()),
+                    ));
+                }
+                result => break result?,
+            }
+        };
         let pulled_event_count = pull.events.len();
         phases.push(SyncPhaseResult::ok(
             SyncPhase::Pull,

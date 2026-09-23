@@ -1,3 +1,4 @@
+mod http;
 mod tools;
 
 use anyhow::Context;
@@ -14,9 +15,20 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let database = Database::open(default_database_path()).context("open database")?;
+    let service = AppService::new(database);
+
+    // stdio (local editor/assistant clients) is the default; `http` serves
+    // the same registry over streamable HTTP for remote access (issue #16).
+    let transport = std::env::var("OPENMGMT_MCP_TRANSPORT").unwrap_or_default();
+    if transport.eq_ignore_ascii_case("http") {
+        let config = http::McpHttpConfig::from_env().context("MCP HTTP config")?;
+        return http::serve_http(&config, service).await;
+    }
+
+    // Historical stdio default: writes off unless explicitly enabled.
     let writes_enabled = std::env::var("OPENMGMT_MCP_WRITE_ENABLED")
         .is_ok_and(|value| value.eq_ignore_ascii_case("true"));
-    let server = OpenMgmtMcp::new(AppService::new(database), writes_enabled);
+    let server = OpenMgmtMcp::new(service, writes_enabled);
 
     tracing::info!(writes_enabled, "starting OpenMgmt MCP server");
     server

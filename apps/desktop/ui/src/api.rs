@@ -51,6 +51,14 @@ pub async fn test_sync_connection() -> Result<SyncConnectionTestResult, String> 
     invoke("test_sync_connection", serde_json::json!({})).await
 }
 
+pub async fn sign_in() -> Result<String, String> {
+    invoke("sign_in", serde_json::json!({})).await
+}
+
+pub async fn sign_out() -> Result<(), String> {
+    invoke("sign_out", serde_json::json!({})).await
+}
+
 pub async fn clear_sync_error() -> Result<SyncStatus, String> {
     invoke("clear_sync_error", serde_json::json!({})).await
 }

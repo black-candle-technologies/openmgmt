@@ -1,7 +1,13 @@
-use crate::models::{
-    AiProvider, AiProviderKind, AiSettings, AiToolAccess, AiToolMetadata, AiToolPermission,
-    AiToolPermissionCheck,
+use crate::{
+    commands::AppService,
+    db::CoreError,
+    models::{
+        AiProvider, AiProviderKind, AiSettings, AiToolAccess, AiToolMetadata, AiToolPermission,
+        AiToolPermissionCheck, BacklogTriage, ProjectSummary, ScoredTask, TaskQueryFilter,
+        TaskStatus, TaskWithContext, TodayPlan,
+    },
 };
+use chrono::{Duration, Utc};
 use serde_json::json;
 
 pub fn ai_tool_registry() -> Vec<AiToolMetadata> {
@@ -10,6 +16,10 @@ pub fn ai_tool_registry() -> Vec<AiToolMetadata> {
         read_tool("list_projects", "List active projects"),
         read_tool("get_project", "Get one project by id"),
         read_tool("query_tasks", "Query tasks with filters and sorting"),
+        read_tool(
+            "list_tasks",
+            "List tasks with simple project/status filters",
+        ),
         read_tool("get_task", "Get one task by id"),
         read_tool("get_board_state", "Get the scored ER board"),
         read_tool("get_today_plan", "Get today's deterministic focus plan"),
@@ -170,6 +180,164 @@ fn is_local_base_url(value: &str) -> bool {
     }
 
     matches!(host, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0")
+}
+
+/// Tasks untouched for this long count as stale in `triage_backlog`.
+const STALE_AFTER: Duration = Duration::days(14);
+
+fn open_tasks(service: &AppService) -> Result<Vec<TaskWithContext>, CoreError> {
+    service.query_tasks(
+        TaskQueryFilter {
+            organization_id: None,
+            project_id: None,
+            status: None,
+            priority: None,
+            due_from: None,
+            due_to: None,
+            scheduled_from: None,
+            scheduled_to: None,
+            pinned: None,
+            tags: None,
+            text: None,
+            include_done: Some(false),
+            include_canceled: Some(false),
+        },
+        None,
+    )
+}
+
+/// Group stale, blocked, and overdue open tasks for review.
+/// Deterministic: pure function of the current task list.
+pub fn triage_backlog(service: &AppService) -> Result<BacklogTriage, CoreError> {
+    let now = Utc::now();
+    let stale_cutoff = now - STALE_AFTER;
+    let mut stale = Vec::new();
+    let mut blocked = Vec::new();
+    let mut overdue = Vec::new();
+    for task in open_tasks(service)? {
+        let is_blocked = task.task.status == TaskStatus::Blocked
+            || task.task.status == TaskStatus::Waiting
+            || task.task.blocked_reason.is_some();
+        let is_overdue = task.task.due_at.is_some_and(|due_at| due_at < now);
+        let is_stale = task.task.updated_at < stale_cutoff && !is_blocked;
+        if is_stale {
+            stale.push(task.clone());
+        }
+        if is_blocked {
+            blocked.push(task.clone());
+        }
+        if is_overdue {
+            overdue.push(task.clone());
+        }
+    }
+    // Most urgent first within each group.
+    stale.sort_by_key(|task| task.task.updated_at);
+    blocked.sort_by_key(|task| task.task.updated_at);
+    overdue.sort_by_key(|task| task.task.due_at);
+    Ok(BacklogTriage {
+        generated_at: now,
+        stale,
+        blocked,
+        overdue,
+    })
+}
+
+/// Highest-urgency next task across the board.
+/// Deterministic: max `urgency_score` over now/overdue/due-soon/next-up.
+pub fn suggest_next_task(service: &AppService) -> Result<Option<ScoredTask>, CoreError> {
+    let board = service.get_board_state()?;
+    Ok(board
+        .now
+        .iter()
+        .chain(&board.overdue)
+        .chain(&board.due_soon)
+        .chain(&board.next_up)
+        .max_by_key(|task| task.urgency_score)
+        .cloned())
+}
+
+/// Today's deterministic focus plan: top tasks by urgency plus counts.
+/// Deterministic: pure function of the board state.
+pub fn plan_today(service: &AppService) -> Result<TodayPlan, CoreError> {
+    let board = service.get_board_state()?;
+    let mut focus: Vec<ScoredTask> = board
+        .now
+        .iter()
+        .chain(&board.overdue)
+        .chain(&board.due_soon)
+        .chain(&board.next_up)
+        .cloned()
+        .collect();
+    focus.sort_by(|a, b| b.urgency_score.cmp(&a.urgency_score));
+    focus.truncate(8);
+    Ok(TodayPlan {
+        generated_at: board.generated_at,
+        focus,
+        overdue_count: board.overdue.len(),
+        due_soon_count: board.due_soon.len(),
+    })
+}
+
+/// Deterministic per-project summary: status counts, overdue/blocked
+/// counts, and the suggested next task within the project.
+pub fn summarize_project(
+    service: &AppService,
+    project_id: &str,
+) -> Result<ProjectSummary, CoreError> {
+    let project = service.get_project(project_id)?;
+    let tasks = service.query_tasks(
+        TaskQueryFilter {
+            organization_id: None,
+            project_id: Some(project_id.into()),
+            status: None,
+            priority: None,
+            due_from: None,
+            due_to: None,
+            scheduled_from: None,
+            scheduled_to: None,
+            pinned: None,
+            tags: None,
+            text: None,
+            include_done: Some(true),
+            include_canceled: Some(true),
+        },
+        None,
+    )?;
+    let now = Utc::now();
+    let mut by_status = std::collections::BTreeMap::new();
+    let mut overdue_count = 0;
+    let mut blocked_count = 0;
+    for task in &tasks {
+        *by_status.entry(task.task.status.to_string()).or_insert(0) += 1;
+        if task.task.status != TaskStatus::Done
+            && task.task.status != TaskStatus::Canceled
+            && task.task.due_at.is_some_and(|due_at| due_at < now)
+        {
+            overdue_count += 1;
+        }
+        if task.task.status == TaskStatus::Blocked || task.task.blocked_reason.is_some() {
+            blocked_count += 1;
+        }
+    }
+    let board = service.get_board_state()?;
+    let suggested_next = board
+        .now
+        .iter()
+        .chain(&board.overdue)
+        .chain(&board.due_soon)
+        .chain(&board.next_up)
+        .filter(|task| task.context.task.project_id == project_id)
+        .max_by_key(|task| task.urgency_score)
+        .cloned();
+    Ok(ProjectSummary {
+        project_id: project.id,
+        project_name: project.name,
+        total_tasks: tasks.len(),
+        by_status,
+        overdue_count,
+        blocked_count,
+        suggested_next,
+    })
 }
 
 #[cfg(test)]

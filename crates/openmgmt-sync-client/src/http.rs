@@ -1,7 +1,7 @@
 use crate::{SyncClientError, SyncClientResult};
 use openmgmt_protocol::{
-    DeviceRegistrationRequest, DeviceRegistrationResponse, SyncHelloRequest, SyncHelloResponse,
-    SyncPullRequest, SyncPullResponse, SyncPushRequest, SyncPushResponse,
+    DeviceRegistrationRequest, DeviceRegistrationResponse, ProtocolErrorCode, SyncHelloRequest,
+    SyncHelloResponse, SyncPullRequest, SyncPullResponse, SyncPushRequest, SyncPushResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::time::Duration;
@@ -9,6 +9,9 @@ use std::time::Duration;
 pub struct OmgpHttpClient {
     base_url: String,
     client: reqwest::Client,
+    /// Black Candle access token, sent on device registration when the
+    /// server requires account auth.
+    bearer_token: Option<String>,
 }
 
 impl OmgpHttpClient {
@@ -18,7 +21,13 @@ impl OmgpHttpClient {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(timeout_seconds))
                 .build()?,
+            bearer_token: None,
         })
+    }
+
+    pub fn with_bearer_token(mut self, bearer_token: Option<String>) -> Self {
+        self.bearer_token = bearer_token;
+        self
     }
 
     pub async fn hello(&self, request: SyncHelloRequest) -> SyncClientResult<SyncHelloResponse> {
@@ -36,8 +45,17 @@ impl OmgpHttpClient {
         &self,
         request: DeviceRegistrationRequest,
     ) -> SyncClientResult<DeviceRegistrationResponse> {
-        let response: DeviceRegistrationResponse =
-            self.post("/omgp/v1/devices/register", &request).await?;
+        let mut call = self.client.post(self.endpoint("/omgp/v1/devices/register"));
+        if let Some(token) = &self.bearer_token {
+            call = call.bearer_auth(token);
+        }
+        let response: DeviceRegistrationResponse = call
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         check_protocol_error(response.error.as_ref())?;
         if !response.accepted {
             return Err(SyncClientError::Protocol(
@@ -82,6 +100,9 @@ impl OmgpHttpClient {
 
 fn check_protocol_error(error: Option<&openmgmt_protocol::ProtocolError>) -> SyncClientResult<()> {
     if let Some(error) = error {
+        if error.code == ProtocolErrorCode::Unauthorized {
+            return Err(SyncClientError::Unauthorized(error.message.clone()));
+        }
         Err(SyncClientError::Protocol(format!(
             "{:?}: {}",
             error.code, error.message

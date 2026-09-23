@@ -1,9 +1,11 @@
+pub mod account_auth;
 pub mod auth;
 pub mod error;
 pub mod messages;
 pub mod sync;
 pub mod version;
 
+pub use account_auth::*;
 pub use auth::*;
 pub use error::*;
 pub use messages::*;

@@ -67,8 +67,38 @@ reuse the desktop database or directly mutate organizations, projects, or
 tasks. The desktop app remains fully local-first and does not require the
 server.
 
-Device tokens are placeholders for future authentication. Real authentication,
-background sync, and domain conflict resolution are not implemented yet.
+## Account Authentication
+
+Device registration is gated on a Black Candle account. The client sends its
+OAuth access token as a `Bearer` credential on
+`POST /omgp/v1/devices/register`; the server validates it against the
+configured issuer's `/oauth/userinfo` endpoint (the same validation used by
+the HTTPS MCP transport) and binds the device to the stable authd user id —
+never the email address.
+
+- New devices are registered to the authenticated account.
+- Re-registering an existing device id requires proof of possession: either
+  the previous device token (`previous_device_token`) or a bearer token for
+  the owning account. A different account without the device token is denied.
+- Devices registered before account auth was enabled can only be claimed
+  by presenting their current device token; an arbitrary signed-in
+  account cannot take them over.
+- Push is restricted to events stamped with the authenticated device id;
+  mismatched events are rejected.
+- Pull is scoped to the authenticated account: a device only sees events
+  pushed by devices registered to the same account.
+
+The issuer is configurable for self-hosters via `OPENMGMT_AUTH_ISSUER`
+(default `https://auth.blackcandletech.com`). Setting it to an empty value
+disables account auth entirely (open registration — only sensible on
+loopback). Local-only OpenMGMT remains account-free; auth applies when sync
+is enabled.
+
+Normal sync traffic keeps using device tokens after registration, so the
+issuer is not contacted on every push/pull. Successful userinfo validations
+are cached for five minutes.
+
+Background sync and domain conflict resolution are not implemented yet.
 
 ## Manual Sync Client
 

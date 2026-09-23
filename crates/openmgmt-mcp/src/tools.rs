@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use openmgmt_core::{
-    AppService, NewProject, NewTask, ProjectStatus, ProjectType, TaskPatch, TaskStatus,
+    AppService, NewProject, NewTask, ProjectStatus, ProjectType, TaskPatch, TaskQueryFilter,
+    TaskSort, TaskSortField, TaskStatus,
+    ai::{self, enforce_ai_tool_permission},
 };
 use rmcp::{
     ServerHandler,
@@ -19,15 +21,43 @@ pub struct OpenMgmtMcp {
 
 impl OpenMgmtMcp {
     pub fn new(service: AppService, writes_enabled: bool) -> Self {
+        Self::build(service, writes_enabled, false)
+    }
+
+    /// Remote (HTTP) serving mode. Applies the same #15 permission model as
+    /// [`Self::new`], plus the remote invariant: destructive tools are never
+    /// exposed over the network, even if the persisted AI settings would
+    /// otherwise allow them.
+    pub fn new_remote(service: AppService, writes_enabled: bool) -> Self {
+        Self::build(service, writes_enabled, true)
+    }
+
+    fn build(service: AppService, writes_enabled: bool, remote: bool) -> Self {
+        // The core AI permission model is the single source of truth for which
+        // tools are exposed. The per-launcher env gate (`writes_enabled`) feeds
+        // into it as the `mcp_writes_enabled` flag; the persisted
+        // `AiSettings` (read/write/destructive toggles) come from the database
+        // so the desktop app's AI settings govern MCP too.
+        let settings = service.get_ai_settings().unwrap_or_else(|error| {
+            tracing::warn!("failed to load AI settings, falling back to defaults: {error}");
+            openmgmt_core::models::AiSettings::default()
+        });
         let mut tool_router = Self::tool_router();
-        if !writes_enabled {
-            for name in [
-                "create_task",
-                "update_task",
-                "complete_task",
-                "create_project",
-            ] {
-                tool_router.disable_route(name.to_owned());
+        for tool in ai::ai_tool_registry() {
+            let check = enforce_ai_tool_permission(&settings, &tool, writes_enabled);
+            // Destructive tools must never be exposed remotely, regardless of
+            // the persisted setting.
+            let denied = !check.allowed || (remote && tool.destructive);
+            if denied {
+                tracing::debug!(
+                    "disabling MCP tool {}: {}",
+                    tool.name,
+                    check
+                        .reason
+                        .as_deref()
+                        .unwrap_or("denied for remote serving")
+                );
+                tool_router.disable_route(tool.name);
             }
         }
         Self {
@@ -60,6 +90,68 @@ struct ListProjectsInput {
 struct ListTasksInput {
     project_id: Option<String>,
     status: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+struct QueryTasksInput {
+    organization_id: Option<String>,
+    project_id: Option<String>,
+    status: Option<Vec<String>>,
+    priority: Option<Vec<i32>>,
+    due_from: Option<DateTime<Utc>>,
+    due_to: Option<DateTime<Utc>>,
+    scheduled_from: Option<DateTime<Utc>>,
+    scheduled_to: Option<DateTime<Utc>>,
+    pinned: Option<bool>,
+    tags: Option<Vec<String>>,
+    text: Option<String>,
+    include_done: Option<bool>,
+    include_canceled: Option<bool>,
+    sort_field: Option<String>,
+    sort_descending: Option<bool>,
+}
+
+impl QueryTasksInput {
+    fn into_filter(self) -> Result<TaskQueryFilter, String> {
+        let status = self
+            .status
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| value.parse::<TaskStatus>())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(TaskQueryFilter {
+            organization_id: self.organization_id,
+            project_id: self.project_id,
+            status: if status.is_empty() {
+                None
+            } else {
+                Some(status)
+            },
+            priority: self.priority,
+            due_from: self.due_from,
+            due_to: self.due_to,
+            scheduled_from: self.scheduled_from,
+            scheduled_to: self.scheduled_to,
+            pinned: self.pinned,
+            tags: self.tags,
+            text: self.text,
+            include_done: self.include_done,
+            include_canceled: self.include_canceled,
+        })
+    }
+
+    fn into_sort(self) -> Result<Option<TaskSort>, String> {
+        match self.sort_field {
+            None => Ok(None),
+            Some(field) => {
+                let field = field.parse::<TaskSortField>()?;
+                Ok(Some(TaskSort {
+                    field,
+                    descending: self.sort_descending.unwrap_or(false),
+                }))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -156,6 +248,21 @@ impl OpenMgmtMcp {
         self.json(self.service.get_task(&input.id))
     }
 
+    #[tool(
+        description = "Query tasks with filters (status, priority, due window, tags, text) and sorting"
+    )]
+    fn query_tasks(&self, Parameters(input): Parameters<QueryTasksInput>) -> String {
+        let filter = match input.clone().into_filter() {
+            Ok(filter) => filter,
+            Err(error) => return serde_json::json!({ "error": error }).to_string(),
+        };
+        let sort = match input.into_sort() {
+            Ok(sort) => sort,
+            Err(error) => return serde_json::json!({ "error": error }).to_string(),
+        };
+        self.json(self.service.query_tasks(filter, sort))
+    }
+
     #[tool(description = "Get the current scored ER-board state")]
     fn get_board_state(&self) -> String {
         self.json(self.service.get_board_state())
@@ -176,6 +283,43 @@ impl OpenMgmtMcp {
             focus.truncate(8);
             serde_json::json!({ "generated_at": board.generated_at, "focus": focus, "board": board })
         }))
+    }
+
+    #[tool(description = "List saved task views")]
+    fn list_saved_task_views(&self) -> String {
+        self.json(self.service.list_saved_task_views())
+    }
+
+    #[tool(description = "List timer sessions for one task")]
+    fn list_timer_sessions(&self, Parameters(input): Parameters<IdInput>) -> String {
+        self.json(self.service.list_task_timer_sessions(&input.id))
+    }
+
+    #[tool(description = "Get the current scoring/urgency settings")]
+    fn get_scoring_settings(&self) -> String {
+        self.json(self.service.get_scoring_settings())
+    }
+
+    #[tool(
+        description = "Deterministic summary of one project: status counts, overdue/blocked, suggested next task"
+    )]
+    fn summarize_project(&self, Parameters(input): Parameters<IdInput>) -> String {
+        self.json(ai::summarize_project(&self.service, &input.id))
+    }
+
+    #[tool(description = "Group stale, blocked, and overdue tasks for review")]
+    fn triage_backlog(&self) -> String {
+        self.json(ai::triage_backlog(&self.service))
+    }
+
+    #[tool(description = "Plan today from board state")]
+    fn plan_today(&self) -> String {
+        self.json(ai::plan_today(&self.service))
+    }
+
+    #[tool(description = "Suggest the highest urgency next task")]
+    fn suggest_next_task(&self) -> String {
+        self.json(ai::suggest_next_task(&self.service))
     }
 
     #[tool(description = "Create a task. Available only when MCP writes are enabled")]
@@ -264,6 +408,30 @@ impl OpenMgmtMcp {
                 }),
         )
     }
+
+    #[tool(description = "Start the timer for a task. Available only when MCP writes are enabled")]
+    fn start_task_timer(&self, Parameters(input): Parameters<IdInput>) -> String {
+        self.json(self.service.start_task_timer(&input.id))
+    }
+
+    #[tool(
+        description = "Pause the running timer for a task. Available only when MCP writes are enabled"
+    )]
+    fn pause_task_timer(&self, Parameters(input): Parameters<IdInput>) -> String {
+        self.json(self.service.pause_task_timer(&input.id))
+    }
+
+    #[tool(
+        description = "Resume a paused timer for a task. Available only when MCP writes are enabled"
+    )]
+    fn resume_task_timer(&self, Parameters(input): Parameters<IdInput>) -> String {
+        self.json(self.service.resume_task_timer(&input.id))
+    }
+
+    #[tool(description = "Stop the timer for a task. Available only when MCP writes are enabled")]
+    fn stop_task_timer(&self, Parameters(input): Parameters<IdInput>) -> String {
+        self.json(self.service.stop_task_timer(&input.id))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -282,15 +450,18 @@ impl ServerHandler for OpenMgmtMcp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openmgmt_core::Database;
+    use openmgmt_core::{AiSettingsPatch, Database};
 
     #[test]
     fn write_tools_are_hidden_by_default() {
         let database = Database::in_memory().unwrap();
         let server = OpenMgmtMcp::new(AppService::new(database), false);
         assert!(server.tool_router.has_route("list_tasks"));
+        assert!(server.tool_router.has_route("query_tasks"));
+        assert!(server.tool_router.has_route("triage_backlog"));
         assert!(!server.tool_router.has_route("create_task"));
         assert!(!server.tool_router.has_route("complete_task"));
+        assert!(!server.tool_router.has_route("start_task_timer"));
     }
 
     #[test]
@@ -299,5 +470,61 @@ mod tests {
         let server = OpenMgmtMcp::new(AppService::new(database), true);
         assert!(server.tool_router.has_route("create_task"));
         assert!(server.tool_router.has_route("create_project"));
+        assert!(server.tool_router.has_route("start_task_timer"));
+        assert!(server.tool_router.has_route("stop_task_timer"));
+    }
+
+    #[test]
+    fn ai_settings_write_toggle_gates_write_tools() {
+        let database = Database::in_memory().unwrap();
+        let service = AppService::new(database);
+        service
+            .update_ai_settings(AiSettingsPatch {
+                write_enabled: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
+        // The env gate alone is not enough: the persisted setting wins.
+        let server = OpenMgmtMcp::new(service, true);
+        assert!(server.tool_router.has_route("list_tasks"));
+        assert!(!server.tool_router.has_route("create_task"));
+        assert!(!server.tool_router.has_route("start_task_timer"));
+    }
+
+    #[test]
+    fn ai_settings_read_toggle_hides_read_tools() {
+        let database = Database::in_memory().unwrap();
+        let service = AppService::new(database);
+        service
+            .update_ai_settings(AiSettingsPatch {
+                read_enabled: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
+        let server = OpenMgmtMcp::new(service, true);
+        assert!(!server.tool_router.has_route("list_tasks"));
+        assert!(!server.tool_router.has_route("query_tasks"));
+        assert!(!server.tool_router.has_route("triage_backlog"));
+    }
+
+    #[test]
+    fn remote_mode_never_exposes_destructive_tools() {
+        // The remote constructor applies the same #15 permission model as
+        // the local one, plus the remote invariant: destructive tools are
+        // never exposed over the network, even if the persisted settings
+        // would allow them.
+        let database = Database::in_memory().unwrap();
+        let local = OpenMgmtMcp::new(AppService::new(database), true);
+        let database = Database::in_memory().unwrap();
+        let remote = OpenMgmtMcp::new_remote(AppService::new(database), true);
+        for tool in ai::ai_tool_registry() {
+            let expected = !tool.destructive && local.tool_router.has_route(tool.name.as_str());
+            assert_eq!(
+                remote.tool_router.has_route(tool.name.as_str()),
+                expected,
+                "remote exposure of {}",
+                tool.name
+            );
+        }
     }
 }

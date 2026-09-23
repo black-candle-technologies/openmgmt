@@ -3,12 +3,13 @@ use crate::models::{ProjectStatus, ProjectType};
 use crate::{
     board::build_board,
     models::{
-        ActiveTimerInfo, BoardState, CalendarBlock, CalendarBlockSource, CalendarBlockStatus,
-        NewOrganization, NewProject, NewSavedTaskView, NewTask, Organization, OrganizationPatch,
-        Project, ProjectPatch, RecurrenceRule, SavedTaskView, SavedTaskViewPatch, ScheduleConflict,
-        ScheduleTaskInput, ScheduledBlockCompletion, ScoringSettings, ScoringSettingsPatch, Task,
-        TaskContext, TaskPatch, TaskQueryFilter, TaskSort, TaskSortField, TaskStatus,
-        TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
+        ActiveTimerInfo, AiSettings, AiSettingsPatch, BoardState, CalendarBlock,
+        CalendarBlockSource, CalendarBlockStatus, NewOrganization, NewProject, NewSavedTaskView,
+        NewTask, Organization, OrganizationPatch, Project, ProjectPatch, RecurrenceRule,
+        SavedTaskView, SavedTaskViewPatch, ScheduleConflict, ScheduleTaskInput,
+        ScheduledBlockCompletion, ScoringSettings, ScoringSettingsPatch, Task, TaskContext,
+        TaskPatch, TaskQueryFilter, TaskSort, TaskSortField, TaskStatus, TaskTimerSession,
+        TaskWithContext, TimeBlockSuggestion,
     },
     scheduling::{generate_schedule_ics, next_recurrence_at},
     scoring::{ScoringWeights, score_task},
@@ -52,6 +53,50 @@ pub enum CoreError {
 
 pub type Result<T> = std::result::Result<T, CoreError>;
 
+const AI_READ_ENABLED_KEY: &str = "ai.read_enabled";
+const AI_WRITE_ENABLED_KEY: &str = "ai.write_enabled";
+const AI_DESTRUCTIVE_TOOLS_ENABLED_KEY: &str = "ai.destructive_tools_enabled";
+
+fn get_bool_state(connection: &Connection, key: &str, default: bool) -> Result<bool> {
+    let value: Option<String> = connection
+        .query_row("SELECT value FROM sync_state WHERE key=?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    match value.as_deref() {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(other) => Err(CoreError::InvalidValue(format!("invalid {key}: {other}"))),
+    }
+}
+
+fn set_bool_state(connection: &Connection, key: &str, value: bool) -> Result<()> {
+    connection.execute(
+        "INSERT INTO sync_state (key,value) VALUES (?1,?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, if value { "true" } else { "false" }],
+    )?;
+    Ok(())
+}
+
+fn get_ai_settings_with_connection(connection: &Connection) -> Result<AiSettings> {
+    Ok(AiSettings {
+        read_enabled: get_bool_state(connection, AI_READ_ENABLED_KEY, true)?,
+        write_enabled: get_bool_state(connection, AI_WRITE_ENABLED_KEY, true)?,
+        destructive_tools_enabled: get_bool_state(
+            connection,
+            AI_DESTRUCTIVE_TOOLS_ENABLED_KEY,
+            false,
+        )?,
+        default_provider_id: None,
+        default_model_id: None,
+        local_only_mode: false,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    })
+}
+
 #[derive(Clone)]
 pub struct Database {
     connection: Arc<Mutex<Connection>>,
@@ -64,6 +109,31 @@ enum MutationOrigin {
     Remote,
     #[cfg(test)]
     Seed,
+}
+
+/// One entry for the MCP audit trail (`mcp_audit_log`). Written by the MCP
+/// HTTP transport for every tool call and auth decision; local to the
+/// serving replica and never synced.
+#[derive(Debug, Clone)]
+pub struct McpAuditRecord {
+    /// Black Candle user id, `local-stdio`, or `unauthenticated`.
+    pub caller: String,
+    /// Transport that served the call: `http` or `stdio`.
+    pub transport: String,
+    /// `tools/call:<name>` for tool calls, the raw MCP method otherwise
+    /// (e.g. `initialize`, `tools/list`), `auth` for auth decisions.
+    pub tool_name: String,
+    pub success: bool,
+    /// Optional detail, e.g. the auth rejection reason.
+    pub detail: Option<String>,
+}
+
+/// A stored [`McpAuditRecord`] with its id and timestamp.
+#[derive(Debug, Clone)]
+pub struct McpAuditRow {
+    pub id: i64,
+    pub called_at: DateTime<Utc>,
+    pub record: McpAuditRecord,
 }
 
 impl MutationOrigin {
@@ -255,6 +325,21 @@ impl Database {
               ON applied_remote_events(entity_type, entity_id);
             CREATE INDEX IF NOT EXISTS applied_remote_events_device_sequence_idx
               ON applied_remote_events(device_id, sequence);
+            -- Append-only audit trail for MCP tool calls (written by the MCP
+            -- HTTP transport; see issue #16). Local to this replica, never
+            -- synced. `caller` is the Black Candle user id, `local-stdio`
+            -- for stdio mode, or `unauthenticated` for rejected auth.
+            CREATE TABLE IF NOT EXISTS mcp_audit_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              called_at TEXT NOT NULL,
+              caller TEXT NOT NULL,
+              transport TEXT NOT NULL,
+              tool_name TEXT NOT NULL,
+              success INTEGER NOT NULL,
+              detail TEXT
+            );
+            CREATE INDEX IF NOT EXISTS mcp_audit_log_called_at_idx
+              ON mcp_audit_log(called_at);
             "#,
         )?;
         self.ensure_task_scheduling_columns()?;
@@ -679,6 +764,76 @@ impl Database {
         )?;
         transaction.commit()?;
         Ok(settings)
+    }
+
+    /// Append a row to the MCP audit trail (`mcp_audit_log`). Called by the
+    /// MCP HTTP transport for every tool call and auth decision; local to
+    /// this replica and never synced.
+    pub fn record_mcp_audit(&self, record: &McpAuditRecord) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO mcp_audit_log
+               (called_at, caller, transport, tool_name, success, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                Utc::now().to_rfc3339(),
+                record.caller,
+                record.transport,
+                record.tool_name,
+                i64::from(record.success),
+                record.detail,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Newest-first audit rows, capped at `limit`.
+    pub fn list_mcp_audit(&self, limit: i64) -> Result<Vec<McpAuditRow>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, called_at, caller, transport, tool_name, success, detail
+             FROM mcp_audit_log
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit.max(1)], |row| {
+            Ok(McpAuditRow {
+                id: row.get(0)?,
+                called_at: parse_time(row.get(1)?)?,
+                record: McpAuditRecord {
+                    caller: row.get(2)?,
+                    transport: row.get(3)?,
+                    tool_name: row.get(4)?,
+                    success: row.get::<_, i64>(5)? != 0,
+                    detail: row.get(6)?,
+                },
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(CoreError::Database)
+    }
+
+    pub fn get_ai_settings(&self) -> Result<AiSettings> {
+        let connection = self.connection()?;
+        get_ai_settings_with_connection(&connection)
+    }
+
+    pub fn update_ai_settings(&self, patch: AiSettingsPatch) -> Result<AiSettings> {
+        let connection = self.connection()?;
+        if let Some(read_enabled) = patch.read_enabled {
+            set_bool_state(&connection, AI_READ_ENABLED_KEY, read_enabled)?;
+        }
+        if let Some(write_enabled) = patch.write_enabled {
+            set_bool_state(&connection, AI_WRITE_ENABLED_KEY, write_enabled)?;
+        }
+        if let Some(destructive_tools_enabled) = patch.destructive_tools_enabled {
+            set_bool_state(
+                &connection,
+                AI_DESTRUCTIVE_TOOLS_ENABLED_KEY,
+                destructive_tools_enabled,
+            )?;
+        }
+        get_ai_settings_with_connection(&connection)
     }
 
     pub fn get_sync_status(&self) -> Result<SyncStatus> {
@@ -3474,6 +3629,45 @@ mod tests {
     use crate::sync::{
         RemoteApplyStatus, SyncConnectionState, SyncEntityType, SyncOperation, SyncSettingsPatch,
     };
+
+    #[test]
+    fn mcp_audit_log_records_and_lists() {
+        let database = Database::in_memory().unwrap();
+        assert!(database.list_mcp_audit(10).unwrap().is_empty());
+
+        database
+            .record_mcp_audit(&McpAuditRecord {
+                caller: "user-1".to_string(),
+                transport: "http".to_string(),
+                tool_name: "tools/call:list_tasks".to_string(),
+                success: true,
+                detail: None,
+            })
+            .unwrap();
+        database
+            .record_mcp_audit(&McpAuditRecord {
+                caller: "unauthenticated".to_string(),
+                transport: "http".to_string(),
+                tool_name: "auth".to_string(),
+                success: false,
+                detail: Some("bad token".to_string()),
+            })
+            .unwrap();
+
+        let rows = database.list_mcp_audit(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest first.
+        assert_eq!(rows[0].record.tool_name, "auth");
+        assert_eq!(rows[0].record.caller, "unauthenticated");
+        assert!(!rows[0].record.success);
+        assert_eq!(rows[0].record.detail.as_deref(), Some("bad token"));
+        assert_eq!(rows[1].record.tool_name, "tools/call:list_tasks");
+        assert_eq!(rows[1].record.caller, "user-1");
+        assert!(rows[1].record.success);
+        assert!(rows[1].record.detail.is_none());
+
+        assert_eq!(database.list_mcp_audit(1).unwrap().len(), 1);
+    }
 
     fn seeded_database() -> Database {
         let db = Database::in_memory().unwrap();

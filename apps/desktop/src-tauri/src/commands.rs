@@ -6,7 +6,9 @@ use openmgmt_core::{
     ScoringSettingsPatch, SyncSettings, SyncSettingsPatch, SyncStatus, Task, TaskPatch,
     TaskQueryFilter, TaskSort, TaskTimerSession, TaskWithContext, TimeBlockSuggestion,
 };
-use openmgmt_sync_client::{SyncConnectionTestResult, SyncOnceResult};
+use openmgmt_sync_client::{
+    OAuthConfig, OpenMgmtSyncClient, SyncClientConfig, SyncConnectionTestResult, SyncOnceResult,
+};
 use std::path::{Component, Path, PathBuf};
 use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::{Mutex, MutexGuard};
@@ -480,7 +482,8 @@ pub async fn sync_now(
 ) -> CommandResult<SyncOnceResult> {
     let _guard = runtime.try_start()?;
     let database = service.database();
-    openmgmt_sync_client::sync_once(&database)
+    desktop_sync_client()
+        .sync_once(&database)
         .await
         .map_err(|error| {
             tracing::error!(%error, "manual sync failed");
@@ -493,12 +496,44 @@ pub async fn test_sync_connection(
     service: State<'_, AppService>,
 ) -> CommandResult<SyncConnectionTestResult> {
     let database = service.database();
-    openmgmt_sync_client::test_connection(&database)
+    desktop_sync_client()
+        .test_connection(&database)
         .await
         .map_err(|error| {
             tracing::error!(%error, "sync connection test failed");
             error.to_string()
         })
+}
+
+/// The desktop sync client always enables native OAuth: without it there is
+/// no way to obtain the account Bearer <redacted> registration against a server
+/// with account auth. An explicitly configured bearer still wins; otherwise
+/// the keychain-held token from a previous sign-in is used.
+fn desktop_sync_client() -> OpenMgmtSyncClient {
+    OpenMgmtSyncClient::new(SyncClientConfig {
+        oauth: Some(OAuthConfig::default()),
+        ..Default::default()
+    })
+}
+
+/// Interactive Black Candle sign-in: opens the system browser for the OAuth
+/// flow and stores the access token in the OS keychain. Returns the access
+/// token.
+#[tauri::command]
+pub async fn sign_in() -> CommandResult<String> {
+    desktop_sync_client().sign_in().await.map_err(|error| {
+        tracing::error!(%error, "sign-in failed");
+        error.to_string()
+    })
+}
+
+/// Forget the stored Black Candle access token.
+#[tauri::command]
+pub fn sign_out() -> CommandResult<()> {
+    desktop_sync_client().sign_out().map_err(|error| {
+        tracing::error!(%error, "sign-out failed");
+        error.to_string()
+    })
 }
 
 #[tauri::command]
