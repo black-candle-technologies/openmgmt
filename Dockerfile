@@ -8,5 +8,5 @@ FROM gcr.io/distroless/cc-debian12
 
 COPY --from=builder /app/target/release/openmgmt-server /usr/local/bin/openmgmt-server
 
-EXPOSE 3000
+EXPOSE 8787
 CMD ["/usr/local/bin/openmgmt-server"]
