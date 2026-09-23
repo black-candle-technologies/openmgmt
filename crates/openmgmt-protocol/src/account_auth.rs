@@ -47,9 +47,46 @@ pub enum AccountAuthError {
 
 #[derive(Debug, Deserialize)]
 struct UserInfoResponse {
+    // authd's userinfo returns the user id as a JSON number (SQLite
+    // rowid); accept either form so a numeric id never breaks token
+    // validation with "error decoding response body".
+    #[serde(deserialize_with = "de_string_or_int")]
     id: String,
     email: String,
     email_verified: bool,
+}
+
+/// Deserializes a string that may arrive as a JSON string or integer
+/// (authd returns numeric user ids).
+fn de_string_or_int<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+
+    struct StringOrInt;
+
+    impl Visitor<'_> for StringOrInt {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string or integer")
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<String, E> {
+            Ok(value.to_owned())
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<String, E> {
+            Ok(value.to_string())
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<String, E> {
+            Ok(value.to_string())
+        }
+    }
+
+    deserializer.deserialize_any(StringOrInt)
 }
 
 /// Validates Black Candle access tokens against an OAuth issuer's
@@ -153,5 +190,22 @@ mod tests {
     fn userinfo_url_trims_trailing_slash() {
         let auth = AccountAuth::new("https://auth.example.com/").unwrap();
         assert_eq!(auth.userinfo_url, "https://auth.example.com/oauth/userinfo");
+    }
+
+    #[test]
+    fn userinfo_accepts_numeric_or_string_id() {
+        // Regression test: authd returns the user id as a JSON number.
+        // A strict `id: String` field rejected it with
+        // "error decoding response body", turning every device
+        // registration into HTTP 500.
+        let numeric: UserInfoResponse =
+            serde_json::from_str(r#"{"id": 12345, "email": "a@b.c", "email_verified": true}"#)
+                .expect("numeric id must deserialize");
+        assert_eq!(numeric.id, "12345");
+
+        let textual: UserInfoResponse =
+            serde_json::from_str(r#"{"id": "67890", "email": "a@b.c", "email_verified": true}"#)
+                .expect("string id must deserialize");
+        assert_eq!(textual.id, "67890");
     }
 }
