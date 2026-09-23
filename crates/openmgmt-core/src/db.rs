@@ -111,6 +111,31 @@ enum MutationOrigin {
     Seed,
 }
 
+/// One entry for the MCP audit trail (`mcp_audit_log`). Written by the MCP
+/// HTTP transport for every tool call and auth decision; local to the
+/// serving replica and never synced.
+#[derive(Debug, Clone)]
+pub struct McpAuditRecord {
+    /// Black Candle user id, `local-stdio`, or `unauthenticated`.
+    pub caller: String,
+    /// Transport that served the call: `http` or `stdio`.
+    pub transport: String,
+    /// `tools/call:<name>` for tool calls, the raw MCP method otherwise
+    /// (e.g. `initialize`, `tools/list`), `auth` for auth decisions.
+    pub tool_name: String,
+    pub success: bool,
+    /// Optional detail, e.g. the auth rejection reason.
+    pub detail: Option<String>,
+}
+
+/// A stored [`McpAuditRecord`] with its id and timestamp.
+#[derive(Debug, Clone)]
+pub struct McpAuditRow {
+    pub id: i64,
+    pub called_at: DateTime<Utc>,
+    pub record: McpAuditRecord,
+}
+
 impl MutationOrigin {
     fn logs_sync_event(self) -> bool {
         matches!(self, Self::Local)
@@ -300,6 +325,21 @@ impl Database {
               ON applied_remote_events(entity_type, entity_id);
             CREATE INDEX IF NOT EXISTS applied_remote_events_device_sequence_idx
               ON applied_remote_events(device_id, sequence);
+            -- Append-only audit trail for MCP tool calls (written by the MCP
+            -- HTTP transport; see issue #16). Local to this replica, never
+            -- synced. `caller` is the Black Candle user id, `local-stdio`
+            -- for stdio mode, or `unauthenticated` for rejected auth.
+            CREATE TABLE IF NOT EXISTS mcp_audit_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              called_at TEXT NOT NULL,
+              caller TEXT NOT NULL,
+              transport TEXT NOT NULL,
+              tool_name TEXT NOT NULL,
+              success INTEGER NOT NULL,
+              detail TEXT
+            );
+            CREATE INDEX IF NOT EXISTS mcp_audit_log_called_at_idx
+              ON mcp_audit_log(called_at);
             "#,
         )?;
         self.ensure_task_scheduling_columns()?;
@@ -724,6 +764,53 @@ impl Database {
         )?;
         transaction.commit()?;
         Ok(settings)
+    }
+
+    /// Append a row to the MCP audit trail (`mcp_audit_log`). Called by the
+    /// MCP HTTP transport for every tool call and auth decision; local to
+    /// this replica and never synced.
+    pub fn record_mcp_audit(&self, record: &McpAuditRecord) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO mcp_audit_log
+               (called_at, caller, transport, tool_name, success, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                Utc::now().to_rfc3339(),
+                record.caller,
+                record.transport,
+                record.tool_name,
+                i64::from(record.success),
+                record.detail,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Newest-first audit rows, capped at `limit`.
+    pub fn list_mcp_audit(&self, limit: i64) -> Result<Vec<McpAuditRow>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, called_at, caller, transport, tool_name, success, detail
+             FROM mcp_audit_log
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit.max(1)], |row| {
+            Ok(McpAuditRow {
+                id: row.get(0)?,
+                called_at: parse_time(row.get(1)?)?,
+                record: McpAuditRecord {
+                    caller: row.get(2)?,
+                    transport: row.get(3)?,
+                    tool_name: row.get(4)?,
+                    success: row.get::<_, i64>(5)? != 0,
+                    detail: row.get(6)?,
+                },
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(CoreError::Database)
     }
 
     pub fn get_ai_settings(&self) -> Result<AiSettings> {
@@ -3542,6 +3629,45 @@ mod tests {
     use crate::sync::{
         RemoteApplyStatus, SyncConnectionState, SyncEntityType, SyncOperation, SyncSettingsPatch,
     };
+
+    #[test]
+    fn mcp_audit_log_records_and_lists() {
+        let database = Database::in_memory().unwrap();
+        assert!(database.list_mcp_audit(10).unwrap().is_empty());
+
+        database
+            .record_mcp_audit(&McpAuditRecord {
+                caller: "user-1".to_string(),
+                transport: "http".to_string(),
+                tool_name: "tools/call:list_tasks".to_string(),
+                success: true,
+                detail: None,
+            })
+            .unwrap();
+        database
+            .record_mcp_audit(&McpAuditRecord {
+                caller: "unauthenticated".to_string(),
+                transport: "http".to_string(),
+                tool_name: "auth".to_string(),
+                success: false,
+                detail: Some("bad token".to_string()),
+            })
+            .unwrap();
+
+        let rows = database.list_mcp_audit(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest first.
+        assert_eq!(rows[0].record.tool_name, "auth");
+        assert_eq!(rows[0].record.caller, "unauthenticated");
+        assert!(!rows[0].record.success);
+        assert_eq!(rows[0].record.detail.as_deref(), Some("bad token"));
+        assert_eq!(rows[1].record.tool_name, "tools/call:list_tasks");
+        assert_eq!(rows[1].record.caller, "user-1");
+        assert!(rows[1].record.success);
+        assert!(rows[1].record.detail.is_none());
+
+        assert_eq!(database.list_mcp_audit(1).unwrap().len(), 1);
+    }
 
     fn seeded_database() -> Database {
         let db = Database::in_memory().unwrap();

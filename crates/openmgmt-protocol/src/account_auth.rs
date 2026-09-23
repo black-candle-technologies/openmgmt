@@ -20,6 +20,12 @@ use std::{
 /// How long a successful userinfo validation is cached, keyed by token hash.
 const USERINFO_CACHE_TTL: Duration = Duration::from_secs(300);
 
+/// Default Black Candle auth issuer, shared by the sync server
+/// (`OPENMGMT_AUTH_ISSUER`) and the MCP HTTP transport
+/// (`OPENMGMT_MCP_AUTH_ISSUER`). Self-hosters point both at their own
+/// authd-compatible issuer.
+pub const DEFAULT_AUTH_ISSUER: &str = "https://auth.blackcandletech.com";
+
 /// Validated Black Candle account identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountIdentity {

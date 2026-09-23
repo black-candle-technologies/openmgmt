@@ -1,13 +1,14 @@
 use std::path::PathBuf;
 
+// The default auth issuer lives in openmgmt-protocol so the sync server and
+// the MCP HTTP transport validate against the same issuer. Self-hosters
+// point OPENMGMT_AUTH_ISSUER at their own issuer; an empty value disables
+// account auth entirely (open registration, only sensible on loopback).
+use openmgmt_protocol::DEFAULT_AUTH_ISSUER;
+
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8787";
 const DEFAULT_DATABASE_PATH: &str = "data/openmgmt-server.sqlite";
 const DEFAULT_SERVER_NAME: &str = "OpenMgmt Sync Server";
-/// Default OAuth issuer used to validate Black Candle access tokens at
-/// device registration. Self-hosters point this at their own issuer; an
-/// empty value disables account auth entirely (open registration, only
-/// sensible on loopback).
-pub const DEFAULT_AUTH_ISSUER: &str = "https://auth.blackcandletech.com";
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {

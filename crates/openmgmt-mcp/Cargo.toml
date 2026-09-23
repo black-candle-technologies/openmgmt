@@ -6,12 +6,14 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+axum = { version = "0.8", features = ["http1", "tokio"] }
 chrono.workspace = true
 openmgmt-core = { path = "../openmgmt-core" }
-rmcp = { version = "1.7.0", features = ["server", "transport-io"] }
+openmgmt-protocol = { path = "../openmgmt-protocol" }
+rmcp = { version = "1.7.0", features = ["server", "transport-io", "transport-streamable-http-server"] }
 schemars = "1.0.4"
 serde.workspace = true
 serde_json.workspace = true
-tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "io-std"] }
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "io-std", "net"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }

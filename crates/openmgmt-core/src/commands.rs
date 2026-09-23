@@ -1,5 +1,5 @@
 use crate::{
-    db::{Database, Result},
+    db::{Database, McpAuditRecord, McpAuditRow, Result},
     models::{
         AiSettings, AiSettingsPatch, BoardState, CalendarBlock, NewOrganization, NewProject,
         NewSavedTaskView, NewTask, Organization, OrganizationPatch, Project, ProjectPatch,
@@ -211,6 +211,14 @@ impl AppService {
     }
     pub fn update_ai_settings(&self, patch: AiSettingsPatch) -> Result<AiSettings> {
         self.database.update_ai_settings(patch)
+    }
+    /// Append a row to the MCP audit trail (issue #16).
+    pub fn record_mcp_audit(&self, record: &McpAuditRecord) -> Result<()> {
+        self.database.record_mcp_audit(record)
+    }
+    /// Newest-first MCP audit rows, capped at `limit`.
+    pub fn list_mcp_audit(&self, limit: i64) -> Result<Vec<McpAuditRow>> {
+        self.database.list_mcp_audit(limit)
     }
     pub fn export_tasks_json(&self) -> Result<String> {
         self.database.export_tasks_json()

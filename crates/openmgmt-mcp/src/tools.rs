@@ -21,6 +21,18 @@ pub struct OpenMgmtMcp {
 
 impl OpenMgmtMcp {
     pub fn new(service: AppService, writes_enabled: bool) -> Self {
+        Self::build(service, writes_enabled, false)
+    }
+
+    /// Remote (HTTP) serving mode. Applies the same #15 permission model as
+    /// [`Self::new`], plus the remote invariant: destructive tools are never
+    /// exposed over the network, even if the persisted AI settings would
+    /// otherwise allow them.
+    pub fn new_remote(service: AppService, writes_enabled: bool) -> Self {
+        Self::build(service, writes_enabled, true)
+    }
+
+    fn build(service: AppService, writes_enabled: bool, remote: bool) -> Self {
         // The core AI permission model is the single source of truth for which
         // tools are exposed. The per-launcher env gate (`writes_enabled`) feeds
         // into it as the `mcp_writes_enabled` flag; the persisted
@@ -33,11 +45,17 @@ impl OpenMgmtMcp {
         let mut tool_router = Self::tool_router();
         for tool in ai::ai_tool_registry() {
             let check = enforce_ai_tool_permission(&settings, &tool, writes_enabled);
-            if !check.allowed {
+            // Destructive tools must never be exposed remotely, regardless of
+            // the persisted setting.
+            let denied = !check.allowed || (remote && tool.destructive);
+            if denied {
                 tracing::debug!(
                     "disabling MCP tool {}: {}",
                     tool.name,
-                    check.reason.as_deref().unwrap_or("denied")
+                    check
+                        .reason
+                        .as_deref()
+                        .unwrap_or("denied for remote serving")
                 );
                 tool_router.disable_route(tool.name);
             }
@@ -487,5 +505,26 @@ mod tests {
         assert!(!server.tool_router.has_route("list_tasks"));
         assert!(!server.tool_router.has_route("query_tasks"));
         assert!(!server.tool_router.has_route("triage_backlog"));
+    }
+
+    #[test]
+    fn remote_mode_never_exposes_destructive_tools() {
+        // The remote constructor applies the same #15 permission model as
+        // the local one, plus the remote invariant: destructive tools are
+        // never exposed over the network, even if the persisted settings
+        // would allow them.
+        let database = Database::in_memory().unwrap();
+        let local = OpenMgmtMcp::new(AppService::new(database), true);
+        let database = Database::in_memory().unwrap();
+        let remote = OpenMgmtMcp::new_remote(AppService::new(database), true);
+        for tool in ai::ai_tool_registry() {
+            let expected = !tool.destructive && local.tool_router.has_route(tool.name.as_str());
+            assert_eq!(
+                remote.tool_router.has_route(tool.name.as_str()),
+                expected,
+                "remote exposure of {}",
+                tool.name
+            );
+        }
     }
 }

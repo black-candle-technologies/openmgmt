@@ -81,8 +81,8 @@ specific deployment. Point a supported local MCP launcher or bridge at the
 compiled `openmgmt-mcp` binary and set `OPENMGMT_DATABASE_PATH`.
 
 Some hosted clients cannot directly start a local stdio process. They require a
-trusted MCP bridge or custom app. OpenMgmt does not expose a network bridge in
-the MVP.
+trusted MCP bridge or custom app. For remote access, `openmgmt-mcp` also
+serves the registry over MCP streamable HTTP — see [MCP_HTTP.md](MCP_HTTP.md).
 
 ## Enable writes
 
