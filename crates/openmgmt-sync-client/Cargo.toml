@@ -5,15 +5,21 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+base64.workspace = true
 chrono.workspace = true
+keyring.workspace = true
+open.workspace = true
 openmgmt-core = { path = "../openmgmt-core" }
 openmgmt-protocol = { path = "../openmgmt-protocol" }
+rand.workspace = true
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "time"] }
 tracing.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 axum = "0.8"

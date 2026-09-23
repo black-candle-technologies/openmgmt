@@ -10,6 +10,8 @@ use openmgmt_protocol::ProtocolError;
 pub enum ServerError {
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error("account issuer error: {0}")]
+    AccountIssuer(String),
 }
 
 impl IntoResponse for ServerError {

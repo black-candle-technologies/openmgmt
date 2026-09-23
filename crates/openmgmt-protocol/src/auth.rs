@@ -6,6 +6,10 @@ pub struct DeviceRegistrationRequest {
     pub protocol_version: String,
     pub device_id: String,
     pub device_name: String,
+    /// Stable per-install device token from a previous registration, used as
+    /// proof of possession when re-registering an existing device id.
+    #[serde(default)]
+    pub previous_device_token: Option<String>,
     pub user_hint: Option<String>,
 }
 

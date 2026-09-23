@@ -177,6 +177,36 @@ pub fn SyncPage() -> impl IntoView {
         });
     };
 
+    let sign_in = move || {
+        state.start_action("signin");
+        spawn_local(async move {
+            match api::sign_in().await {
+                Ok(_) => {
+                    state.notice.set(Some(
+                        "Signed in. Your next sync will register this device to your account."
+                            .into(),
+                    ));
+                }
+                Err(error) => state.error.set(Some(format!("Sign-in failed: {error}"))),
+            }
+            state.reload_status().await;
+            state.finish_action();
+        });
+    };
+
+    let sign_out = move || {
+        state.start_action("signout");
+        spawn_local(async move {
+            match api::sign_out().await {
+                Ok(()) => {
+                    state.notice.set(Some("Signed out.".into()));
+                }
+                Err(error) => state.error.set(Some(format!("Sign-out failed: {error}"))),
+            }
+            state.finish_action();
+        });
+    };
+
     view! {
         <PageHeader
             eyebrow="OPTIONAL SYNC"
@@ -347,6 +377,20 @@ pub fn SyncPage() -> impl IntoView {
                         on:click=move |_| test()
                     >
                         {move || if state.action.get() == Some("test") { "Testing…" } else { "Test connection" }}
+                    </button>
+                    <button
+                        class="btn btn-ghost"
+                        disabled=move || state.action.get().is_some()
+                        on:click=move |_| sign_in()
+                    >
+                        {move || if state.action.get() == Some("signin") { "Waiting for browser…" } else { "Sign in" }}
+                    </button>
+                    <button
+                        class="btn btn-ghost"
+                        disabled=move || state.action.get().is_some()
+                        on:click=move |_| sign_out()
+                    >
+                        {move || if state.action.get() == Some("signout") { "Signing out…" } else { "Sign out" }}
                     </button>
                     <button
                         class="btn btn-primary"

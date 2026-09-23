@@ -2,16 +2,20 @@ services:
   server:
     build: .
     ports:
-      # Loopback-only by default. Binding 0.0.0.0 is only safe once account
-      # auth is enforced (see issue #14); until then the server is an open
-      # event store to anyone who can reach it. The process binds 0.0.0.0
-      # *inside* the container (required for Docker port forwarding to
-      # reach it); loopback-only is enforced at the host level by
+      # Loopback-only by default. Device registration now requires a Black
+      # Candle account (issue #14), but loopback remains the safe default
+      # until the deployment is deliberately exposed. The process binds
+      # 0.0.0.0 *inside* the container (required for Docker port forwarding
+      # to reach it); loopback-only is enforced at the host level by
       # publishing 127.0.0.1:8787.
       - "127.0.0.1:8787:8787"
     environment:
       OPENMGMT_SERVER_BIND_ADDR: "0.0.0.0:8787"
       OPENMGMT_SERVER_DATABASE_PATH: /data/openmgmt-server.sqlite
+      # Account auth issuer. Defaults to https://auth.blackcandletech.com;
+      # point at your own authd-compatible issuer to self-host, or set to an
+      # empty value to disable account auth (open registration).
+      # OPENMGMT_AUTH_ISSUER: ""
     volumes:
       - server-data:/data
 

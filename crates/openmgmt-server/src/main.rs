@@ -6,6 +6,7 @@ mod store;
 
 use anyhow::Context;
 use config::ServerConfig;
+use openmgmt_protocol::AccountAuth;
 use state::AppState;
 use std::sync::Arc;
 use store::ServerStore;
@@ -19,6 +20,21 @@ async fn main() -> anyhow::Result<()> {
 
     let config = ServerConfig::from_env();
     let store = ServerStore::open(&config.database_path).context("open server database")?;
+    let account_auth = config
+        .auth_issuer
+        .as_deref()
+        .map(AccountAuth::new)
+        .transpose()
+        .context("configure account auth")?
+        .map(Arc::new);
+    if config.account_auth_required() {
+        tracing::info!(
+            issuer = config.auth_issuer.as_deref().unwrap_or_default(),
+            "device registration requires a Black Candle account"
+        );
+    } else {
+        tracing::warn!("account auth disabled: device registration is open");
+    }
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await
         .with_context(|| format!("bind {}", config.bind_addr))?;
@@ -32,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
     let app = routes::router(AppState {
         config: Arc::new(config),
         store,
+        account_auth,
     });
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

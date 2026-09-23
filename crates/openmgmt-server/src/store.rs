@@ -20,9 +20,31 @@ pub enum StoreError {
     LockPoisoned,
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
+    /// Device registration was refused: no proof of possession for an
+    /// existing device id, or an account mismatch.
+    #[error("registration denied: {0}")]
+    RegistrationDenied(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// How a device registration should be authorized.
+#[derive(Debug, Clone)]
+pub enum RegistrationMode {
+    /// Historical open registration (account auth disabled).
+    Open,
+    /// Account auth is on: `account_user_id` is the validated Black Candle
+    /// user id. New devices are bound to that account; re-registering an
+    /// existing device id requires either the previous device token
+    /// (proof of possession) or a bearer for the owning account.
+    /// A legacy device (no account bound yet) can only be claimed by
+    /// presenting its current device token; an arbitrary signed-in
+    /// account cannot take it over.
+    AccountAuthenticated {
+        account_user_id: String,
+        existing_device_token: Option<String>,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredDevice {
@@ -109,6 +131,8 @@ impl ServerStore {
               created_at TEXT NOT NULL,
               last_seen_at TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS server_devices_account_idx
+              ON server_devices(account_id);
             CREATE TABLE IF NOT EXISTS server_state (
               key TEXT PRIMARY KEY NOT NULL,
               value TEXT NOT NULL
@@ -127,7 +151,11 @@ impl ServerStore {
         )?)
     }
 
-    pub fn register_device(&self, request: &DeviceRegistrationRequest) -> Result<RegisteredDevice> {
+    pub fn register_device(
+        &self,
+        request: &DeviceRegistrationRequest,
+        mode: RegistrationMode,
+    ) -> Result<RegisteredDevice> {
         let now = server_timestamp(Utc::now());
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
@@ -144,13 +172,73 @@ impl ServerStore {
                 },
             )
             .optional()?;
-        let (account_id, user_id, device_token) = match existing {
-            Some((account_id, user_id, token)) => (
+        let (account_id, user_id, device_token) = match (existing, &mode) {
+            (
+                Some((stored_account, stored_user, stored_token)),
+                RegistrationMode::AccountAuthenticated {
+                    account_user_id,
+                    existing_device_token,
+                },
+            ) => {
+                // Devices registered before account auth was enabled have no
+                // account yet. Claiming one requires proving possession with
+                // its current device token, so a signed-in account cannot
+                // take over someone else's legacy device. (Rows that predate
+                // device tokens entirely have nothing to prove with, so the
+                // first authenticated registration claims those.)
+                if stored_account.is_none() {
+                    match (stored_token, existing_device_token) {
+                        (Some(stored), Some(presented)) if stored == *presented => (
+                            Some(account_user_id.clone()),
+                            Some(account_user_id.clone()),
+                            stored,
+                        ),
+                        (Some(_), _) => {
+                            return Err(StoreError::RegistrationDenied(
+                                "device id is already registered; present its device token to claim it for this account".into(),
+                            ));
+                        }
+                        (None, _) => (
+                            Some(account_user_id.clone()),
+                            Some(account_user_id.clone()),
+                            Uuid::new_v4().to_string(),
+                        ),
+                    }
+                } else {
+                    let token_ok = match (stored_token.as_deref(), existing_device_token.as_deref())
+                    {
+                        (Some(stored), Some(presented)) => stored == presented,
+                        _ => false,
+                    };
+                    let account_ok = stored_account.as_deref() == Some(account_user_id.as_str());
+                    if !token_ok && !account_ok {
+                        return Err(StoreError::RegistrationDenied(
+                            "device id is already registered to another account; present the device token or sign in as the owning account".into(),
+                        ));
+                    }
+                    (
+                        stored_account,
+                        stored_user,
+                        stored_token.unwrap_or_else(|| Uuid::new_v4().to_string()),
+                    )
+                }
+            }
+            (Some((account_id, user_id, token)), RegistrationMode::Open) => (
                 account_id,
                 user_id,
                 token.unwrap_or_else(|| Uuid::new_v4().to_string()),
             ),
-            None => (None, None, Uuid::new_v4().to_string()),
+            (
+                None,
+                RegistrationMode::AccountAuthenticated {
+                    account_user_id, ..
+                },
+            ) => (
+                Some(account_user_id.clone()),
+                Some(account_user_id.clone()),
+                Uuid::new_v4().to_string(),
+            ),
+            (None, RegistrationMode::Open) => (None, None, Uuid::new_v4().to_string()),
         };
         transaction.execute(
             "INSERT INTO server_devices (
@@ -200,13 +288,39 @@ impl ServerStore {
         Ok(true)
     }
 
-    pub fn push_events(&self, events: &[SyncEvent]) -> Result<PushResult> {
+    /// Account that owns a device, if the device is registered and bound.
+    pub fn device_account_id(&self, device_id: &str) -> Result<Option<String>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT account_id FROM server_devices WHERE device_id=?1",
+                [device_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Store pushed events. Every event must belong to the authenticated
+    /// device; events stamped with another device id are rejected.
+    pub fn push_events(&self, events: &[SyncEvent], auth_device_id: &str) -> Result<PushResult> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         let mut accepted_event_ids = Vec::new();
         let mut rejected_events = Vec::new();
 
         for event in events {
+            if event.device_id != auth_device_id {
+                rejected_events.push(RejectedSyncEvent {
+                    event_id: event.event_id.clone(),
+                    error: ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "event device_id does not match the authenticated device",
+                        false,
+                    ),
+                });
+                continue;
+            }
             if transaction
                 .query_row(
                     "SELECT 1 FROM server_events WHERE event_id=?1",
@@ -271,31 +385,42 @@ impl ServerStore {
         })
     }
 
+    /// Pull events. When `account_id` is `Some`, only events pushed by
+    /// devices registered to that account are returned. `None` keeps the
+    /// historical global behavior (account auth disabled).
     pub fn pull_events(
         &self,
         after: Option<(DateTime<Utc>, String)>,
         limit: u32,
+        account_id: Option<&str>,
     ) -> Result<PullPage> {
         let connection = self.connection()?;
         let query_limit = i64::from(limit) + 1;
+        // `?1 IS NULL` disables the filter for servers without account auth.
+        let scope = "AND (?1 IS NULL OR device_id IN (SELECT device_id FROM server_devices WHERE account_id = ?1))";
         let mut events = if let Some((received_at, event_id)) = after {
             let mut statement = connection.prepare(&format!(
                 "{SERVER_EVENT_SELECT}
-                     WHERE received_at > ?1 OR (received_at = ?1 AND event_id > ?2)
-                     ORDER BY received_at,event_id LIMIT ?3"
+                     WHERE (received_at > ?2 OR (received_at = ?2 AND event_id > ?3)) {scope}
+                     ORDER BY received_at,event_id LIMIT ?4"
             ))?;
             statement
                 .query_map(
-                    params![server_timestamp(received_at), event_id, query_limit],
+                    params![
+                        account_id,
+                        server_timestamp(received_at),
+                        event_id,
+                        query_limit
+                    ],
                     map_server_event,
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         } else {
             let mut statement = connection.prepare(&format!(
-                "{SERVER_EVENT_SELECT} ORDER BY received_at,event_id LIMIT ?1"
+                "{SERVER_EVENT_SELECT} WHERE 1=1 {scope} ORDER BY received_at,event_id LIMIT ?2"
             ))?;
             statement
-                .query_map([query_limit], map_server_event)?
+                .query_map(params![account_id, query_limit], map_server_event)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let has_more = events.len() > limit as usize;
@@ -424,6 +549,17 @@ mod tests {
         for table in ["server_events", "server_devices", "server_state"] {
             assert!(store.table_exists(table).unwrap(), "missing {table}");
         }
+        // Account scoping (pull) filters on server_devices.account_id.
+        let index: bool = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='server_devices_account_idx')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index, "missing server_devices_account_idx");
     }
 
     #[test]
@@ -433,14 +569,186 @@ mod tests {
             protocol_version: "omgp/1".into(),
             device_id: "device-1".into(),
             device_name: "Desktop".into(),
+            previous_device_token: None,
             user_hint: None,
         };
 
-        let first = store.register_device(&request).unwrap();
-        let second = store.register_device(&request).unwrap();
+        let first = store
+            .register_device(&request, RegistrationMode::Open)
+            .unwrap();
+        let second = store
+            .register_device(&request, RegistrationMode::Open)
+            .unwrap();
 
         assert!(!first.device_token.is_empty());
         assert_eq!(first.device_token, second.device_token);
+    }
+
+    #[test]
+    fn authenticated_registration_binds_account_and_requires_proof() {
+        let store = ServerStore::in_memory().unwrap();
+        let request = DeviceRegistrationRequest {
+            protocol_version: "omgp/1".into(),
+            device_id: "device-1".into(),
+            device_name: "Desktop".into(),
+            previous_device_token: None,
+            user_hint: None,
+        };
+        let mode = || RegistrationMode::AccountAuthenticated {
+            account_user_id: "user-123".into(),
+            existing_device_token: None,
+        };
+
+        let first = store.register_device(&request, mode()).unwrap();
+        assert_eq!(first.account_id.as_deref(), Some("user-123"));
+        assert_eq!(first.user_id.as_deref(), Some("user-123"));
+
+        // A different account without the device token is denied.
+        let denied = store.register_device(
+            &request,
+            RegistrationMode::AccountAuthenticated {
+                account_user_id: "user-456".into(),
+                existing_device_token: None,
+            },
+        );
+        assert!(matches!(denied, Err(StoreError::RegistrationDenied(_))));
+
+        // The owning account may re-register without the token.
+        let again = store.register_device(&request, mode()).unwrap();
+        assert_eq!(again.device_token, first.device_token);
+
+        // Anyone holding the device token may re-register.
+        let with_token = store
+            .register_device(
+                &DeviceRegistrationRequest {
+                    previous_device_token: Some(first.device_token.clone()),
+                    ..request.clone()
+                },
+                RegistrationMode::AccountAuthenticated {
+                    account_user_id: "user-456".into(),
+                    existing_device_token: Some(first.device_token.clone()),
+                },
+            )
+            .unwrap();
+        assert_eq!(with_token.device_token, first.device_token);
+        // The account binding does not move on a token-proved re-registration.
+        assert_eq!(with_token.account_id.as_deref(), Some("user-123"));
+    }
+
+    #[test]
+    fn legacy_device_claim_requires_device_token_proof() {
+        let store = ServerStore::in_memory().unwrap();
+        let request = DeviceRegistrationRequest {
+            protocol_version: "omgp/1".into(),
+            device_id: "device-legacy".into(),
+            device_name: "Old laptop".into(),
+            previous_device_token: None,
+            user_hint: None,
+        };
+        let legacy = store
+            .register_device(&request, RegistrationMode::Open)
+            .unwrap();
+        assert_eq!(legacy.account_id, None);
+
+        // A different signed-in account cannot take over the legacy device
+        // without proving possession of its device token.
+        let takeover = store.register_device(
+            &request,
+            RegistrationMode::AccountAuthenticated {
+                account_user_id: "user-999".into(),
+                existing_device_token: None,
+            },
+        );
+        assert!(matches!(takeover, Err(StoreError::RegistrationDenied(_))));
+
+        // Presenting the current device token claims it for the account.
+        let claimed = store
+            .register_device(
+                &DeviceRegistrationRequest {
+                    previous_device_token: Some(legacy.device_token.clone()),
+                    ..request.clone()
+                },
+                RegistrationMode::AccountAuthenticated {
+                    account_user_id: "user-123".into(),
+                    existing_device_token: Some(legacy.device_token.clone()),
+                },
+            )
+            .unwrap();
+        assert_eq!(claimed.account_id.as_deref(), Some("user-123"));
+        assert_eq!(claimed.device_token, legacy.device_token);
+    }
+
+    #[test]
+    fn pull_scopes_events_to_account() {
+        use chrono::TimeZone;
+        use openmgmt_protocol::{SyncEntityType, SyncEvent, SyncOperation};
+
+        let store = ServerStore::in_memory().unwrap();
+        let device = |id: &str, user: &str| {
+            store
+                .register_device(
+                    &DeviceRegistrationRequest {
+                        protocol_version: "omgp/1".into(),
+                        device_id: id.into(),
+                        device_name: id.into(),
+                        previous_device_token: None,
+                        user_hint: None,
+                    },
+                    RegistrationMode::AccountAuthenticated {
+                        account_user_id: user.into(),
+                        existing_device_token: None,
+                    },
+                )
+                .unwrap()
+        };
+        device("device-a1", "user-a");
+        device("device-a2", "user-a");
+        device("device-b1", "user-b");
+
+        let event = |event_id: &str, device_id: &str| SyncEvent {
+            event_id: event_id.into(),
+            device_id: device_id.into(),
+            actor_user_id: None,
+            target_user_id: None,
+            workspace_id: None,
+            sequence: 1,
+            entity_type: SyncEntityType::Task,
+            entity_id: format!("task-{event_id}"),
+            operation: SyncOperation::Created,
+            payload_json: serde_json::json!({}),
+            created_at: Utc.with_ymd_and_hms(2026, 6, 13, 12, 0, 0).unwrap(),
+            synced_at: None,
+        };
+        // Events are pushed per authenticated device.
+        for (event_id, device_id) in [
+            ("event-a1", "device-a1"),
+            ("event-a2", "device-a2"),
+            ("event-b1", "device-b1"),
+        ] {
+            let result = store
+                .push_events(&[event(event_id, device_id)], device_id)
+                .unwrap();
+            assert_eq!(result.accepted_event_ids, vec![event_id]);
+        }
+
+        // A mismatched event device_id is rejected, not stored.
+        let rejected = store
+            .push_events(&[event("event-spoof", "device-b1")], "device-a1")
+            .unwrap();
+        assert!(rejected.accepted_event_ids.is_empty());
+        assert_eq!(rejected.rejected_events.len(), 1);
+
+        let page = store.pull_events(None, 100, Some("user-a")).unwrap();
+        let ids: Vec<_> = page.events.iter().map(|e| e.event_id.as_str()).collect();
+        assert_eq!(ids, vec!["event-a1", "event-a2"]);
+
+        let page = store.pull_events(None, 100, Some("user-b")).unwrap();
+        let ids: Vec<_> = page.events.iter().map(|e| e.event_id.as_str()).collect();
+        assert_eq!(ids, vec!["event-b1"]);
+
+        // No account filter: the historical global view.
+        let page = store.pull_events(None, 100, None).unwrap();
+        assert_eq!(page.events.len(), 3);
     }
 
     #[test]

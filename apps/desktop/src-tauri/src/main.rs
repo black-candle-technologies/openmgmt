@@ -83,6 +83,8 @@ fn main() {
             commands::get_sync_status,
             commands::sync_now,
             commands::test_sync_connection,
+            commands::sign_in,
+            commands::sign_out,
             commands::clear_sync_error,
             commands::open_tv_board_window,
             commands::close_tv_board_window,
