@@ -2,12 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
 
-macro_rules! string_enum {
-    ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        pub enum $name { $($variant),+ }
-
+macro_rules! string_enum_value_impls {
+    ($name:ident, $($variant:ident => $value:literal),+) => {
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 let value = match self { $(Self::$variant => $value),+ };
@@ -27,7 +23,35 @@ macro_rules! string_enum {
     };
 }
 
-string_enum!(ProjectType {
+macro_rules! string_enum {
+    ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $name { $($variant),+ }
+
+        string_enum_value_impls!($name, $($variant => $value),+);
+    };
+}
+
+/// Like [`string_enum!`], but the first variant listed is also the
+/// [`Default`]. Use it for enums with a natural default value; prefer
+/// [`string_enum!`] when every value must be chosen explicitly.
+macro_rules! string_enum_with_default {
+    ($name:ident { $default:ident => $default_value:literal $(, $variant:ident => $value:literal)* $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $name {
+            #[default]
+            $default,
+            $($variant),*
+        }
+
+        string_enum_value_impls!($name, $default => $default_value $(, $variant => $value)*);
+    };
+}
+
+string_enum_with_default!(ProjectType {
+    Other => "other",
     Software => "software",
     Writing => "writing",
     Business => "business",
@@ -36,17 +60,16 @@ string_enum!(ProjectType {
     Research => "research",
     Operations => "operations",
     Personal => "personal",
-    Other => "other",
 });
 
-string_enum!(ProjectStatus {
+string_enum_with_default!(ProjectStatus {
     Active => "active",
     Paused => "paused",
     Completed => "completed",
     Archived => "archived",
 });
 
-string_enum!(TaskStatus {
+string_enum_with_default!(TaskStatus {
     Inbox => "inbox",
     Backlog => "backlog",
     Scheduled => "scheduled",
@@ -499,24 +522,6 @@ pub struct ProjectSummary {
     pub overdue_count: usize,
     pub blocked_count: usize,
     pub suggested_next: Option<ScoredTask>,
-}
-
-impl Default for ProjectType {
-    fn default() -> Self {
-        Self::Other
-    }
-}
-
-impl Default for ProjectStatus {
-    fn default() -> Self {
-        Self::Active
-    }
-}
-
-impl Default for TaskStatus {
-    fn default() -> Self {
-        Self::Inbox
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

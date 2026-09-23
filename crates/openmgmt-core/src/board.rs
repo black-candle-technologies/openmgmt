@@ -67,7 +67,7 @@ pub fn build_board(tasks: Vec<TaskContext>, now: DateTime<Utc>) -> BoardState {
         &mut board.overdue,
         &mut board.done_today,
     ] {
-        column.sort_by(|a, b| b.urgency_score.cmp(&a.urgency_score));
+        column.sort_by_key(|task| std::cmp::Reverse(task.urgency_score));
     }
     board
 }

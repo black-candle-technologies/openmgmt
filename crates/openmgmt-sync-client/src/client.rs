@@ -66,14 +66,14 @@ impl OpenMgmtSyncClient {
         let result = self
             .sync_after_attempt(database, settings, server_url, device_id)
             .await;
-        if let Err(error) = &result {
-            if let Err(status_error) = database.record_sync_error(&error.to_string()) {
-                tracing::error!(
-                    error = %status_error,
-                    sync_error = %error,
-                    "failed to record sync error"
-                );
-            }
+        if let Err(error) = &result
+            && let Err(status_error) = database.record_sync_error(&error.to_string())
+        {
+            tracing::error!(
+                error = %status_error,
+                sync_error = %error,
+                "failed to record sync error"
+            );
         }
         result
     }
@@ -312,6 +312,18 @@ impl OpenMgmtSyncClient {
             phases,
         })
     }
+}
+
+pub async fn sync_once(database: &Database) -> SyncClientResult<SyncOnceResult> {
+    OpenMgmtSyncClient::new(SyncClientConfig::default())
+        .sync_once(database)
+        .await
+}
+
+pub async fn test_connection(database: &Database) -> SyncClientResult<SyncConnectionTestResult> {
+    OpenMgmtSyncClient::new(SyncClientConfig::default())
+        .test_connection(database)
+        .await
 }
 
 #[cfg(test)]
@@ -845,16 +857,4 @@ mod tests {
             Some("checkpoint-1")
         );
     }
-}
-
-pub async fn sync_once(database: &Database) -> SyncClientResult<SyncOnceResult> {
-    OpenMgmtSyncClient::new(SyncClientConfig::default())
-        .sync_once(database)
-        .await
-}
-
-pub async fn test_connection(database: &Database) -> SyncClientResult<SyncConnectionTestResult> {
-    OpenMgmtSyncClient::new(SyncClientConfig::default())
-        .test_connection(database)
-        .await
 }

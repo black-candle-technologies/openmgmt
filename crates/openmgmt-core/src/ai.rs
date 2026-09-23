@@ -268,7 +268,7 @@ pub fn plan_today(service: &AppService) -> Result<TodayPlan, CoreError> {
         .chain(&board.next_up)
         .cloned()
         .collect();
-    focus.sort_by(|a, b| b.urgency_score.cmp(&a.urgency_score));
+    focus.sort_by_key(|task| std::cmp::Reverse(task.urgency_score));
     focus.truncate(8);
     Ok(TodayPlan {
         generated_at: board.generated_at,

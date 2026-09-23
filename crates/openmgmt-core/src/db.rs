@@ -157,6 +157,11 @@ pub fn default_database_path() -> PathBuf {
     PathBuf::from("data").join("openmgmt.sqlite")
 }
 
+/// One row from the task-context query: the task with its display
+/// context, plus the project id, organization id, and optional
+/// organization icon.
+type TaskContextRow = (TaskContext, String, String, Option<String>);
+
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         if let Some(parent) = path.as_ref().parent() {
@@ -477,7 +482,7 @@ impl Database {
         Ok(scoring_settings_to_weights(&self.get_scoring_settings()?))
     }
 
-    fn task_context_rows(&self) -> Result<Vec<(TaskContext, String, String, Option<String>)>> {
+    fn task_context_rows(&self) -> Result<Vec<TaskContextRow>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT t.id,t.project_id,t.title,t.description,t.status,t.priority,t.due_at,
