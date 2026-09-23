@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeDevCommand": {
+      "script": "cmd /C \"set NO_COLOR=false&& trunk serve --address 127.0.0.1 --port 1420\"",
+      "cwd": "../ui",
+      "wait": false
+    }
+  }
+}

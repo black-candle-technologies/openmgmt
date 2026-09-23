@@ -364,7 +364,7 @@ pub async fn login(config: &OAuthConfig, store: &dyn TokenStore) -> SyncClientRe
 async fn login_with_opener(
     config: &OAuthConfig,
     store: &dyn TokenStore,
-    open_browser: &dyn Fn(&str) -> SyncClientResult<()>,
+    open_browser: &(dyn Fn(&str) -> SyncClientResult<()> + Send + Sync),
 ) -> SyncClientResult<String> {
     let (verifier, challenge) = pkce_pair();
     let state = random_state();

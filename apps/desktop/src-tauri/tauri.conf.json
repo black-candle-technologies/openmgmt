@@ -5,7 +5,7 @@
   "identifier": "com.openmgmt.desktop",
   "build": {
     "beforeDevCommand": {
-      "script": "trunk serve --address 127.0.0.1 --port 1420",
+      "script": "env NO_COLOR=false trunk serve --address 127.0.0.1 --port 1420",
       "cwd": "../ui",
       "wait": false
     },
