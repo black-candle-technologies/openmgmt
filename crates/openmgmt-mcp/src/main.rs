@@ -1,4 +1,5 @@
 mod http;
+mod sync_publish;
 mod tools;
 
 use anyhow::Context;
@@ -15,6 +16,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let database = Database::open(default_database_path()).context("open database")?;
+    // Publish this process's sync outbox into the server event log so MCP
+    // writes reach syncing devices. No-op unless the database is shared with
+    // the sync server.
+    let _sync_publisher = sync_publish::spawn_sync_publisher(database.clone());
     let service = AppService::new(database);
 
     // stdio (local editor/assistant clients) is the default; `http` serves

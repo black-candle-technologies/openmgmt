@@ -23,7 +23,7 @@ use crate::{
 };
 #[cfg(test)]
 use chrono::Duration;
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, SecondsFormat, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::{
     cmp::Ordering,
@@ -605,6 +605,77 @@ impl Database {
             )?;
         }
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// Copy unsynced local outbox events into the server-side event log.
+    ///
+    /// This is the co-located equivalent of pushing the outbox through the
+    /// sync protocol: it lets a writer that shares its SQLite file with the
+    /// sync server (e.g. the MCP server) publish its mutations so other
+    /// devices can pull them. Without this step, rows written here are
+    /// visible only to local readers and never reach syncing clients.
+    ///
+    /// Returns the number of events published. Does nothing (returns 0) when
+    /// the database has no `server_events` table, e.g. a standalone desktop
+    /// database.
+    pub fn publish_sync_outbox(&self) -> Result<usize> {
+        let mut connection = self.connection()?;
+        if !table_exists(&connection, "server_events")? {
+            return Ok(0);
+        }
+        // Match the server's own timestamp format so `received_at` ordering
+        // stays consistent with rows the sync server writes itself.
+        let received_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let synced_at = timestamp(Utc::now());
+        let transaction = connection.transaction()?;
+        let published = transaction.execute(
+            "INSERT OR IGNORE INTO server_events (
+                event_id,device_id,actor_user_id,target_user_id,workspace_id,sequence,
+                entity_type,entity_id,operation,payload_json,created_at,received_at
+             ) SELECT event_id,device_id,actor_user_id,target_user_id,workspace_id,sequence,
+                entity_type,entity_id,operation,payload_json,created_at,?1
+             FROM sync_events WHERE synced_at IS NULL",
+            params![received_at],
+        )?;
+        transaction.execute(
+            "UPDATE sync_events SET synced_at=?1 WHERE synced_at IS NULL",
+            params![synced_at],
+        )?;
+        transaction.commit()?;
+        Ok(published)
+    }
+
+    /// Register the local device in the server's device registry under an account.
+    ///
+    /// Sync pulls are scoped to the pulling device's account: only events whose
+    /// `device_id` is registered under that account are returned. A co-located
+    /// writer (e.g. the MCP server) must register here or its published events
+    /// stay invisible to account-scoped pulls.
+    ///
+    /// Mirrors the server's account-authenticated registration, except the
+    /// device token stays NULL: the co-located publisher writes to the shared
+    /// database directly and must never authenticate over HTTP, and
+    /// `Store::authenticate` fails closed on a NULL token. Does nothing when
+    /// the database has no `server_devices` table.
+    pub fn ensure_server_device(&self, account_id: &str, device_name: &str) -> Result<()> {
+        let connection = self.connection()?;
+        if !table_exists(&connection, "server_devices")? {
+            return Ok(());
+        }
+        let now = timestamp(Utc::now());
+        let device_id = get_or_create_device_id_with_connection(&connection)?;
+        connection.execute(
+            "INSERT INTO server_devices (
+                device_id,device_name,account_id,user_id,device_token,created_at,last_seen_at
+             ) VALUES (?1,?2,?3,?3,NULL,?4,?4)
+             ON CONFLICT(device_id) DO UPDATE SET
+                device_name=excluded.device_name,
+                account_id=excluded.account_id,
+                user_id=excluded.user_id,
+                last_seen_at=excluded.last_seen_at",
+            params![device_id, device_name, account_id, now],
+        )?;
         Ok(())
     }
 
@@ -3559,6 +3630,14 @@ fn timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339()
 }
 
+fn table_exists(connection: &Connection, name: &str) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [name],
+        |row| row.get(0),
+    )?)
+}
+
 fn slugify(value: &str) -> String {
     let mut slug = String::new();
     let mut separator = false;
@@ -5291,5 +5370,143 @@ mod tests {
             .urgency_score;
 
         assert!(wide_score > narrow_score);
+    }
+
+    const SERVER_TABLES_SQL: &str = "
+        CREATE TABLE server_events (
+            event_id TEXT PRIMARY KEY NOT NULL,
+            device_id TEXT NOT NULL,
+            actor_user_id TEXT,
+            target_user_id TEXT,
+            workspace_id TEXT,
+            sequence INTEGER NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            received_at TEXT NOT NULL
+        );
+        CREATE TABLE server_devices (
+            device_id TEXT PRIMARY KEY NOT NULL,
+            device_name TEXT NOT NULL,
+            account_id TEXT,
+            user_id TEXT,
+            device_token TEXT,
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        );";
+
+    #[test]
+    fn publish_sync_outbox_is_noop_without_server_tables() {
+        // A standalone database (e.g. a desktop client) has no server-side
+        // tables: publishing must silently do nothing.
+        let db = Database::in_memory().unwrap();
+        db.append_sync_event(
+            SyncEntityType::Task,
+            "task-1",
+            SyncOperation::Created,
+            serde_json::json!({"title": "t"}),
+        )
+        .unwrap();
+        assert_eq!(db.publish_sync_outbox().unwrap(), 0);
+        db.ensure_server_device("acct-1", "Test").unwrap();
+        // The outbox row is untouched.
+        assert_eq!(db.list_unsynced_events().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn publish_sync_outbox_copies_unsynced_events_to_server_log() {
+        let db = Database::in_memory().unwrap();
+        db.connection()
+            .unwrap()
+            .execute_batch(SERVER_TABLES_SQL)
+            .unwrap();
+
+        db.append_sync_event(
+            SyncEntityType::Task,
+            "task-1",
+            SyncOperation::Created,
+            serde_json::json!({"title": "t"}),
+        )
+        .unwrap();
+        db.append_sync_event(
+            SyncEntityType::Task,
+            "task-1",
+            SyncOperation::Updated,
+            serde_json::json!({"title": "t2"}),
+        )
+        .unwrap();
+
+        assert_eq!(db.publish_sync_outbox().unwrap(), 2);
+
+        let count: i64 = db
+            .connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM server_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // received_at uses the server's timestamp format.
+        let received_at: String = db
+            .connection()
+            .unwrap()
+            .query_row("SELECT received_at FROM server_events LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(received_at.ends_with('Z'), "received_at={received_at}");
+
+        // Outbox rows are marked synced, so a second publish is a no-op.
+        assert!(db.list_unsynced_events().unwrap().is_empty());
+        assert_eq!(db.publish_sync_outbox().unwrap(), 0);
+    }
+
+    #[test]
+    fn ensure_server_device_registers_local_device_without_token() {
+        let db = Database::in_memory().unwrap();
+        db.connection()
+            .unwrap()
+            .execute_batch(SERVER_TABLES_SQL)
+            .unwrap();
+
+        db.ensure_server_device("acct-1", "Test Publisher").unwrap();
+        let device_id = db.get_or_create_device_id().unwrap();
+        let (name, account_id, user_id, token): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = db
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT device_name, account_id, user_id, device_token
+                 FROM server_devices WHERE device_id=?1",
+                [&device_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "Test Publisher");
+        assert_eq!(account_id.as_deref(), Some("acct-1"));
+        assert_eq!(user_id.as_deref(), Some("acct-1"));
+        // No HTTP device token: the co-located publisher writes to the shared
+        // database directly and must fail closed in Store::authenticate.
+        assert_eq!(token, None);
+
+        // Re-running updates the row instead of duplicating it.
+        db.ensure_server_device("acct-1", "Renamed").unwrap();
+        let (name, count): (String, i64) = db
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT device_name, (SELECT COUNT(*) FROM server_devices)
+                 FROM server_devices WHERE device_id=?1",
+                [&device_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "Renamed");
+        assert_eq!(count, 1);
     }
 }

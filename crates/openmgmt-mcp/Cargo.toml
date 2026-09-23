@@ -14,6 +14,6 @@ rmcp = { version = "1.7.0", features = ["server", "transport-io", "transport-str
 schemars = "1.0.4"
 serde.workspace = true
 serde_json.workspace = true
-tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "io-std", "net"] }
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "io-std", "net", "time"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
