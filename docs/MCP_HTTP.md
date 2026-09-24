@@ -48,6 +48,29 @@ subject to the #15 AI settings (`AiSettings.read_enabled` /
 remains a kill switch). Destructive tools are **never exposed remotely**,
 even if the persisted settings would allow them.
 
+## Token scopes
+
+Both interactive OAuth tokens and personal access tokens (minted in the
+website's **Dashboard → Tokens** section) authenticate through the same
+Black Candle userinfo path. The token's granted scope is enforced per
+request, before tool dispatch:
+
+| Scope | MCP access |
+|---|---|
+| `identity` (or empty — pre-scope issuers) | Full access. Every existing OAuth client behaves exactly as before. |
+| `openmgmt:tasks:read` | Read-only tools (`list_tasks`, `query_tasks`, `get_board_state`, …). |
+| `openmgmt:tasks:write` | All tools (write implies read). |
+| anything else (e.g. `courier:messages:read`) | No MCP tool access — every call is rejected with `403`. |
+
+Multi-scope tokens (space-delimited per RFC 6749) grant the union of
+their scopes. Read/write classification reuses the #15 AI tool registry,
+so scopes can never drift from it. Scope denials are recorded in
+`mcp_audit_log` with caller, scope, and tool (never token material).
+
+Known caveat: successful userinfo validations are cached for five
+minutes, so revoking a personal token (or narrowing its scope) takes up
+to five minutes to reach the MCP server.
+
 ## Rate limiting and audit
 
 - Per-IP fixed-window rate limiting (`429` when exceeded).

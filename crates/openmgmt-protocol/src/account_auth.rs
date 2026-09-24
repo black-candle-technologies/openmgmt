@@ -33,6 +33,15 @@ pub struct AccountIdentity {
     pub user_id: String,
     pub email: String,
     pub email_verified: bool,
+    /// OAuth scopes granted to the token, space-delimited per RFC 6749
+    /// (e.g. `"identity"`, or `"openmgmt:tasks:read"` for a personal
+    /// access token minted with a narrow scope). Reported by authd's
+    /// `/oauth/userinfo`. Issuers that predate scoped tokens omit the
+    /// field; it defaults to `"identity"` (full access), preserving the
+    /// historical behavior where any valid token could do anything.
+    /// Scope is immutable for a given token string, so caching it with
+    /// the identity is safe.
+    pub scope: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +63,16 @@ struct UserInfoResponse {
     id: String,
     email: String,
     email_verified: bool,
+    // Absent on issuers that predate scoped tokens; the default keeps
+    // back-compat (full access, like every token before scopes existed).
+    #[serde(default = "default_scope")]
+    scope: String,
+}
+
+/// Scope assumed when the issuer does not report one: the legacy
+/// full-access scope every pre-scope token effectively carried.
+fn default_scope() -> String {
+    "identity".to_string()
 }
 
 /// Deserializes a string that may arrive as a JSON string or integer
@@ -151,6 +170,7 @@ impl AccountAuth {
                     user_id: info.id,
                     email: info.email,
                     email_verified: true,
+                    scope: info.scope,
                 }
             }
             // authd returns 401 for invalid/expired tokens and 403 for
@@ -190,6 +210,31 @@ mod tests {
     fn userinfo_url_trims_trailing_slash() {
         let auth = AccountAuth::new("https://auth.example.com/").unwrap();
         assert_eq!(auth.userinfo_url, "https://auth.example.com/oauth/userinfo");
+    }
+
+    #[test]
+    fn userinfo_reports_scope_when_present() {
+        let scoped: UserInfoResponse = serde_json::from_str(
+            r#"{"id": 7, "email": "a@b.c", "email_verified": true, "scope": "openmgmt:tasks:read"}"#,
+        )
+        .expect("scoped userinfo must deserialize");
+        assert_eq!(scoped.scope, "openmgmt:tasks:read");
+
+        let multi: UserInfoResponse = serde_json::from_str(
+            r#"{"id": 7, "email": "a@b.c", "email_verified": true, "scope": "openmgmt:tasks:read courier:messages:read"}"#,
+        )
+        .expect("multi-scope userinfo must deserialize");
+        assert_eq!(multi.scope, "openmgmt:tasks:read courier:messages:read");
+    }
+
+    #[test]
+    fn userinfo_defaults_scope_to_identity_when_absent() {
+        // Pre-scope issuers omit the field; the default preserves the
+        // historical behavior where any valid token had full access.
+        let legacy: UserInfoResponse =
+            serde_json::from_str(r#"{"id": 7, "email": "a@b.c", "email_verified": true}"#)
+                .expect("legacy userinfo must deserialize");
+        assert_eq!(legacy.scope, "identity");
     }
 
     #[test]

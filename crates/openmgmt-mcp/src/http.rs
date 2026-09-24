@@ -5,8 +5,12 @@
 //! over the public internet — can manage this OpenMGMT replica:
 //!
 //! - Bearer authentication against the configured Black Candle issuer,
-//!   reusing the [`AccountAuth`] validator from #14. An empty
-//!   `OPENMGMT_MCP_AUTH_ISSUER` disables auth; only do that on loopback.
+//!   reusing the [`AccountAuth`] validator from #14. Both interactive
+//!   OAuth tokens and personal access tokens (minted via the website's
+//!   token manager) validate through the same userinfo path; the token's
+//!   granted scope is enforced per request (see [`check_token_scope`]).
+//!   An empty `OPENMGMT_MCP_AUTH_ISSUER` disables auth; only do that on
+//!   loopback.
 //! - Remote permission model: reads plus non-destructive writes by default,
 //!   subject to the #15 AI settings; destructive tools are never exposed
 //!   remotely (see [`OpenMgmtMcp::new_remote`]).
@@ -41,7 +45,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use openmgmt_core::{AppService, McpAuditRecord};
+use openmgmt_core::{AiToolAccess, AppService, McpAuditRecord, ai::ai_tool_metadata};
 use openmgmt_protocol::{AccountAuth, DEFAULT_AUTH_ISSUER};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -143,7 +147,40 @@ fn check_bind_safety(config: &McpHttpConfig) -> anyhow::Result<()> {
 /// middleware for the audit middleware to consume.
 #[derive(Clone)]
 struct CallerIdentity {
-    user_id: String,
+    caller: Caller,
+}
+
+/// Who a validated request belongs to.
+#[derive(Clone, Debug)]
+enum Caller {
+    /// Black Candle account: the stable user id plus the token's granted
+    /// scope (space-delimited, RFC 6749). Interactive OAuth tokens and
+    /// personal access tokens both validate through the userinfo path,
+    /// so both arrive here — scope is what distinguishes a narrowly
+    /// scoped personal token from a full-access `identity` token.
+    User {
+        id: String,
+        scope: String,
+    },
+    Unauthenticated,
+}
+
+impl Caller {
+    /// Audit-log name: the user id, or `unauthenticated`. The token
+    /// itself never appears in audit rows.
+    fn audit_name(&self) -> String {
+        match self {
+            Caller::User { id, .. } => id.clone(),
+            Caller::Unauthenticated => "unauthenticated".to_string(),
+        }
+    }
+
+    fn scope(&self) -> &str {
+        match self {
+            Caller::User { scope, .. } => scope,
+            Caller::Unauthenticated => "",
+        }
+    }
 }
 
 /// Serve the MCP registry over streamable HTTP.
@@ -240,7 +277,7 @@ async fn auth_middleware(
         // Auth disabled: every caller is anonymous. The loud startup warning
         // (serve_http) is the guardrail; only loopback binds are sane here.
         request.extensions_mut().insert(CallerIdentity {
-            user_id: "unauthenticated".to_string(),
+            caller: Caller::Unauthenticated,
         });
         return next.run(request).await;
     };
@@ -257,7 +294,10 @@ async fn auth_middleware(
     match auth.validate(&token).await {
         Ok(identity) => {
             request.extensions_mut().insert(CallerIdentity {
-                user_id: identity.user_id,
+                caller: Caller::User {
+                    id: identity.user_id,
+                    scope: identity.scope,
+                },
             });
             next.run(request).await
         }
@@ -293,6 +333,85 @@ fn unauthorized(detail: &str) -> Response {
         .into_response()
 }
 
+/// 403 for authenticated callers that lack permission (e.g. a personal
+/// access token whose scope does not cover the requested tool). Distinct
+/// from 401: the credential was valid, the action is not permitted.
+fn forbidden(detail: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": "forbidden", "detail": detail })),
+    )
+        .into_response()
+}
+
+/// Enforce the authd token scope before tool dispatch.
+///
+/// Scope semantics (authd's scope registry; multi-scope tokens are
+/// space-delimited per RFC 6749 and grant the union):
+/// - `identity` — or an empty scope, which pre-scope issuers produce —
+///   full access. Every historical OAuth client (Android app, etc.)
+///   behaves exactly as before.
+/// - `openmgmt:tasks:read` — read-only tools.
+/// - `openmgmt:tasks:write` — all tools (write implies read).
+/// - anything else (e.g. `courier:messages:read`) — no MCP tool access.
+///
+/// Tool classification reuses the #15 AI registry
+/// ([`ai_tool_metadata`]) — the single source of truth for read vs
+/// write — so scope enforcement can never drift from the registry.
+/// Non-tool MCP methods (`initialize`, `tools/list`, `ping`) carry no
+/// data access and are always allowed. Unknown tool names fail closed
+/// downstream at the MCP router (they cannot execute), so they pass
+/// the scope check.
+fn check_token_scope(scope: &str, tool_names: &[String]) -> Result<(), String> {
+    let scopes: Vec<&str> = scope.split_whitespace().collect();
+    // Empty scope = issuer predates scoped tokens: back-compat full access.
+    if scopes.is_empty() || scopes.contains(&"identity") {
+        return Ok(());
+    }
+    if scopes.contains(&"openmgmt:tasks:write") {
+        return Ok(());
+    }
+    let can_read = scopes.contains(&"openmgmt:tasks:read");
+    for tool_name in tool_names {
+        let Some(name) = tool_name.strip_prefix("tools/call:") else {
+            continue;
+        };
+        let is_write =
+            ai_tool_metadata(name).is_some_and(|meta| meta.access == AiToolAccess::Write);
+        if is_write || !can_read {
+            return Err(format!(
+                "token scope '{scope}' does not permit tool '{name}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Record a scope denial in the audit trail: one row per attempted tool
+/// call (or MCP method), carrying caller, scope, and tool. Token material
+/// never appears — the caller already knows their own scope.
+async fn scope_deny(
+    service: &AppService,
+    caller: &str,
+    scope: &str,
+    tool_names: &[String],
+    reason: &str,
+) {
+    tracing::warn!("MCP HTTP scope denied for {caller}: {reason}");
+    for tool_name in tool_names {
+        let record = McpAuditRecord {
+            caller: caller.to_string(),
+            transport: "http".to_string(),
+            tool_name: tool_name.clone(),
+            success: false,
+            detail: Some(format!("scope '{scope}' denied: {reason}")),
+        };
+        if let Err(error) = service.record_mcp_audit(&record) {
+            tracing::warn!("failed to record MCP scope-denial audit: {error}");
+        }
+    }
+}
+
 async fn deny(service: &AppService, detail: &str) {
     tracing::warn!("MCP HTTP auth denied: {detail}");
     let record = McpAuditRecord {
@@ -317,8 +436,9 @@ async fn audit_middleware(
     let caller = request
         .extensions()
         .get::<CallerIdentity>()
-        .map(|identity| identity.user_id.clone())
-        .unwrap_or_else(|| "unauthenticated".to_string());
+        .map(|identity| identity.caller.clone())
+        .unwrap_or(Caller::Unauthenticated);
+    let caller_name = caller.audit_name();
 
     let (parts, body) = request.into_parts();
     let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
@@ -332,6 +452,24 @@ async fn audit_middleware(
         }
     };
     let tool_names = extract_tool_names(&bytes);
+
+    // Scope-check authenticated callers before the request runs: a
+    // narrowly scoped personal token attempting a tool outside its grant
+    // is rejected here with 403 and never reaches the MCP service.
+    // (Auth-disabled loopback callers are `Unauthenticated` and keep the
+    // historical full access.)
+    if let Some(reason) = check_token_scope(caller.scope(), &tool_names).err() {
+        scope_deny(
+            &state.service,
+            &caller_name,
+            caller.scope(),
+            &tool_names,
+            &reason,
+        )
+        .await;
+        return forbidden(&reason);
+    }
+
     let request = Request::from_parts(parts, Body::from(bytes));
 
     let response = next.run(request).await;
@@ -346,7 +484,13 @@ async fn audit_middleware(
         .is_some_and(|content_type| content_type.contains("text/event-stream"));
     if is_sse {
         let success = parts.status.is_success();
-        audit_tool_calls(&state.service, &caller, &tool_names, success, parts.status);
+        audit_tool_calls(
+            &state.service,
+            &caller_name,
+            &tool_names,
+            success,
+            parts.status,
+        );
         return Response::from_parts(parts, body);
     }
     let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
@@ -354,7 +498,7 @@ async fn audit_middleware(
         Err(_) => {
             audit_tool_calls(
                 &state.service,
-                &caller,
+                &caller_name,
                 &tool_names,
                 false,
                 StatusCode::BAD_GATEWAY,
@@ -367,7 +511,13 @@ async fn audit_middleware(
         }
     };
     let success = parts.status.is_success() && !is_jsonrpc_error(&bytes);
-    audit_tool_calls(&state.service, &caller, &tool_names, success, parts.status);
+    audit_tool_calls(
+        &state.service,
+        &caller_name,
+        &tool_names,
+        success,
+        parts.status,
+    );
     Response::from_parts(parts, Body::from(bytes))
 }
 
@@ -658,6 +808,128 @@ mod tests {
             ..config_for_bind_test()
         };
         assert!(check_bind_safety(&public_authed).is_ok());
+    }
+
+    #[test]
+    fn token_scope_identity_grants_full_access() {
+        // The legacy OAuth scope: every historical client behaves exactly
+        // as before. Empty scope = pre-scope issuer: same back-compat.
+        for scope in ["identity", "", "   "] {
+            assert!(check_token_scope(scope, &["tools/call:update_task".into()]).is_ok());
+            assert!(check_token_scope(scope, &["tools/call:list_tasks".into()]).is_ok());
+        }
+    }
+
+    #[test]
+    fn token_scope_read_permits_reads_and_non_tool_methods() {
+        let scope = "openmgmt:tasks:read";
+        for tool in [
+            "tools/call:list_tasks",
+            "tools/call:query_tasks",
+            "tools/call:get_task",
+            "tools/call:get_board_state",
+            "tools/call:list_timer_sessions",
+        ] {
+            assert!(check_token_scope(scope, &[tool.into()]).is_ok(), "{tool}");
+        }
+        // Non-tool MCP methods carry no data access.
+        for method in ["initialize", "tools/list", "ping"] {
+            assert!(
+                check_token_scope(scope, &[method.into()]).is_ok(),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_scope_read_blocks_writes() {
+        let scope = "openmgmt:tasks:read";
+        for tool in [
+            "tools/call:create_task",
+            "tools/call:update_task",
+            "tools/call:complete_task",
+            "tools/call:create_project",
+            "tools/call:start_task_timer",
+        ] {
+            let detail = check_token_scope(scope, &[tool.into()]).unwrap_err();
+            assert!(detail.contains("openmgmt:tasks:read"), "{detail}");
+            let name = tool.strip_prefix("tools/call:").unwrap();
+            assert!(detail.contains(name), "{detail}");
+        }
+        // A batch is denied when any call needs write.
+        let detail = check_token_scope(
+            scope,
+            &[
+                "tools/call:query_tasks".into(),
+                "tools/call:complete_task".into(),
+            ],
+        )
+        .unwrap_err();
+        assert!(detail.contains("complete_task"), "{detail}");
+    }
+
+    #[test]
+    fn token_scope_write_permits_everything() {
+        for scope in [
+            "openmgmt:tasks:write",
+            "openmgmt:tasks:write openmgmt:tasks:read",
+        ] {
+            assert!(check_token_scope(scope, &["tools/call:create_task".into()]).is_ok());
+            assert!(check_token_scope(scope, &["tools/call:list_tasks".into()]).is_ok());
+        }
+    }
+
+    #[test]
+    fn token_scope_other_services_get_no_access() {
+        // A Courier-scoped token must not touch any MCP tool, read or write.
+        for scope in [
+            "courier:messages:read",
+            "courier:messages:write",
+            "courier:messages:read courier:messages:write",
+        ] {
+            let detail = check_token_scope(scope, &["tools/call:list_tasks".into()]).unwrap_err();
+            assert!(detail.contains("courier:messages"), "{detail}");
+            assert!(check_token_scope(scope, &["tools/call:create_task".into()]).is_err());
+        }
+        // Unknown scopes are denied, not ignored.
+        assert!(check_token_scope("nonsense", &["tools/call:list_tasks".into()]).is_err());
+    }
+
+    #[test]
+    fn token_scope_multi_scope_grants_union() {
+        let scope = "openmgmt:tasks:read courier:messages:read";
+        assert!(check_token_scope(scope, &["tools/call:list_tasks".into()]).is_ok());
+        // The union still lacks any write grant.
+        assert!(check_token_scope(scope, &["tools/call:update_task".into()]).is_err());
+    }
+
+    #[test]
+    fn token_scope_unknown_tools_fail_closed_downstream() {
+        // The MCP router rejects unknown tool names before execution, so
+        // they carry no data access and pass the scope check.
+        assert!(check_token_scope("openmgmt:tasks:read", &["tools/call:nope".into()]).is_ok());
+        // …while a token with no read grant is still denied outright.
+        assert!(check_token_scope("courier:messages:read", &["tools/call:nope".into()]).is_err());
+    }
+
+    #[test]
+    fn caller_audit_names() {
+        assert_eq!(
+            Caller::User {
+                id: "user-123".to_string(),
+                scope: "identity".to_string(),
+            }
+            .audit_name(),
+            "user-123"
+        );
+        assert_eq!(Caller::Unauthenticated.audit_name(), "unauthenticated");
+        // The audit name never carries the scope or token material.
+        let caller = Caller::User {
+            id: "user-123".to_string(),
+            scope: "openmgmt:tasks:read".to_string(),
+        };
+        assert_eq!(caller.audit_name(), "user-123");
+        assert_eq!(caller.scope(), "openmgmt:tasks:read");
     }
 
     fn config_for_bind_test() -> McpHttpConfig {
