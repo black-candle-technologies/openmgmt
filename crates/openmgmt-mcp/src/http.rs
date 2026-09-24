@@ -4,15 +4,20 @@
 //! `POST /mcp` (MCP streamable HTTP), so a remote assistant — e.g. Muse
 //! over the public internet — can manage this OpenMGMT replica:
 //!
-//! - Bearer authentication against the configured Black Candle issuer,
-//!   reusing the [`AccountAuth`] validator from #14. An empty
-//!   `OPENMGMT_MCP_AUTH_ISSUER` disables auth; only do that on loopback.
+//! - Bearer authentication, in two flavors (issue #38 added the second):
+//!   Black Candle OAuth Bearer <redacted>, validated against the configured issuer
+//!   with the [`AccountAuth`] validator from #14, or a static API key
+//!   (`omg_live_…`) for agent/machine clients that cannot do the interactive
+//!   OAuth flow. An empty `OPENMGMT_MCP_AUTH_ISSUER` disables auth; only do
+//!   that on loopback.
 //! - Remote permission model: reads plus non-destructive writes by default,
 //!   subject to the #15 AI settings; destructive tools are never exposed
-//!   remotely (see [`OpenMgmtMcp::new_remote`]).
+//!   remotely (see [`OpenMgmtMcp::new_remote`]). API keys are additionally
+//!   scoped (`tasks:read` vs `tasks:write`).
 //! - Per-IP fixed-window rate limiting.
 //! - Every tool call and auth decision is appended to the `mcp_audit_log`
-//!   table with caller, time, and tool.
+//!   table with caller, time, and tool. API-key callers are recorded as
+//!   `api-key:<id>` — the key itself never appears in the audit trail.
 //!
 //! Writes go through [`AppService`]/[`Database`] exactly like local writes,
 //! so they emit sync events and converge with other replicas normally.
@@ -41,7 +46,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use openmgmt_core::{AppService, McpAuditRecord};
+use openmgmt_core::{
+    API_KEY_PREFIX, AiToolAccess, ApiKeyScope, ApiKeyValidation, AppService, Database,
+    McpAuditRecord, ai::ai_tool_metadata, scopes_allow_write,
+};
 use openmgmt_protocol::{AccountAuth, DEFAULT_AUTH_ISSUER};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -143,7 +151,32 @@ fn check_bind_safety(config: &McpHttpConfig) -> anyhow::Result<()> {
 /// middleware for the audit middleware to consume.
 #[derive(Clone)]
 struct CallerIdentity {
-    user_id: String,
+    caller: Caller,
+}
+
+/// Who a validated request belongs to.
+#[derive(Clone, Debug)]
+enum Caller {
+    /// Black Candle OAuth user id (the #14 path).
+    User(String),
+    /// API key (the #38 path): key id plus granted scopes.
+    ApiKey {
+        id: String,
+        scopes: Vec<ApiKeyScope>,
+    },
+    Unauthenticated,
+}
+
+impl Caller {
+    /// Audit-log name: the user id, `api-key:<id>`, or `unauthenticated`.
+    /// The key itself never appears in audit rows.
+    fn audit_name(&self) -> String {
+        match self {
+            Caller::User(id) => id.clone(),
+            Caller::ApiKey { id, .. } => format!("api-key:{id}"),
+            Caller::Unauthenticated => "unauthenticated".to_string(),
+        }
+    }
 }
 
 /// Serve the MCP registry over streamable HTTP.
@@ -240,7 +273,7 @@ async fn auth_middleware(
         // Auth disabled: every caller is anonymous. The loud startup warning
         // (serve_http) is the guardrail; only loopback binds are sane here.
         request.extensions_mut().insert(CallerIdentity {
-            user_id: "unauthenticated".to_string(),
+            caller: Caller::Unauthenticated,
         });
         return next.run(request).await;
     };
@@ -249,24 +282,78 @@ async fn auth_middleware(
     let Some(token) = token else {
         deny(
             &state.service,
+            "unauthenticated",
             "missing or malformed Authorization bearer token",
         )
         .await;
         return unauthorized("missing or malformed Authorization bearer token");
     };
-    match auth.validate(&token).await {
-        Ok(identity) => {
-            request.extensions_mut().insert(CallerIdentity {
-                user_id: identity.user_id,
-            });
+    match authenticate(auth, &state.service.database(), &token).await {
+        Ok(caller) => {
+            request.extensions_mut().insert(CallerIdentity { caller });
             next.run(request).await
         }
-        Err(error) => {
-            let detail = error.to_string();
-            deny(&state.service, &detail).await;
+        Err(detail) => {
+            deny(&state.service, "unauthenticated", &detail).await;
             unauthorized(&detail)
         }
     }
+}
+
+/// Validate a Bearer <redacted> Two credential types, routed by prefix:
+///
+/// - `omg_live_…` → API-key validation against the local `mcp_api_keys`
+///   table (issue #38). Cheap, offline, no network.
+/// - anything else → the existing `AccountAuth` OAuth validation (issue
+///   #14), byte-for-byte unchanged.
+///
+/// On failure the returned string is safe to expose: it names the reason
+/// and, for revoked keys, the key id — never the key.
+async fn authenticate(
+    auth: &AccountAuth,
+    database: &Database,
+    token: &str,
+) -> Result<Caller, String> {
+    if token.starts_with(API_KEY_PREFIX) {
+        return match database.validate_api_key(token) {
+            Ok(ApiKeyValidation::Valid(key)) => Ok(Caller::ApiKey {
+                id: key.id,
+                scopes: key.scopes,
+            }),
+            Ok(ApiKeyValidation::Revoked { id }) => Err(format!("API key {id} has been revoked")),
+            Ok(ApiKeyValidation::Unknown) => Err("unknown API key".to_string()),
+            Err(error) => Err(format!("API key validation failed: {error}")),
+        };
+    }
+    match auth.validate(token).await {
+        Ok(identity) => Ok(Caller::User(identity.user_id)),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Enforce per-key scopes (issue #38): a key without `tasks:write` may only
+/// invoke read tools. Tool classification reuses the #15 AI registry — the
+/// single source of truth for read vs write — so scopes can never drift
+/// from the registry. Non-tool MCP methods (`initialize`, `tools/list`,
+/// `ping`) carry no data access and are always allowed; unknown tool names
+/// fail closed downstream at the MCP router, so they pass the scope check.
+fn check_api_key_scope(scopes: &[ApiKeyScope], tool_names: &[String]) -> Result<(), String> {
+    if scopes_allow_write(scopes) {
+        return Ok(());
+    }
+    for tool_name in tool_names {
+        let Some(name) = tool_name.strip_prefix("tools/call:") else {
+            continue;
+        };
+        let is_write =
+            ai_tool_metadata(name).is_some_and(|meta| meta.access == AiToolAccess::Write);
+        if is_write {
+            return Err(format!(
+                "API key lacks the 'tasks:write' scope required by tool '{name}'"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -293,10 +380,21 @@ fn unauthorized(detail: &str) -> Response {
         .into_response()
 }
 
-async fn deny(service: &AppService, detail: &str) {
+/// 403 for authenticated callers that lack permission (e.g. an API key
+/// without the scope a tool requires). Distinct from 401: the credential
+/// was valid, the action is not permitted.
+fn forbidden(detail: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": "forbidden", "detail": detail })),
+    )
+        .into_response()
+}
+
+async fn deny(service: &AppService, caller: &str, detail: &str) {
     tracing::warn!("MCP HTTP auth denied: {detail}");
     let record = McpAuditRecord {
-        caller: "unauthenticated".to_string(),
+        caller: caller.to_string(),
         transport: "http".to_string(),
         tool_name: "auth".to_string(),
         success: false,
@@ -309,6 +407,11 @@ async fn deny(service: &AppService, detail: &str) {
 
 /// Parse the JSON-RPC body, run the request, then append one audit row per
 /// tool call (or MCP method) with caller, time, and tool.
+///
+/// API-key callers are additionally scope-checked here (issue #38): the
+/// parsed tool names are known before the request runs, so a read-only key
+/// attempting a write tool is rejected with 403 and never reaches the MCP
+/// service.
 async fn audit_middleware(
     State(state): State<HttpState>,
     request: Request,
@@ -317,8 +420,9 @@ async fn audit_middleware(
     let caller = request
         .extensions()
         .get::<CallerIdentity>()
-        .map(|identity| identity.user_id.clone())
-        .unwrap_or_else(|| "unauthenticated".to_string());
+        .map(|identity| identity.caller.clone())
+        .unwrap_or(Caller::Unauthenticated);
+    let caller_name = caller.audit_name();
 
     let (parts, body) = request.into_parts();
     let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
@@ -332,6 +436,19 @@ async fn audit_middleware(
         }
     };
     let tool_names = extract_tool_names(&bytes);
+
+    // Scope-check API-key callers before the request runs; a read-only key
+    // attempting a write tool is rejected here and never reaches the MCP
+    // service.
+    let scope_denial = match &caller {
+        Caller::ApiKey { scopes, .. } => check_api_key_scope(scopes, &tool_names).err(),
+        _ => None,
+    };
+    if let Some(reason) = scope_denial {
+        deny(&state.service, &caller_name, &reason).await;
+        return forbidden(&reason);
+    }
+
     let request = Request::from_parts(parts, Body::from(bytes));
 
     let response = next.run(request).await;
@@ -346,7 +463,13 @@ async fn audit_middleware(
         .is_some_and(|content_type| content_type.contains("text/event-stream"));
     if is_sse {
         let success = parts.status.is_success();
-        audit_tool_calls(&state.service, &caller, &tool_names, success, parts.status);
+        audit_tool_calls(
+            &state.service,
+            &caller_name,
+            &tool_names,
+            success,
+            parts.status,
+        );
         return Response::from_parts(parts, body);
     }
     let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
@@ -354,7 +477,7 @@ async fn audit_middleware(
         Err(_) => {
             audit_tool_calls(
                 &state.service,
-                &caller,
+                &caller_name,
                 &tool_names,
                 false,
                 StatusCode::BAD_GATEWAY,
@@ -367,7 +490,13 @@ async fn audit_middleware(
         }
     };
     let success = parts.status.is_success() && !is_jsonrpc_error(&bytes);
-    audit_tool_calls(&state.service, &caller, &tool_names, success, parts.status);
+    audit_tool_calls(
+        &state.service,
+        &caller_name,
+        &tool_names,
+        success,
+        parts.status,
+    );
     Response::from_parts(parts, Body::from(bytes))
 }
 
@@ -524,6 +653,7 @@ async fn rate_limit_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openmgmt_core::Database;
     use std::sync::Mutex;
 
     /// Env-var tests mutate process-global state, so they serialize on this.
@@ -668,5 +798,114 @@ mod tests {
             allowed_hosts: None,
             rate_limit_per_minute: 120,
         }
+    }
+
+    /// `AccountAuth::new` builds an HTTP client but performs no I/O, so the
+    /// API-key path can be tested without network: any `omg_live_` token is
+    /// validated locally and never reaches the OAuth issuer.
+    fn dummy_auth() -> AccountAuth {
+        AccountAuth::new("https://auth.invalid").unwrap()
+    }
+
+    #[tokio::test]
+    async fn authenticate_accepts_valid_api_key() {
+        let database = Database::in_memory().unwrap();
+        let (key, plaintext) = database
+            .create_api_key("agent", &[ApiKeyScope::TasksRead, ApiKeyScope::TasksWrite])
+            .unwrap();
+        let caller = authenticate(&dummy_auth(), &database, &plaintext)
+            .await
+            .unwrap();
+        let (id, scopes) = match caller.clone() {
+            Caller::ApiKey { id, scopes } => (id, scopes),
+            other => panic!("expected ApiKey caller, got {other:?}"),
+        };
+        assert_eq!(id, key.id);
+        assert_eq!(
+            scopes,
+            vec![ApiKeyScope::TasksRead, ApiKeyScope::TasksWrite]
+        );
+        // The audit name carries the key id, never the key.
+        assert_eq!(caller.audit_name(), format!("api-key:{}", key.id));
+        assert!(!caller.audit_name().contains(&plaintext));
+    }
+
+    #[tokio::test]
+    async fn authenticate_rejects_unknown_and_revoked_keys() {
+        let database = Database::in_memory().unwrap();
+        let (key, plaintext) = database
+            .create_api_key("agent", &[ApiKeyScope::TasksRead])
+            .unwrap();
+        let missing = format!("{API_KEY_PREFIX}0000000000000000000000000000000000000000000");
+        let detail = authenticate(&dummy_auth(), &database, &missing)
+            .await
+            .unwrap_err();
+        assert!(detail.contains("unknown API key"), "{detail}");
+
+        database.revoke_api_key(&key.id).unwrap();
+        let detail = authenticate(&dummy_auth(), &database, &plaintext)
+            .await
+            .unwrap_err();
+        // Revocation names the key id (safe for audit) without the key.
+        assert!(detail.contains(&key.id), "{detail}");
+        assert!(detail.contains("revoked"), "{detail}");
+        assert!(!detail.contains(&plaintext));
+    }
+
+    #[test]
+    fn api_key_scope_enforcement_uses_registry_classification() {
+        let read = [ApiKeyScope::TasksRead];
+        let read_write = [ApiKeyScope::TasksRead, ApiKeyScope::TasksWrite];
+
+        // Read tools pass on a read-only key.
+        assert!(check_api_key_scope(&read, &["tools/call:query_tasks".into()]).is_ok());
+        assert!(check_api_key_scope(&read, &["tools/call:list_tasks".into()]).is_ok());
+        assert!(check_api_key_scope(&read, &["tools/call:get_board_state".into()]).is_ok());
+        // Non-tool MCP methods carry no data access.
+        assert!(check_api_key_scope(&read, &["initialize".into()]).is_ok());
+        assert!(check_api_key_scope(&read, &["tools/list".into()]).is_ok());
+
+        // Write tools are denied without the write scope.
+        let detail = check_api_key_scope(&read, &["tools/call:update_task".into()]).unwrap_err();
+        assert!(detail.contains("tasks:write"), "{detail}");
+        assert!(detail.contains("update_task"), "{detail}");
+        let detail = check_api_key_scope(&read, &["tools/call:create_task".into()]).unwrap_err();
+        assert!(detail.contains("tasks:write"), "{detail}");
+
+        // A batch is denied if any call needs write.
+        let detail = check_api_key_scope(
+            &read,
+            &[
+                "tools/call:query_tasks".into(),
+                "tools/call:complete_task".into(),
+            ],
+        )
+        .unwrap_err();
+        assert!(detail.contains("complete_task"), "{detail}");
+
+        // The write scope permits both.
+        assert!(check_api_key_scope(&read_write, &["tools/call:update_task".into()]).is_ok());
+        assert!(check_api_key_scope(&read_write, &["tools/call:query_tasks".into()]).is_ok());
+
+        // Unknown tool names cannot execute (the MCP router rejects them),
+        // so they pass the scope check and fail closed downstream.
+        assert!(check_api_key_scope(&read, &["tools/call:nope_not_a_tool".into()]).is_ok());
+    }
+
+    #[test]
+    fn caller_audit_names() {
+        assert_eq!(
+            Caller::User("user-123".to_string()).audit_name(),
+            "user-123"
+        );
+        assert_eq!(
+            Caller::ApiKey {
+                id: "key-id".to_string(),
+                scopes: vec![ApiKeyScope::TasksRead],
+            }
+            .audit_name(),
+            "api-key:key-id"
+        );
+        assert_eq!(Caller::Unauthenticated.audit_name(), "unauthenticated");
     }
 }

@@ -1,5 +1,7 @@
 #[cfg(feature = "native")]
 pub mod ai;
+#[cfg(feature = "native")]
+pub mod api_keys;
 pub mod board;
 #[cfg(feature = "native")]
 pub mod commands;
@@ -10,6 +12,8 @@ pub mod scheduling;
 pub mod scoring;
 pub mod sync;
 
+#[cfg(feature = "native")]
+pub use api_keys::{API_KEY_PREFIX, ApiKey, ApiKeyScope, ApiKeyValidation, scopes_allow_write};
 pub use board::build_board;
 #[cfg(feature = "native")]
 pub use commands::AppService;

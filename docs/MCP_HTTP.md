@@ -81,3 +81,83 @@ Any MCP client with streamable-HTTP support can point at
 header. The token is a Black Candle OAuth access token (1h lifetime —
 refresh it via your normal authd flow); it is validated on each call
 (5-minute cache) but never stored.
+
+## API key authentication (issue #38)
+
+The OAuth flow (DCR + PKCE + loopback redirect + rotating refresh tokens)
+is built for interactive clients like the Android app. Agent and machine
+clients — and agent-connector flows, which accept exactly one credential
+shape, a single static key — cannot use it. For those, the MCP server
+accepts long-lived API keys as an alternative credential type. The OAuth
+path is unchanged.
+
+### Creating a key
+
+Key management is a local operator action on the machine running
+`openmgmt-mcp` — it is deliberately not exposed over the network:
+
+```sh
+# Read-only key (the default)
+openmgmt-mcp apikey create --name "ci-runner"
+
+# Read/write key
+openmgmt-mcp apikey create --name "agent" --scopes tasks:read,tasks:write
+
+openmgmt-mcp apikey list
+openmgmt-mcp apikey revoke <id>
+```
+
+`create` prints the secret once — store it immediately:
+
+```
+API key created. The secret is shown once — store it now:
+
+  omg_live_5Y-oCoJ7iF3sfqx_bA09Qefy-X_Ba1dphsU0sry_-TI
+
+  id:     8a8a09f1-78be-4d38-af20-0eba7bb44770
+  name:   agent
+  prefix: omg_live_5Y-oCoJ
+  scopes: tasks:read, tasks:write
+```
+
+### Using a key
+
+Send it as the Bearer <redacted>, exactly like an OAuth token:
+
+```
+Authorization: Bearer omg_live_5Y-oCoJ7iF3sfqx_bA09Qefy-X_Ba1dphsU0sry_-TI
+```
+
+The server routes any Bearer <redacted> starting with `omg_live_` to API-key
+validation; everything else keeps going through `AccountAuth` unchanged.
+
+### Scopes
+
+- `tasks:read` — read tools only (`list_tasks`, `query_tasks`, …).
+- `tasks:write` — non-destructive write tools (`create_task`, `update_task`,
+  …); implies read.
+
+A key without `tasks:write` that calls a write tool gets `403 Forbidden`
+and the attempt is audited. Scope classification reuses the #15 AI tool
+registry, so scopes cannot drift from the registry. Destructive tools stay
+unavailable remotely regardless of scope.
+
+### Storage, revocation, audit
+
+- Only the SHA-256 hash of a key is stored (`mcp_api_keys`), same pattern
+  authd uses for tokens. The plaintext is never written to disk.
+- Keys do not expire; revoke them with `openmgmt-mcp apikey revoke <id>`.
+  Revoked keys are rejected with `401` naming the key id.
+- Every tool call and auth decision is appended to `mcp_audit_log` with the
+  caller recorded as `api-key:<id>` — the key itself never appears there:
+
+```sql
+SELECT called_at, caller, tool_name, success
+FROM mcp_audit_log WHERE caller LIKE 'api-key:%' ORDER BY id DESC LIMIT 20;
+```
+
+### Custom-connector usage
+
+Paste the key into the connector's hosted connect page as the single API
+key. No request signing, no key/secret pair, no session handling — the
+server needs only `Authorization: Bearer <key>` on each request.

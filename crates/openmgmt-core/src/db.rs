@@ -187,7 +187,7 @@ impl Database {
         Ok(database)
     }
 
-    fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
+    pub(crate) fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
         self.connection.lock().map_err(|_| CoreError::LockPoisoned)
     }
 
@@ -345,6 +345,22 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS mcp_audit_log_called_at_idx
               ON mcp_audit_log(called_at);
+            -- API keys for the MCP HTTP transport (issue #38): agent/machine
+            -- clients authenticate with a static Bearer <redacted> instead of the
+            -- interactive OAuth flow. Only SHA-256 hashes are stored; the
+            -- plaintext is shown once at creation. Local to this replica,
+            -- never synced.
+            CREATE TABLE IF NOT EXISTS mcp_api_keys (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              key_hash TEXT NOT NULL UNIQUE,
+              key_prefix TEXT NOT NULL,
+              scopes TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              revoked_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS mcp_api_keys_hash_idx
+              ON mcp_api_keys(key_hash);
             "#,
         )?;
         self.ensure_task_scheduling_columns()?;
@@ -3528,7 +3544,7 @@ fn map_sync_event(row: &Row<'_>) -> rusqlite::Result<SyncEvent> {
     })
 }
 
-fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
+pub(crate) fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(&value)
         .map(|value| value.with_timezone(&Utc))
         .map_err(|error| {
