@@ -258,10 +258,10 @@ impl ServerStore {
                 now
             ],
         )?;
-        if account_id != previous_account {
-            if let Some(account) = account_id.as_deref() {
-                crate::projection::rebuild_account(&transaction, account)?;
-            }
+        if account_id != previous_account
+            && let Some(account) = account_id.as_deref()
+        {
+            crate::projection::rebuild_account(&transaction, account)?;
         }
         transaction.commit()?;
         Ok(RegisteredDevice {
