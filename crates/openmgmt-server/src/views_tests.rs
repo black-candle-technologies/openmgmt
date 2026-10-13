@@ -265,6 +265,47 @@ fn accepted_updates_and_archives_change_materialized_rows_atomically() {
             .subtitle,
         "Canceled"
     );
+    let mut project_archive = entity_event("a", "project-1", 6, "ignored", SyncEntityType::Project);
+    project_archive.operation = SyncOperation::Archived;
+    project_archive.payload_json = json!({"id":"project-1","archived_at":Utc::now()});
+    store.push_events(&[project_archive], "a").unwrap();
+    assert_eq!(
+        store
+            .view_page(
+                "user-a",
+                ViewQuery {
+                    kind: "project".into(),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .rows
+            .len(),
+        0
+    );
+    assert_eq!(
+        store
+            .view_page(
+                "user-a",
+                ViewQuery {
+                    kind: "project".into(),
+                    filter_id: "archived".into(),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .view_detail("user-a", "project", "project-1")
+            .unwrap()
+            .screen
+            .subtitle,
+        "Archived"
+    );
 }
 #[test]
 fn malformed_new_snapshot_cannot_present_old_data_as_current() {
