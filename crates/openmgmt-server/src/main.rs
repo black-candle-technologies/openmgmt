@@ -1,8 +1,10 @@
 mod config;
 mod error;
+mod projection;
 mod routes;
 mod state;
 mod store;
+mod views;
 
 use anyhow::Context;
 use config::ServerConfig;

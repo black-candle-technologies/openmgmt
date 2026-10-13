@@ -96,7 +96,7 @@ impl ServerStore {
         Ok(store)
     }
 
-    fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
+    pub(crate) fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
         self.connection.lock().map_err(|_| StoreError::LockPoisoned)
     }
 
@@ -139,6 +139,7 @@ impl ServerStore {
             );
             "#,
         )?;
+        crate::projection::migrate(&mut *self.connection()?)?;
         Ok(())
     }
 
@@ -172,6 +173,7 @@ impl ServerStore {
                 },
             )
             .optional()?;
+        let previous_account = existing.as_ref().and_then(|row| row.0.clone());
         let (account_id, user_id, device_token) = match (existing, &mode) {
             (
                 Some((stored_account, stored_user, stored_token)),
@@ -198,11 +200,9 @@ impl ServerStore {
                                 "device id is already registered; present its device token to claim it for this account".into(),
                             ));
                         }
-                        (None, _) => (
-                            Some(account_user_id.clone()),
-                            Some(account_user_id.clone()),
-                            Uuid::new_v4().to_string(),
-                        ),
+                        (None, _) => return Err(StoreError::RegistrationDenied(
+                            "legacy device has no ownership proof; register a new device or migrate administratively".into(),
+                        )),
                     }
                 } else {
                     let token_ok = match (stored_token.as_deref(), existing_device_token.as_deref())
@@ -246,6 +246,7 @@ impl ServerStore {
              ) VALUES (?1,?2,?3,?4,?5,?6,?6)
              ON CONFLICT(device_id) DO UPDATE SET
                 device_name=excluded.device_name,
+                account_id=excluded.account_id,user_id=excluded.user_id,
                 device_token=excluded.device_token,
                 last_seen_at=excluded.last_seen_at",
             params![
@@ -257,6 +258,11 @@ impl ServerStore {
                 now
             ],
         )?;
+        if account_id != previous_account {
+            if let Some(account) = account_id.as_deref() {
+                crate::projection::rebuild_account(&transaction, account)?;
+            }
+        }
         transaction.commit()?;
         Ok(RegisteredDevice {
             device_id: request.device_id.clone(),
@@ -373,6 +379,19 @@ impl ServerStore {
                     server_timestamp(Utc::now()),
                 ],
             )?;
+            let account: Option<String> = transaction.query_row(
+                "SELECT account_id FROM server_devices WHERE device_id=?1",
+                [&event.device_id],
+                |row| row.get(0),
+            )?;
+            if let Some(account) = account {
+                crate::projection::apply(
+                    &transaction,
+                    &account,
+                    event,
+                    transaction.last_insert_rowid(),
+                )?;
+            }
             accepted_event_ids.push(event.event_id.clone());
         }
 
