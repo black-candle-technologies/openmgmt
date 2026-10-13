@@ -8,7 +8,7 @@ All require `Authorization: Bearer <account access credential>`, a configured `O
 
 | Method | Route | Response |
 | --- | --- | --- |
-| GET | `/api/views/v1/overview` | `schema_version`, `service_id:openmgmt`, `screen`, `availability`, recent task/project `sections`, read-only `capabilities`, `revision` |
+| GET | `/api/views/v1/overview` | `schema_version`, `service_id:openmgmt`, `screen`, `availability`, task/project summary `metrics`, safe browse action and recent item `sections`, read-only `capabilities`, `revision` |
 | GET | `/api/views/v1/items?kind=task&q=...&filter_id=active&sort_id=updated_desc&limit=25&cursor=...` | Standard server `ListPageView` with rows, advertised filters/sorts, selected choices, empty state and opaque next cursor |
 | GET | `/api/views/v1/items/task/{id}` | Standard `DetailView`: screen, description/status/updated display fields, revision, empty actions |
 | GET | `/api/views/v1/items/project/{id}` | Same detail shape for account-owned projects |
@@ -16,6 +16,10 @@ All require `Authorization: Bearer <account access credential>`, a configured `O
 `kind` is `task` (default) or `project`. `filter_id` is `active` (default, meaning not archived), `archived`, or `all`; completed tasks are still non-archived until an explicit archive event. `sort_id` is `updated_desc` (default) or `title_asc`, each with stable ID tie breaking. `limit` is 1–50. Search is trimmed, Unicode-lowercased on the server, and matched against materialized title/description search text. Search is literal, not SQL wildcard syntax. Query size is bounded to 200 UTF-8 bytes; unsupported/extra query fields and malformed cursors are rejected.
 
 List row IDs are `task_{source_id}` or `project_{source_id}`; detail routes returned to Android are `services/openmgmt/items/{row_id}`. The BFF decodes the fixed prefix to the appropriate upstream detail route. The BFF may provide a `projects` presentation filter mapping to `kind=project`, allowing generic mobile navigation to browse both kinds without trusting remote URLs.
+
+Overview metrics are typed `{id,label,value,tone,action}` values for `task_count` and `project_count`. The server computes complete SQL counts where the authenticated account matches, `valid=1` and `archived=0`; it never counts the five recent preview rows to infer totals. Labels and decimal count strings are authored by the server, tone is `muted`, and action is the fixed `open_openmgmt` identifier. Completed but non-archived tasks follow the same active-list policy. Partial availability explains unsupported/malformed records; their undisplayable rows are excluded from both visible lists and counts.
+
+The `browse` section has component `action_rows` with only a safe link to `services/openmgmt/items`. The separate recent-item `list_page` sections contain private task/project presentation data for the online service overview. **The BFF must project only summary metrics and the safe action section into Home and its offline-eligible snapshot; it must never embed those private preview rows into the dashboard/cache.** Android does not aggregate or manufacture these counts.
 
 Responses are `Cache-Control: private, no-store` and vary by Authorization. Missing/invalid bearer is 401; missing product scope or unverified email is 403; another user's or unknown item is 404; invalid query/cursor is 400; a cursor invalidated by accepted data changes is 409; disabled account auth or issuer/database outage is 503. No secret, bearer or raw event payload appears in presentation responses. No mutation endpoint is introduced.
 
@@ -33,7 +37,7 @@ HMAC-SHA256 cursors bind the account, normalized query, kind, filter, sort, page
 
 ## Validation and deployment limits
 
-`cargo test -p openmgmt-server` passes **23 tests**: the original 16 and seven new projection/route tests for account separation, product scopes, verified identities, denied open/global reads, identical cross-account entity IDs, Unicode search, page/cursor tampering and binding, stable pages, update/archive/detail behavior, legacy claim proof, existing-event backfill, malformed snapshot suppression, query limits, and disabled auth. Run `cargo fmt -p openmgmt-server -- --check` and these tests before publishing.
+`cargo test -p openmgmt-server` passes **24 tests**: the original 16 and eight new projection/route tests for account separation, product scopes, verified identities, denied open/global reads, identical cross-account entity IDs, Unicode search, page/cursor tampering and binding, stable pages, update/archive/detail behavior, legacy claim proof, existing-event backfill, malformed snapshot suppression, query limits, disabled auth, and complete account-scoped summary counts independent of previews with archive/malformed-record exclusions. Run `cargo fmt -p openmgmt-server -- --check` and these tests before publishing.
 
 Local tests ran on Windows with Rust/Cargo 1.97.1 (stable MSVC toolchain), using temporary/in-memory SQLite and a loopback mock OAuth issuer. They do **not** demonstrate production deployment, authentic user data, multi-node behavior or mobile/device interoperability. The actual public OAuth issuer, BFF base URL configuration and first-party OAuth product-scope grants must be configured and verified. Existing `AccountAuth` has a five-minute successful-token validation cache; read revocation can therefore lag by that bounded cache interval. This work does not change shared protocol caching or claim immediate revocation for upstream read views.
 

@@ -536,3 +536,79 @@ async fn read_routes_require_configured_auth_verified_accounts_and_product_scope
     assert_eq!(status, StatusCode::OK);
     assert_eq!(view["rows"][0]["id"], "project_project-1");
 }
+
+#[tokio::test]
+async fn summary_counts_are_complete_account_scoped_and_follow_archive_visibility() {
+    let issuer = issuer().await;
+    let store = fixture();
+    for sequence in 4..=13 {
+        let id = format!("extra-{sequence}");
+        store
+            .push_events(
+                &[entity_event(
+                    "a",
+                    &id,
+                    sequence,
+                    "Additional task",
+                    SyncEntityType::Task,
+                )],
+                "a",
+            )
+            .unwrap();
+    }
+    let app = app(store.clone(), Some(&issuer));
+    let (_, overview) = get_response(app.clone(), "/api/views/v1/overview", Some("user-a")).await;
+    assert_eq!(overview["metrics"][0]["id"], "task_count");
+    assert_eq!(overview["metrics"][0]["value"], "12");
+    assert_eq!(overview["metrics"][1]["value"], "1");
+    let preview = overview["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|section| section["id"] == "tasks")
+        .unwrap();
+    assert_eq!(preview["items"].as_array().unwrap().len(), 5);
+    let browse = overview["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|section| section["component"] == "action_rows")
+        .unwrap();
+    assert_eq!(browse["items"][0]["route"], "services/openmgmt/items");
+    assert_eq!(browse["items"].as_array().unwrap().len(), 1);
+    assert!(
+        overview["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|metric| {
+                metric["tone"] == "muted"
+                    && metric["action"] == "open_openmgmt"
+                    && metric["label"]
+                        .as_str()
+                        .is_some_and(|label| !label.is_empty())
+            })
+    );
+    let (_, other) = get_response(app.clone(), "/api/views/v1/overview", Some("user-b")).await;
+    assert_eq!(other["metrics"][0]["value"], "1");
+    assert_eq!(other["metrics"][1]["value"], "0");
+
+    for (id, sequence, kind) in [
+        ("shared", 14, SyncEntityType::Task),
+        ("project-1", 15, SyncEntityType::Project),
+    ] {
+        let mut archive = entity_event("a", id, sequence, "ignored", kind);
+        archive.operation = SyncOperation::Archived;
+        archive.payload_json = json!({"id":id,"archived_at":Utc::now()});
+        store.push_events(&[archive], "a").unwrap();
+    }
+    let mut malformed = entity_event("a", "second", 16, "invalid", SyncEntityType::Task);
+    malformed.payload_json = json!({"entity":{"id":"wrong"}});
+    store.push_events(&[malformed], "a").unwrap();
+    let (_, updated) = get_response(app.clone(), "/api/views/v1/overview", Some("user-a")).await;
+    assert_eq!(updated["metrics"][0]["value"], "10");
+    assert_eq!(updated["metrics"][1]["value"], "0");
+    assert_eq!(updated["availability"], "partial");
+    let (_, unchanged_other) = get_response(app, "/api/views/v1/overview", Some("user-b")).await;
+    assert_eq!(unchanged_other["metrics"], other["metrics"]);
+}

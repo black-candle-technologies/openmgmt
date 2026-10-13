@@ -226,11 +226,20 @@ struct Section {
     items: Vec<ItemRow>,
 }
 #[derive(Serialize)]
+struct Metric {
+    id: &'static str,
+    label: &'static str,
+    value: String,
+    tone: &'static str,
+    action: &'static str,
+}
+#[derive(Serialize)]
 struct Overview {
     schema_version: u32,
     service_id: &'static str,
     screen: Header,
     availability: &'static str,
+    metrics: Vec<Metric>,
     sections: Vec<Section>,
     capabilities: Vec<&'static str>,
     revision: String,
@@ -523,6 +532,14 @@ pub async fn overview(
         [&account],
         |row| row.get(0),
     )?;
+    // Aggregate the complete account projection, independently of the five-row previews.
+    // This uses exactly the valid/non-archived visibility policy of the active list.
+    let (task_count, project_count): (i64, i64) = connection.query_row(
+        "SELECT COALESCE(SUM(kind='task'),0),COALESCE(SUM(kind='project'),0)
+         FROM mobile_projection WHERE account_id=?1 AND valid=1 AND archived=0",
+        [&account],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
     Ok(response(Overview {
         schema_version: 1,
         service_id: "openmgmt",
@@ -536,7 +553,35 @@ pub async fn overview(
             .into(),
         },
         availability: if invalid { "partial" } else { "available" },
+        metrics: vec![
+            Metric {
+                id: "task_count",
+                label: "Active tasks",
+                value: task_count.to_string(),
+                tone: "muted",
+                action: "open_openmgmt",
+            },
+            Metric {
+                id: "project_count",
+                label: "Active projects",
+                value: project_count.to_string(),
+                tone: "muted",
+                action: "open_openmgmt",
+            },
+        ],
         sections: vec![
+            Section {
+                id: "browse".into(),
+                title: "OpenMGMT".into(),
+                component: "action_rows",
+                items: vec![ItemRow {
+                    id: "browse".into(),
+                    title: "Browse tasks and projects".into(),
+                    subtitle: "View your account-owned synced items.".into(),
+                    status_label: String::new(),
+                    route: "services/openmgmt/items".into(),
+                }],
+            },
             Section {
                 id: "tasks".into(),
                 title: "Recent tasks".into(),
