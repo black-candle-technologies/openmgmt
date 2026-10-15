@@ -5,7 +5,9 @@ pub mod board;
 pub mod commands;
 #[cfg(feature = "native")]
 pub mod db;
+pub mod dispatch;
 pub mod models;
+pub use dispatch::{AgentState, RepoBinding, TaskAgent};
 pub mod scheduling;
 pub mod scoring;
 pub mod sync;

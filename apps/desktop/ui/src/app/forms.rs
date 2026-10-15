@@ -51,6 +51,7 @@ pub fn DrawerHost(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoVie
                         "Edit task".to_string(),
                         view! {
                             <TaskTimerPanel state now=now_sig task_id=panel_id status=panel_status time_limit_minutes=panel_limit />
+                            <super::dispatch::AgentSection state task=task.clone() />
                             <TaskForm state existing=task />
                         }.into_any(),
                     )

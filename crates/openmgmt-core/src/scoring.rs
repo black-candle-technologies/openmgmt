@@ -97,6 +97,7 @@ mod tests {
         let now = Utc::now();
         TaskContext {
             task: Task {
+                agent: None,
                 id: "task".into(),
                 project_id: "project".into(),
                 title: "Test".into(),

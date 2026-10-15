@@ -59,6 +59,7 @@ pub fn TaskTable(
 fn TaskRow(state: AppState, task: Task, project_name: String, show_project: bool) -> impl IntoView {
     let edit_task = task.clone();
     let title = task.title.clone();
+    let agent_pill = view! { <crate::app::dispatch::AgentPill task=task.clone() /> };
     let status = task.status.to_string();
     let priority = task.priority;
     let pinned = task.pinned;
@@ -77,7 +78,7 @@ fn TaskRow(state: AppState, task: Task, project_name: String, show_project: bool
             <span class="task-row-pri"><PriorityBadge value=priority /></span>
             <div class="task-row-main">
                 <button class="task-row-title" on:click=move |_| state.open_drawer(Drawer::EditTask(edit_task.clone()))>
-                    {title}
+                    {title}{agent_pill}
                 </button>
                 <div class="task-row-tags">
                     {pinned.then(|| view! { <Badge label="pinned" tone="ready" /> })}
@@ -153,6 +154,7 @@ fn QueryTaskRow(
     let edit_task = task.clone();
     let schedule_task = task.clone();
     let title = task.title.clone();
+    let agent_pill = view! { <crate::app::dispatch::AgentPill task=task.clone() /> };
     let status = task.status;
     let status_str = task.status.to_string();
     let priority = task.priority;
@@ -194,7 +196,7 @@ fn QueryTaskRow(
             <div class="qtask-main">
                 <button class="task-row-title" on:click=move |_| state.open_drawer(Drawer::EditTask(edit_task.clone()))>
                     {pinned.then(|| view! { <span class="qtask-pin" title="Pinned">"★ "</span> })}
-                    {title}
+                    {title}{agent_pill}
                 </button>
                 <div class="qtask-tags">
                     {scheduled_label.map(|label| view! { <span class="task-card-sched" title="Scheduled time">{"◷ "}{label}</span> })}
@@ -245,6 +247,7 @@ pub fn TaskCard(
 ) -> impl IntoView {
     let edit_task = task.clone();
     let title = task.title.clone();
+    let agent_pill = view! { <crate::app::dispatch::AgentPill task=task.clone() /> };
     let status = task.status.to_string();
     let priority = task.priority;
     let elapsed = task
@@ -269,7 +272,7 @@ pub fn TaskCard(
             <span class="task-card-pri"><PriorityBadge value=priority /></span>
             <div class="task-card-body">
                 <button class="task-card-title" on:click=move |_| state.open_drawer(Drawer::EditTask(edit_task.clone()))>
-                    {title}
+                    {title}{agent_pill}
                 </button>
                 <div class="task-card-meta">
                     <StatusBadge status />

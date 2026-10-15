@@ -1,5 +1,6 @@
 pub mod client;
 pub mod config;
+pub mod dispatch;
 pub mod error;
 pub mod http;
 pub mod oauth;

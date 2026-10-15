@@ -52,6 +52,7 @@ pub fn ProjectDetailPage(state: AppState, page: RwSignal<Page>, id: String) -> i
                         <PageHeader eyebrow=org_name.clone() title=title description=description>
                             <Button variant="ghost" on_click=Callback::new(move |_| state.open_drawer(Drawer::EditProject(edit_project.clone())))>"Edit project"</Button>
                         </PageHeader>
+                        <crate::app::dispatch::RepositoryBinding state project=project.clone() />
                         <section class="meta-grid">
                             <div class="meta-item"><span class="meta-label">"Organization"</span><span class="meta-value">{org_name}</span></div>
                             <div class="meta-item"><span class="meta-label">"Type"</span><span class="meta-value">{kind}</span></div>

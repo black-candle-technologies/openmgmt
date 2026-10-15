@@ -35,6 +35,7 @@ pub enum Page {
     Board,
     Sync,
     Settings,
+    AgentSession(String, String),
 }
 
 impl Page {
@@ -50,6 +51,7 @@ impl Page {
             Page::Board => "Board",
             Page::Sync => "Sync",
             Page::Settings => "Settings",
+            Page::AgentSession(_, _) => "Agent session",
         }
     }
 }

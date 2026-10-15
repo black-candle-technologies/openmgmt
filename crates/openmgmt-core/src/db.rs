@@ -347,11 +347,58 @@ impl Database {
               ON mcp_audit_log(called_at);
             "#,
         )?;
+        self.ensure_dispatch_columns()?;
         self.ensure_task_scheduling_columns()?;
         self.ensure_sync_event_ownership_columns()?;
         self.seed_system_saved_task_views()?;
         self.ensure_default_scoring_settings()?;
         Ok(())
+    }
+
+    fn ensure_dispatch_columns(&self) -> Result<()> {
+        let connection = self.connection()?;
+        for (table, column) in [("tasks", "agent_json"), ("projects", "repo_binding_json")] {
+            let columns = connection
+                .prepare(&format!("PRAGMA table_info({table})"))?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !columns.iter().any(|existing| existing == column) {
+                connection.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Local metadata is deliberately untouched by remote whole-record upserts.
+    pub fn set_task_agent(&self, id: &str, agent: &crate::TaskAgent) -> Result<()> {
+        changed(
+            self.connection()?.execute(
+                "UPDATE tasks SET agent_json=?2 WHERE id=?1",
+                params![
+                    id,
+                    serde_json::to_string(agent)
+                        .map_err(|e| CoreError::InvalidValue(e.to_string()))?
+                ],
+            )?,
+            "task",
+        )
+    }
+
+    pub fn set_repo_binding(&self, id: &str, binding: &crate::RepoBinding) -> Result<()> {
+        require_name(&binding.owner)?;
+        require_name(&binding.name)?;
+        require_name(&binding.default_branch)?;
+        changed(
+            self.connection()?.execute(
+                "UPDATE projects SET repo_binding_json=?2 WHERE id=?1",
+                params![
+                    id,
+                    serde_json::to_string(binding)
+                        .map_err(|e| CoreError::InvalidValue(e.to_string()))?
+                ],
+            )?,
+            "project",
+        )
     }
 
     fn ensure_task_scheduling_columns(&self) -> Result<()> {
@@ -490,7 +537,7 @@ impl Database {
               t.recurrence_rule,t.recurrence_anchor_at,t.recurrence_timezone,t.calendar_block_id,
               t.started_at,t.completed_at,t.estimated_minutes,t.time_limit_minutes,
               t.pinned,t.blocked_reason,t.tags,t.created_at,t.updated_at,
-              p.id,p.name,p.type,p.status,p.priority,o.id,o.name,o.color,o.icon
+              p.id,p.name,p.type,p.status,p.priority,o.id,o.name,o.color,o.icon,t.agent_json
              FROM tasks t JOIN projects p ON p.id=t.project_id
              JOIN organizations o ON o.id=p.organization_id
              WHERE p.archived_at IS NULL AND p.status != 'archived' AND o.archived_at IS NULL",
@@ -1036,7 +1083,7 @@ impl Database {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT p.id,p.organization_id,p.name,p.slug,p.description,p.type,p.status,p.priority,
-                    p.deadline,p.repo_url,p.notes,p.created_at,p.updated_at,p.archived_at
+                    p.deadline,p.repo_url,p.notes,p.created_at,p.updated_at,p.archived_at,p.repo_binding_json
              FROM projects p JOIN organizations o ON o.id=p.organization_id
              WHERE p.archived_at IS NULL AND p.status != 'archived' AND o.archived_at IS NULL
              ORDER BY p.priority ASC,p.name",
@@ -1064,6 +1111,7 @@ impl Database {
         validate_priority(input.priority)?;
         let now = Utc::now();
         let project = Project {
+            repo_binding: None,
             id: Uuid::new_v4().to_string(),
             organization_id: input.organization_id,
             slug: slugify(input.slug.as_deref().unwrap_or(&input.name)),
@@ -1205,7 +1253,7 @@ impl Database {
                     t.scheduled_at,t.scheduled_start_at,t.scheduled_end_at,t.deadline_at,
                     t.reminder_at,t.recurrence_rule,t.recurrence_anchor_at,t.recurrence_timezone,
                     t.calendar_block_id,t.started_at,t.completed_at,t.estimated_minutes,
-                    t.time_limit_minutes,t.pinned,t.blocked_reason,t.tags,t.created_at,t.updated_at
+                    t.time_limit_minutes,t.pinned,t.blocked_reason,t.tags,t.created_at,t.updated_at,t.agent_json
              FROM tasks t JOIN projects p ON p.id=t.project_id
              JOIN organizations o ON o.id=p.organization_id
              WHERE t.status != 'canceled' AND p.archived_at IS NULL
@@ -1231,6 +1279,7 @@ impl Database {
         validate_priority(input.priority)?;
         let now = Utc::now();
         let task = Task {
+            agent: None,
             id: Uuid::new_v4().to_string(),
             project_id: input.project_id,
             title: input.title,
@@ -2457,7 +2506,7 @@ impl Database {
 const TASK_SELECT: &str = "SELECT id,project_id,title,description,status,priority,due_at,
  scheduled_at,scheduled_start_at,scheduled_end_at,deadline_at,reminder_at,recurrence_rule,
  recurrence_anchor_at,recurrence_timezone,calendar_block_id,started_at,completed_at,
- estimated_minutes,time_limit_minutes,pinned,blocked_reason,tags,created_at,updated_at FROM tasks";
+ estimated_minutes,time_limit_minutes,pinned,blocked_reason,tags,created_at,updated_at,agent_json FROM tasks";
 
 fn get_or_create_device_id_with_connection(connection: &Connection) -> Result<String> {
     let now = timestamp(Utc::now());
@@ -2928,7 +2977,7 @@ fn get_project_with_connection(connection: &Connection, id: &str) -> Result<Proj
     connection
         .query_row(
             "SELECT id,organization_id,name,slug,description,type,status,priority,deadline,repo_url,
-                    notes,created_at,updated_at,archived_at FROM projects WHERE id=?1",
+                    notes,created_at,updated_at,archived_at,repo_binding_json FROM projects WHERE id=?1",
             [id],
             map_project,
         )
@@ -3080,6 +3129,18 @@ fn map_organization(row: &Row<'_>) -> rusqlite::Result<Organization> {
 
 fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
+        repo_binding: row
+            .get::<_, Option<String>>("repo_binding_json")?
+            .map(|s| {
+                serde_json::from_str(&s).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        14,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            })
+            .transpose()?,
         id: row.get(0)?,
         organization_id: row.get(1)?,
         name: row.get(2)?,
@@ -3100,6 +3161,18 @@ fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
 fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let tags: String = row.get(22)?;
     Ok(Task {
+        agent: row
+            .get::<_, Option<String>>("agent_json")?
+            .map(|s| {
+                serde_json::from_str(&s).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        25,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            })
+            .transpose()?,
         id: row.get(0)?,
         project_id: row.get(1)?,
         title: row.get(2)?,
@@ -4305,6 +4378,7 @@ mod tests {
     fn remote_project(id: &str, organization_id: &str) -> Project {
         let now = Utc::now();
         Project {
+            repo_binding: None,
             id: id.into(),
             organization_id: organization_id.into(),
             name: "Remote Project".into(),
@@ -4325,6 +4399,7 @@ mod tests {
     fn remote_task(id: &str, project_id: &str) -> Task {
         let now = Utc::now();
         Task {
+            agent: None,
             id: id.into(),
             project_id: project_id.into(),
             title: "Remote Task".into(),

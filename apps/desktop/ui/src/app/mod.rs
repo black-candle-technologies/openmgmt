@@ -3,6 +3,7 @@
 
 pub mod board;
 pub mod components;
+pub mod dispatch;
 pub mod forms;
 pub mod pages;
 pub mod records;
@@ -101,6 +102,7 @@ pub fn App() -> impl IntoView {
     auto_start_tick.forget();
 
     let page = RwSignal::new(Page::Dashboard);
+    provide_context(page);
     view! {
         <div class="app-shell">
             <Sidebar state page />
@@ -117,6 +119,7 @@ pub fn App() -> impl IntoView {
                         Page::Tasks => view! { <pages::TasksPage state now /> }.into_any(),
                         Page::Schedule => view! { <pages::SchedulePage state now /> }.into_any(),
                         Page::Board => view! { <pages::BoardPage state now /> }.into_any(),
+                        Page::AgentSession(task_id, id) => view! { <dispatch::AgentSession state task_id id /> }.into_any(),
                         Page::Sync => view! { <pages::SyncPage /> }.into_any(),
                         Page::Settings => view! { <pages::SettingsPage state /> }.into_any(),
                     }}

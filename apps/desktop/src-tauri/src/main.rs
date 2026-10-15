@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod dispatch;
 
 use openmgmt_core::{AppService, Database, default_database_path};
 use std::{
@@ -24,6 +25,10 @@ fn main() {
         .manage(AppService::new(database))
         .manage(commands::SyncRuntimeState::default())
         .invoke_handler(tauri::generate_handler![
+            dispatch::dispatch_settings,
+            dispatch::dispatch_signed_in,
+            dispatch::bind_repository,
+            dispatch::dispatch_request,
             commands::list_organizations,
             commands::create_organization,
             commands::update_organization,
