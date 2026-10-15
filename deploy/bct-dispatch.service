@@ -1,0 +1,19 @@
+[Unit]
+Description=OpenMGMT Dispatch API
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/bct/openmgmt-dispatch
+EnvironmentFile=/etc/bct/dispatch.env
+ExecStart=/opt/bct/openmgmt-dispatch/openmgmt-dispatch
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
