@@ -1283,12 +1283,18 @@ input, select, textarea, .form-field input, .filter-control input, .filter-contr
   --agent-done-bg: #E7DDF2; --agent-done-ink: #5B4390;
   --agent-failed-bg: #F6D9D6; --agent-failed-ink: #8D302B;
 }
-[data-theme="dark"], .tv-board, .board-preview {
+[data-theme="dark"], .tv-board, .board-surface {
   --agent-running-bg: #203323; --agent-running-ink: #A5D695;
   --agent-input-bg: #392C15; --agent-input-ink: #E0A52E;
   --agent-pr-bg: #1E2C42; --agent-pr-ink: #9EBFF6;
   --agent-done-bg: #30243D; --agent-done-ink: #C5A8E8;
   --agent-failed-bg: #3A1713; --agent-failed-ink: #F39D96;
+}
+.board-surface, .tv-board {
+  --surface: var(--board-surface); --surface-2: var(--board-surface-2);
+  --surface-sunken: var(--board-surface-2); --line: var(--board-line);
+  --text: var(--board-text); --text-soft: var(--board-text); --text-muted: var(--board-text-muted);
+  --primary: var(--lime); --on-primary: var(--charcoal);
 }
 .agent-pill { display: inline-block; margin-inline: 6px; padding: 3px 8px; border-radius: var(--radius-pill); font: 500 11px var(--font); background: var(--surface-2); color: var(--text-soft); }
 .agent-Running { background: var(--agent-running-bg); color: var(--agent-running-ink); }
@@ -1303,6 +1309,12 @@ input, select, textarea, .form-field input, .filter-control input, .filter-contr
 .open-count b { font: 600 32px var(--mono); color: var(--text); }
 .priority { padding: 3px; background: transparent; }
 summary { cursor: pointer; padding-block: 12px; font-weight: 600; }
+[hidden] { display: none !important; }
+.topbar-search { width: clamp(130px, 16vw, 240px); border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; }
+.sched-slot { position: relative; }
+.sched-now-line { position: absolute; left: 0; right: 0; border-top: 1px solid var(--primary); z-index: 2; pointer-events: none; }
+.sched-now-line span { position: absolute; right: 0; top: -10px; font: 600 10px var(--font); color: var(--on-primary); background: var(--primary); padding: 2px 5px; border-radius: 4px; }
+.sync-account-panel { margin-block: 18px; }
 .panel { border-radius: 14px; }
 .metric-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .filter-bar { flex-wrap: wrap; }

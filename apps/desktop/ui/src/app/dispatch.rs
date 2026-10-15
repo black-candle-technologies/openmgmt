@@ -56,16 +56,24 @@ pub fn RepositoryBinding(state: AppState, project: Project) -> impl IntoView {
     }
 }
 #[component]
+pub fn AgentRowAction(state: AppState, task: Task) -> impl IntoView {
+    let signed_in = expect_context::<AccountStatus>().0;
+    let page = expect_context::<RwSignal<Page>>();
+    let task = StoredValue::new(task);
+    view! {
+        <button class="btn btn-ghost" hidden=move || !signed_in.get() on:click=move |_| {
+            let task = task.get_value();
+            if let Some(agent) = &task.agent {
+                page.set(Page::AgentSession(task.id.clone(), agent.dispatch_id.clone()));
+            } else { state.open_drawer(Drawer::EditTask(task)); }
+        }>{if task.get_value().agent.is_some() { "Agent session" } else { "Dispatch agent" }}</button>
+    }
+}
+
+#[component]
 pub fn AgentSection(state: AppState, task: Task) -> impl IntoView {
     let page = expect_context::<RwSignal<Page>>();
-    let signed_in = RwSignal::new(false);
-    spawn_local(async move {
-        signed_in.set(
-            invoke::<bool>("dispatch_signed_in", json!({}))
-                .await
-                .unwrap_or(false),
-        );
-    });
+    let signed_in = expect_context::<AccountStatus>().0;
     let task = StoredValue::new(task);
     let composing = RwSignal::new(false);
     let busy = RwSignal::new(false);
@@ -141,7 +149,7 @@ pub fn AgentSection(state: AppState, task: Task) -> impl IntoView {
                     <button class="btn btn-subtle" disabled=move || !has_repo.get() || busy.get() on:click=move |_| generate.run(())>"Dispatch agent"</button>
                 }.into_any()
             }}
-            {move || composing.get().then(|| view! {
+            {move || (composing.get() && signed_in.get()).then(|| view! {
                 <div role="dialog" aria-label="Compose agent dispatch" aria-busy=move || busy.get()>
                     {move || busy.get().then(|| view! { <p class="skeleton">"Drafting with MiniMax M3…"</p> })}
                     <textarea aria-label="Dispatch prompt" rows="10" prop:value=move || prompt.get() on:input=move |e| prompt.set(event_target_value(&e)) />
@@ -154,7 +162,14 @@ pub fn AgentSection(state: AppState, task: Task) -> impl IntoView {
                         spawn_local(async move {
                             let t = task.get_value();
                             match request("dispatch", &t.id, None, json!({"prompt": prompt.get_untracked(), "model": model.get_untracked()})).await {
-                                Ok(_) => { state.reload().await; state.close_drawer(); state.notice.set(Some("Agent dispatched.".into())); }
+                                Ok(_) => {
+                                    state.reload().await;
+                                    let refreshed = state.snapshot.get_untracked().tasks.into_iter().find(|row| row.id == t.id);
+                                    busy.set(false);
+                                    state.notice.set(Some("Agent dispatched.".into()));
+                                    if let Some(task) = refreshed { state.open_drawer(Drawer::EditTask(task)); }
+                                    return;
+                                }
                                 Err(e) => error.set(Some(e)),
                             }
                             busy.set(false);

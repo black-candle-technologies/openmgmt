@@ -212,6 +212,7 @@ fn QueryTaskRow(
             <span class="qtask-project">{project_name}</span>
             <span class="qtask-due">{due_label}</span>
             <span class="qtask-timer qtask-timer-col">
+                <crate::app::dispatch::AgentRowAction state task=task.clone() />
                 {can_schedule.then(|| view! {
                     <button class="btn btn-subtle qtask-schedule" type="button" title="Schedule this task" on:click=move |_| {
                         schedule_target.set(Some(schedule_task.clone()));

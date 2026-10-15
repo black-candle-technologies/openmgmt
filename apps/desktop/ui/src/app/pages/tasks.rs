@@ -20,6 +20,11 @@ pub fn TasksPage(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoView
     // One struct signal so a saved-view preset can set every control at once and
     // the query effect tracks a single dependency.
     let filter = RwSignal::new(TaskFilterState::all_active());
+    let search = expect_context::<GlobalSearch>();
+    Effect::new(move |_| {
+        let text = search.0.get();
+        filter.update(|f| f.text = text);
+    });
     let active_view = RwSignal::new(Some("all-tasks".to_string()));
 
     // Saved views from the backend; falls back to known system presets while

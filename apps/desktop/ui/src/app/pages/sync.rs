@@ -13,6 +13,7 @@ struct SyncViewState {
     settings: RwSignal<Option<SyncSettings>>,
     status: RwSignal<Option<SyncStatus>>,
     enabled: RwSignal<bool>,
+    signed_in: RwSignal<bool>,
     server_url: RwSignal<String>,
     device_name: RwSignal<String>,
     loading: RwSignal<bool>,
@@ -28,6 +29,7 @@ impl SyncViewState {
             settings: RwSignal::new(None),
             status: RwSignal::new(None),
             enabled: RwSignal::new(false),
+            signed_in: expect_context::<crate::app::state::AccountStatus>().0,
             server_url: RwSignal::new(String::new()),
             device_name: RwSignal::new(String::new()),
             loading: RwSignal::new(true),
@@ -46,6 +48,7 @@ impl SyncViewState {
 
     async fn reload(self) {
         self.loading.set(true);
+        self.reload_account().await;
         let settings = api::get_sync_settings().await;
         let status = api::get_sync_status().await;
         match settings {
@@ -69,7 +72,17 @@ impl SyncViewState {
         self.loading.set(false);
     }
 
+    async fn reload_account(self) {
+        match crate::app::state::invoke::<bool>("dispatch_signed_in", serde_json::json!({})).await {
+            Ok(signed_in) => self.signed_in.set(signed_in),
+            Err(error) => self
+                .error
+                .set(Some(format!("Could not read account state: {error}"))),
+        }
+    }
+
     async fn reload_status(self) {
+        self.reload_account().await;
         match api::get_sync_status().await {
             Ok(status) => self.status.set(Some(status)),
             Err(error) => self
@@ -200,6 +213,7 @@ pub fn SyncPage() -> impl IntoView {
                 }
                 Err(error) => state.error.set(Some(format!("Sign-out failed: {error}"))),
             }
+            state.reload_account().await;
             state.finish_action();
         });
     };
@@ -249,6 +263,16 @@ pub fn SyncPage() -> impl IntoView {
             </div>
         })}
 
+        <Panel class="sync-account-panel">
+            <h2>"Account"</h2>
+            <p>{move || if state.signed_in.get() { "Signed in to Black Candle" } else { "Signed out — sign in to sync and dispatch agents." }}</p>
+            <button class="btn btn-primary" hidden=move || state.signed_in.get() disabled=move || state.action.get().is_some() on:click=move |_| sign_in()>
+                {move || if state.action.get() == Some("signin") { "Waiting for browser…" } else { "Sign in" }}
+            </button>
+            <button class="btn btn-ghost" hidden=move || !state.signed_in.get() disabled=move || state.action.get().is_some() on:click=move |_| sign_out()>
+                {move || if state.action.get() == Some("signout") { "Signing out…" } else { "Sign out" }}
+            </button>
+        </Panel>
         <div class="sync-layout">
             <Panel class="sync-config-panel">
                 <div class="sync-panel-head">
@@ -376,22 +400,9 @@ pub fn SyncPage() -> impl IntoView {
                         {move || if state.action.get() == Some("test") { "Testing…" } else { "Test connection" }}
                     </button>
                     <button
-                        class="btn btn-ghost"
-                        disabled=move || state.action.get().is_some()
-                        on:click=move |_| sign_in()
-                    >
-                        {move || if state.action.get() == Some("signin") { "Waiting for browser…" } else { "Sign in" }}
-                    </button>
-                    <button
-                        class="btn btn-ghost"
-                        disabled=move || state.action.get().is_some()
-                        on:click=move |_| sign_out()
-                    >
-                        {move || if state.action.get() == Some("signout") { "Signing out…" } else { "Sign out" }}
-                    </button>
-                    <button
                         class="btn btn-primary"
                         disabled=move || state.action.get().is_some()
+                        title=move || if state.signed_in.get() { "Sync this device" } else { "Sign in or configure a server token to sync" }
                         on:click=move |_| sync()
                     >
                         {move || if state.action.get() == Some("sync") { "Syncing…" } else { "Sync now" }}

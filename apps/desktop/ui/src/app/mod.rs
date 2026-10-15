@@ -107,6 +107,8 @@ pub fn App() -> impl IntoView {
 
     let page = RwSignal::new(Page::Dashboard);
     provide_context(page);
+    provide_context(GlobalSearch(RwSignal::new(String::new())));
+    provide_context(AccountStatus(RwSignal::new(false)));
     view! {
         <div class="app-shell">
             <Sidebar state page />
@@ -138,7 +140,17 @@ pub fn App() -> impl IntoView {
 
 #[component]
 fn Sidebar(state: AppState, page: RwSignal<Page>) -> impl IntoView {
-    let _ = state;
+    let signed_in = expect_context::<AccountStatus>().0;
+    Effect::new(move |_| {
+        let _ = state.synced_at.get();
+        spawn_local(async move {
+            signed_in.set(
+                invoke::<bool>("dispatch_signed_in", json!({}))
+                    .await
+                    .unwrap_or(false),
+            );
+        });
+    });
     view! {
         <aside class="sidebar">
             <div class="brand">
@@ -161,6 +173,7 @@ fn Sidebar(state: AppState, page: RwSignal<Page>) -> impl IntoView {
             </nav>
             <div class="sidebar-foot">
                 <span class="local-dot"><i></i>"Local database"</span>
+                <button class="nav-button" on:click=move |_| page.set(Page::Sync)>{move || if signed_in.get() { "Black Candle account →" } else { "Sign in →" }}</button>
             </div>
         </aside>
     }
@@ -190,6 +203,7 @@ fn NavButton(label: &'static str, target: Page, page: RwSignal<Page>) -> impl In
 
 #[component]
 fn TopBar(state: AppState, page: RwSignal<Page>) -> impl IntoView {
+    let search = expect_context::<GlobalSearch>();
     view! {
         <header class="topbar">
             <div class="topbar-lead">
@@ -200,11 +214,12 @@ fn TopBar(state: AppState, page: RwSignal<Page>) -> impl IntoView {
                     } else if state.error.get().is_some() {
                         view! { <span class="status-pill status-pill-error">"Error"</span> }.into_any()
                     } else {
-                        view! { <span class="status-pill status-pill-ok">"Up to date"</span> }.into_any()
+                        view! { <span class="status-pill status-pill-ok">{state.synced_at.get().map(|at| format!("Updated {} UTC", at.format("%H:%M"))).unwrap_or_else(|| "Ready".into())}</span> }.into_any()
                     }}
                 </span>
             </div>
             <div class="topbar-actions">
+                <input class="topbar-search" type="search" aria-label="Search tasks" placeholder="Search tasks…" prop:value=move || search.0.get() on:input=move |e| search.0.set(event_target_value(&e)) on:keydown=move |e| { if e.key() == "Enter" { page.set(Page::Tasks); } } />
                 <theme::ThemeToggle />
                 <button class="btn btn-ghost" title="Refresh" aria-label="Refresh" on:click=move |_| state.refresh()>"↻"</button>
                 <Button variant="ghost" on_click=Callback::new(move |_| {

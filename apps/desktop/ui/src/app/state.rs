@@ -22,6 +22,12 @@ extern "C" {
     fn tauri_invoke(command: &str, args: JsValue) -> Result<js_sys::Promise, JsValue>;
 }
 
+#[derive(Clone, Copy)]
+pub struct GlobalSearch(pub RwSignal<String>);
+
+#[derive(Clone, Copy)]
+pub struct AccountStatus(pub RwSignal<bool>);
+
 /// Top-level workspace sections shown in the sidebar.
 #[derive(Clone, PartialEq)]
 pub enum Page {
