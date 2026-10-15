@@ -117,7 +117,6 @@ pub fn QueryTaskTable(
                 <span>"ORG"</span>
                 <span>"PROJECT"</span>
                 <span>"DUE"</span>
-                <span class="qtask-urg-col">"URG"</span>
                 <span class="qtask-timer-col">"TIMER"</span>
             </div>
             {move || {
@@ -187,7 +186,6 @@ fn QueryTaskRow(
         .clone()
         .unwrap_or_else(|| "#7c867c".into());
     let project_name = row.project_name.clone();
-    let urgency = row.urgency_score;
     let can_cancel = !matches!(status, TaskStatus::Canceled);
 
     view! {
@@ -211,7 +209,6 @@ fn QueryTaskRow(
             </span>
             <span class="qtask-project">{project_name}</span>
             <span class="qtask-due">{due_label}</span>
-            <span class="qtask-urgency qtask-urg-col" title="Urgency score">{urgency}</span>
             <span class="qtask-timer qtask-timer-col">
                 {can_schedule.then(|| view! {
                     <button class="btn btn-subtle qtask-schedule" type="button" title="Schedule this task" on:click=move |_| {

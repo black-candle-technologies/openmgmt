@@ -9,8 +9,8 @@ pub mod records;
 pub mod schedule_modal;
 pub mod state;
 pub mod tags;
-pub mod timer;
 pub mod theme;
+pub mod timer;
 pub mod views;
 
 use chrono::Utc;

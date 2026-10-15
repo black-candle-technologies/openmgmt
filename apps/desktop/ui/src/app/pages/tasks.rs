@@ -2,8 +2,6 @@
 //! backend `query_tasks` command. Results carry organization, urgency score, and
 //! live timer state, rendered by `QueryTaskTable`.
 
-use std::collections::BTreeSet;
-
 use chrono::{DateTime, Utc};
 use leptos::prelude::*;
 use openmgmt_core::{SavedTaskView, TaskWithContext};
@@ -74,19 +72,6 @@ pub fn TasksPage(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoView
     let loading_sig = Signal::derive(move || querying.get());
     let result_count = Signal::derive(move || results.get().len());
 
-    // Distinct tags in use, for the tag filter.
-    let all_tags = Signal::derive(move || {
-        state
-            .snapshot
-            .get()
-            .tasks
-            .iter()
-            .flat_map(|task| task.tags.iter().cloned())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
-    });
-
     // The view-strip chips: backend saved views when present, else presets.
     let view_chips = Signal::derive(move || {
         let backend = saved_views.get();
@@ -142,57 +127,6 @@ pub fn TasksPage(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoView
                 />
             </label>
             <label class="filter-control">
-                <span>"Sort by"</span>
-                <select
-                    prop:value=move || filter.get().sort_field
-                    on:change=move |event| {
-                        let value = event_target_value(&event);
-                        filter.update(|f| f.sort_field = value);
-                        active_view.set(None);
-                    }
-                >
-                    <option value="urgency">"Urgency"</option>
-                    <option value="priority">"Priority"</option>
-                    <option value="due_at">"Due date"</option>
-                    <option value="status">"Status"</option>
-                    <option value="project">"Project"</option>
-                    <option value="organization">"Organization"</option>
-                </select>
-            </label>
-            <label class="filter-control">
-                <span>"Order"</span>
-                <select
-                    prop:value=move || if filter.get().sort_desc { "desc" } else { "asc" }
-                    on:change=move |event| {
-                        let desc = event_target_value(&event) == "desc";
-                        filter.update(|f| f.sort_desc = desc);
-                        active_view.set(None);
-                    }
-                >
-                    <option value="desc">"Descending"</option>
-                    <option value="asc">"Ascending"</option>
-                </select>
-            </label>
-        </div>
-
-        <div class="filter-bar">
-            <label class="filter-control">
-                <span>"Organization"</span>
-                <select
-                    prop:value=move || filter.get().organization_id
-                    on:change=move |event| {
-                        let value = event_target_value(&event);
-                        filter.update(|f| f.organization_id = value);
-                        active_view.set(None);
-                    }
-                >
-                    <option value="">"All organizations"</option>
-                    {move || state.snapshot.get().organizations.into_iter().map(|item| view! {
-                        <option value=item.id>{item.name}</option>
-                    }).collect_view()}
-                </select>
-            </label>
-            <label class="filter-control">
                 <span>"Project"</span>
                 <select
                     prop:value=move || filter.get().project_id
@@ -238,64 +172,7 @@ pub fn TasksPage(state: AppState, now: RwSignal<DateTime<Utc>>) -> impl IntoView
                     {(1..=5).map(|value| view! { <option value=value.to_string()>{format!("P{value}")}</option> }).collect_view()}
                 </select>
             </label>
-            <label class="filter-control">
-                <span>"Due"</span>
-                <select
-                    prop:value=move || filter.get().due_window
-                    on:change=move |event| {
-                        let value = event_target_value(&event);
-                        filter.update(|f| f.due_window = value);
-                        active_view.set(None);
-                    }
-                >
-                    <option value="">"Any time"</option>
-                    <option value="overdue">"Overdue"</option>
-                    <option value="today">"Due today"</option>
-                    <option value="soon">"Due soon (24h)"</option>
-                    <option value="week">"This week"</option>
-                </select>
-            </label>
-            <label class="filter-control">
-                <span>"Tag"</span>
-                <select
-                    prop:value=move || filter.get().tag
-                    on:change=move |event| {
-                        let value = event_target_value(&event);
-                        filter.update(|f| f.tag = value);
-                        active_view.set(None);
-                    }
-                >
-                    <option value="">"All tags"</option>
-                    {move || all_tags.get().into_iter().map(|tag| {
-                        let value = tag.clone();
-                        view! { <option value=value>{tag}</option> }
-                    }).collect_view()}
-                </select>
-            </label>
-            <label class="filter-check">
-                <input
-                    type="checkbox"
-                    prop:checked=move || filter.get().pinned_only
-                    on:change=move |event| {
-                        let checked = event_target_checked(&event);
-                        filter.update(|f| f.pinned_only = checked);
-                        active_view.set(None);
-                    }
-                />
-                <span>"Pinned"</span>
-            </label>
-            <label class="filter-check">
-                <input
-                    type="checkbox"
-                    prop:checked=move || filter.get().include_done
-                    on:change=move |event| {
-                        let checked = event_target_checked(&event);
-                        filter.update(|f| f.include_done = checked);
-                        active_view.set(None);
-                    }
-                />
-                <span>"Include done"</span>
-            </label>
+            <button class="btn btn-ghost" on:click=move |_| { filter.set(TaskFilterState::all_active()); active_view.set(None); }>"Clear"</button>
         </div>
 
         <Panel>

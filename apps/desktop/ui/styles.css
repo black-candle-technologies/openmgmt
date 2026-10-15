@@ -793,7 +793,7 @@ a { color: inherit; }
 .qtask-table { display: flex; flex-direction: column; }
 .qtask-row {
   display: grid;
-  grid-template-columns: 44px minmax(0, 1fr) 104px 132px 128px 132px 50px minmax(216px, auto);
+  grid-template-columns: 44px minmax(0, 1fr) 104px 132px 128px 132px minmax(216px, auto);
   align-items: center; gap: 12px; padding: 11px 6px; border-bottom: 1px solid var(--line);
 }
 .qtask-row:last-child { border-bottom: 0; }
