@@ -24,8 +24,12 @@ impl ReleaseManifest {
         for file in &manifest.files {
             if !["macos", "windows", "linux"].contains(&file.platform.as_str())
                 || file.name.is_empty()
-                || file.name.contains(['/', '\\'])
+                || file
+                    .name
+                    .contains(['/', '\\', ':', '<', '>', '"', '|', '?', '*'])
+                || file.name.chars().any(char::is_control)
                 || file.name.starts_with('.')
+                || file.name.ends_with(['.', ' '])
                 || file.sha256.len() != 64
                 || !file.sha256.bytes().all(|b| b.is_ascii_hexdigit())
             {
@@ -59,6 +63,29 @@ mod tests {
         assert!(m.newer_file("macos", "aarch64", 103).is_none());
         assert!(m.newer_file("windows", "x86_64", 0).is_none());
     }
+    #[test]
+    fn rejects_nonportable_installer_names() {
+        let mut value: serde_json::Value = serde_json::from_slice(&manifest(102)).unwrap();
+        for name in [
+            "../installer.exe",
+            "dir\\installer.exe",
+            "installer.exe:payload",
+            "installer\0.exe",
+            "installer\n.exe",
+            "installer?.exe",
+            "installer.exe.",
+            "installer.exe ",
+        ] {
+            value["files"][0]["name"] = name.into();
+            assert!(
+                ReleaseManifest::parse(&serde_json::to_vec(&value).unwrap()).is_err(),
+                "accepted unsafe installer name {name:?}"
+            );
+        }
+        value["files"][0]["name"] = "OpenMgmt_0.2.0_x64-setup.exe".into();
+        assert!(ReleaseManifest::parse(&serde_json::to_vec(&value).unwrap()).is_ok());
+    }
+
     #[test]
     fn invalid_manifests_fail_closed() {
         for bytes in [
