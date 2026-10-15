@@ -10,6 +10,7 @@ pub mod schedule_modal;
 pub mod state;
 pub mod tags;
 pub mod timer;
+pub mod theme;
 pub mod views;
 
 use chrono::Utc;
@@ -54,6 +55,7 @@ async fn run_auto_start(state: AppState) {
 
 #[component]
 pub fn App() -> impl IntoView {
+    theme::initialize();
     let board_only = is_board_window();
     let state = AppState::new();
     let now = RwSignal::new(Utc::now());
@@ -195,15 +197,16 @@ fn TopBar(state: AppState, page: RwSignal<Page>) -> impl IntoView {
                 </span>
             </div>
             <div class="topbar-actions">
-                <Button variant="ghost" on_click=Callback::new(move |_| state.refresh())>"Refresh"</Button>
-                <Button variant="primary" on_click=Callback::new(move |_| {
+                <theme::ThemeToggle />
+                <button class="btn btn-ghost" title="Refresh" aria-label="Refresh" on:click=move |_| state.refresh()>"↻"</button>
+                <Button variant="ghost" on_click=Callback::new(move |_| {
                     spawn_local(async move {
                         match invoke::<()>("open_tv_board_window", serde_json::json!({})).await {
                             Ok(_) => state.notice.set(Some("TV board opened.".into())),
                             Err(error) => state.fail("Could not open TV board", error),
                         }
                     });
-                })>"Open TV Board"</Button>
+                })><span title="Open TV board" aria-label="Open TV board">"▣"</span></Button>
             </div>
         </header>
     }
