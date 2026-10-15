@@ -119,12 +119,15 @@ impl Registry {
         Ok(())
     }
     pub fn all(&self) -> Result<Vec<Dispatch>> {
+        self.query("ORDER BY created_at DESC, rowid DESC", [])
+    }
+    fn query(&self, clause: &str, params: impl rusqlite::Params) -> Result<Vec<Dispatch>> {
         let c = self
             .0
             .lock()
             .map_err(|_| anyhow::anyhow!("registry lock"))?;
-        let mut stmt = c.prepare("SELECT dispatch_id,owner_sub,task_id,project_id,repo,branch,prompt,provider,model,state,pi_job_id,pr_url,activity,created_at,updated_at FROM dispatches ORDER BY created_at DESC, rowid DESC")?;
-        let rows = stmt.query_map([], |r| {
+        let mut stmt = c.prepare(&format!("SELECT dispatch_id,owner_sub,task_id,project_id,repo,branch,prompt,provider,model,state,pi_job_id,pr_url,activity,created_at,updated_at FROM dispatches {clause}"))?;
+        let rows = stmt.query_map(params, |r| {
             Ok(Dispatch {
                 dispatch_id: r.get(0)?,
                 owner_sub: r.get(1)?,
@@ -164,9 +167,18 @@ impl Registry {
         Ok(result)
     }
     pub fn owned(&self, id: &str, owner: &str) -> Result<Dispatch> {
-        self.all()?
+        self.query("WHERE dispatch_id=?1 AND owner_sub=?2", params![id, owner])?
             .into_iter()
-            .find(|d| d.dispatch_id == id && d.owner_sub == owner)
+            .next()
             .context("dispatch not found")
+    }
+    pub fn latest_by_task(&self, owner: &str, task: &str) -> Result<Option<Dispatch>> {
+        Ok(self
+            .query(
+                "WHERE owner_sub=?1 AND task_id=?2 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![owner, task],
+            )?
+            .into_iter()
+            .next())
     }
 }

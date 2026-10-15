@@ -176,9 +176,7 @@ async fn latest(
 ) -> ApiResult {
     let d = app
         .db
-        .all()?
-        .into_iter()
-        .find(|d| d.owner_sub == owner && d.input.task_id == q.task_id)
+        .latest_by_task(&owner, &q.task_id)?
         .ok_or(ApiError(StatusCode::NOT_FOUND))?;
     Ok(Json(serde_json::to_value(d).map_err(anyhow::Error::from)?))
 }
@@ -203,7 +201,10 @@ async fn message(
         .as_str()
         .or_else(|| status["status"].as_str())
         .unwrap_or("");
-    if ["queued", "starting", "running"].contains(&state) {
+    if matches!(
+        map_state(state, false),
+        Some("dispatched" | "running" | "needs_input")
+    ) {
         app.cp
             .call(
                 "resume",
@@ -211,7 +212,7 @@ async fn message(
             )
             .await?;
         app.db.save(&mut d, "running", "Follow-up sent", None)?;
-    } else if ["done", "failed", "cancelled", "interrupted-past-deadline"].contains(&state) {
+    } else if matches!(map_state(state, false), Some("done" | "failed")) {
         let summary = status["summary"]
             .as_str()
             .or_else(|| status["output"].as_str())
@@ -267,11 +268,41 @@ pub fn map_state(status: &str, has_pr: bool) -> Option<&'static str> {
     match status {
         "queued" | "starting" => Some("dispatched"),
         "running" => Some("running"),
+        "needs_input" | "needs-input" | "waiting_for_input" | "input_required" => {
+            Some("needs_input")
+        }
         "done" if has_pr => Some("pr_opened"),
         "done" => Some("done"),
-        "failed" | "cancelled" | "interrupted-past-deadline" => Some("failed"),
+        "failed"
+        | "cancelled"
+        | "interrupted-past-deadline"
+        | "timeout"
+        | "timed_out"
+        | "deadline_exceeded" => Some("failed"),
         _ => None,
     }
+}
+fn terminal_reason(status: &Value, state: &str) -> String {
+    let fallback = match state {
+        "cancelled" => return "Cancelled".into(),
+        "interrupted-past-deadline" | "timeout" | "timed_out" | "deadline_exceeded" => {
+            return "Deadline exceeded".into();
+        }
+        _ => "Pi job failed",
+    };
+    [
+        status["error"].as_str(),
+        status["error"]["message"].as_str(),
+        status["reason"].as_str(),
+        status["message"].as_str(),
+        status["summary"].as_str(),
+        status["output"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|s| !s.trim().is_empty())
+    .unwrap_or(fallback)
+    .to_owned()
 }
 pub fn activity(output: &str) -> String {
     output
@@ -290,7 +321,7 @@ pub async fn poll(app: &App) -> Result<()> {
         .db
         .all()?
         .into_iter()
-        .filter(|d| ["dispatched", "running"].contains(&d.state.as_str()))
+        .filter(|d| ["dispatched", "running", "needs_input"].contains(&d.state.as_str()))
     {
         let Some(job) = &d.pi_job_id else {
             d.activity =
@@ -313,14 +344,19 @@ pub async fn poll(app: &App) -> Result<()> {
             d.activity = latest_activity;
         }
         d.pr_url = extract_pr(output, &d.input.repo).or(d.pr_url);
-        if let Some(state) = map_state(
-            status["state"]
-                .as_str()
-                .or_else(|| status["status"].as_str())
-                .unwrap_or(""),
-            d.pr_url.is_some(),
-        ) {
-            app.db.save(&mut d, state, "Pi status updated", None)?;
+        let pi_state = status["state"]
+            .as_str()
+            .or_else(|| status["status"].as_str())
+            .unwrap_or("");
+        if let Some(state) = map_state(pi_state, d.pr_url.is_some()) {
+            let note = if state == "failed" {
+                let reason = terminal_reason(&status, pi_state);
+                d.activity = reason.clone();
+                reason
+            } else {
+                "Pi status updated".into()
+            };
+            app.db.save(&mut d, state, &note, None)?;
         }
     }
     Ok(())

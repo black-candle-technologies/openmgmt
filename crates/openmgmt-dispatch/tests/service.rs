@@ -358,6 +358,126 @@ async fn failed_start_and_restart_recovery() {
     assert_eq!(latest["dispatch_id"], d.dispatch_id);
 }
 
+#[tokio::test]
+async fn needs_input_lifecycle_and_resume() {
+    for key in ["state", "status"] {
+        for signal in [
+            "needs_input",
+            "needs-input",
+            "waiting_for_input",
+            "input_required",
+        ] {
+            let cp = Arc::new(FakeCpClient::default());
+            cp.replies.lock().unwrap().extend([
+                json!({key: signal}),
+                json!({key: signal}),
+                json!({"ok":true}),
+                json!({key:"done"}),
+            ]);
+            let app = app(Arc::new(Accept), cp.clone());
+            let mut d = app.db.create("alice".into(), input()).unwrap();
+            app.db
+                .save(&mut d, "running", "started", Some(("job-1", "initial")))
+                .unwrap();
+            poll(&app).await.unwrap();
+            let saved = app.db.owned(&d.dispatch_id, "alice").unwrap();
+            assert_eq!(saved.state, "needs_input");
+            assert_eq!(saved.events.last().unwrap().state, "needs_input");
+            let (status, body) = request(
+                app.clone(),
+                "POST",
+                &format!("/v1/dispatches/{}/messages", d.dispatch_id),
+                "alice",
+                json!({"text":"Use option A"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["state"], "running");
+            let calls = cp.calls.lock().unwrap().clone();
+            assert_eq!(calls[2].0, "resume");
+            assert_eq!(calls[2].1["job_id"], "job-1");
+            assert!(
+                calls[2].1["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Use option A")
+            );
+            // Waiting jobs must still be watched even without a follow-up.
+            app.db.save(&mut d, "needs_input", "waiting", None).unwrap();
+            poll(&app).await.unwrap();
+            assert_eq!(app.db.owned(&d.dispatch_id, "alice").unwrap().state, "done");
+        }
+    }
+}
+
+#[tokio::test]
+async fn polled_terminal_reasons_are_persisted() {
+    for (status, reason) in [
+        (
+            json!({"state":"cancelled","output":"stale progress"}),
+            "Cancelled",
+        ),
+        (
+            json!({"status":"interrupted-past-deadline"}),
+            "Deadline exceeded",
+        ),
+        (json!({"state":"timeout"}), "Deadline exceeded"),
+        (json!({"state":"timed_out"}), "Deadline exceeded"),
+        (json!({"state":"deadline_exceeded"}), "Deadline exceeded"),
+        (
+            json!({"state":"failed","error":"Worker crashed"}),
+            "Worker crashed",
+        ),
+        (
+            json!({"status":"failed","error":{"message":"Exit code 1"}}),
+            "Exit code 1",
+        ),
+        (
+            json!({"state":"failed","reason":"Provider unavailable"}),
+            "Provider unavailable",
+        ),
+        (
+            json!({"state":"failed","output":"Build failed"}),
+            "Build failed",
+        ),
+        (json!({"state":"failed"}), "Pi job failed"),
+    ] {
+        let cp = Arc::new(FakeCpClient::default());
+        cp.replies.lock().unwrap().push_back(status);
+        let app = app(Arc::new(Accept), cp.clone());
+        let mut d = app.db.create("alice".into(), input()).unwrap();
+        app.db
+            .save(&mut d, "running", "started", Some(("job-1", "initial")))
+            .unwrap();
+        poll(&app).await.unwrap();
+        let saved = app.db.owned(&d.dispatch_id, "alice").unwrap();
+        assert_eq!(saved.state, "failed");
+        assert_eq!(saved.activity, reason);
+        assert_eq!(saved.events.last().unwrap().note, reason);
+        poll(&app).await.unwrap();
+        assert_eq!(cp.calls.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn latest_lookup_is_owner_and_task_scoped() {
+    let db = Registry::open(":memory:").unwrap();
+    db.create("alice".into(), input()).unwrap();
+    let mut latest = db.create("alice".into(), input()).unwrap();
+    db.save(&mut latest, "running", "selected event", None)
+        .unwrap();
+    db.create("bob".into(), input()).unwrap();
+    let mut other_task = input();
+    other_task.task_id = "task-2".into();
+    db.create("alice".into(), other_task).unwrap();
+    let saved = db.latest_by_task("alice", "task-1").unwrap().unwrap();
+    assert_eq!(saved.dispatch_id, latest.dispatch_id);
+    assert_eq!(saved.events.len(), 2);
+    assert_eq!(saved.events.last().unwrap().note, "selected event");
+    assert!(db.latest_by_task("charlie", "task-1").unwrap().is_none());
+    assert!(db.latest_by_task("alice", "missing").unwrap().is_none());
+}
+
 #[test]
 fn cp_requires_https_without_url_credentials() {
     assert!(HttpCpClient::new("http://example.invalid", String::new()).is_err());
