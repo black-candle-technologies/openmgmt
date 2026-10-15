@@ -12,6 +12,7 @@ pub mod state;
 pub mod tags;
 pub mod theme;
 pub mod timer;
+pub mod updates;
 pub mod views;
 
 use chrono::Utc;
@@ -86,6 +87,8 @@ pub fn App() -> impl IntoView {
         .into_any();
     }
 
+    updates::Updates::initialize();
+
     // Main app: load the full snapshot and refresh it every 10s.
     state.refresh();
     let snapshot_refresh = Interval::new(10_000, move || state.refresh());
@@ -110,6 +113,7 @@ pub fn App() -> impl IntoView {
                 <TopBar state page />
                 <main class="app-content">
                     <Feedback state />
+                    <updates::UpdateBanner />
                     {move || match page.get() {
                         Page::Dashboard => view! { <pages::Dashboard state page /> }.into_any(),
                         Page::DailyOps => view! { <pages::DailyOpsPage state page now /> }.into_any(),

@@ -2896,10 +2896,13 @@ name = "openmgmt-desktop"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "open",
  "openmgmt-core",
  "openmgmt-sync-client",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tempfile",

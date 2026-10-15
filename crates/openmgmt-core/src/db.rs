@@ -1131,7 +1131,7 @@ impl Database {
         let transaction = connection.transaction()?;
         get_organization_with_connection(&transaction, &project.organization_id)?;
         transaction.execute(
-            "INSERT INTO projects VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            "INSERT INTO projects (id,organization_id,name,slug,description,type,status,priority,deadline,repo_url,notes,created_at,updated_at,archived_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 project.id,
                 project.organization_id,
@@ -2380,7 +2380,7 @@ impl Database {
             connection
                 .query_row(
                     "SELECT id,organization_id,name,slug,description,type,status,priority,deadline,
-                        repo_url,notes,created_at,updated_at,archived_at
+                        repo_url,notes,created_at,updated_at,archived_at,repo_binding_json
                  FROM projects WHERE organization_id=?1 AND slug='openmgmt'
                    AND archived_at IS NULL",
                     [&personal.id],

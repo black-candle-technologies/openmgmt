@@ -193,6 +193,9 @@ pub fn SettingsPage(state: AppState) -> impl IntoView {
             </details>
         </Section>
 
+        <crate::app::updates::UpdatesSettings />
+        <crate::app::updates::DispatchSettings />
+        <Section title="About"><p>{concat!("OpenMGMT ", env!("CARGO_PKG_VERSION"), " — local-first task management.")}</p></Section>
         <Section title="Data export & backup">
             <p class="settings-note">
                 "Exports download to your browser/webview downloads folder. The database backup writes a consistent SQLite snapshot to a path you choose."

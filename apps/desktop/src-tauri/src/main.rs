@@ -3,6 +3,7 @@
 
 mod commands;
 mod dispatch;
+mod updater;
 
 use openmgmt_core::{AppService, Database, default_database_path};
 use std::{
@@ -24,7 +25,11 @@ fn main() {
     tauri::Builder::default()
         .manage(AppService::new(database))
         .manage(commands::SyncRuntimeState::default())
+        .manage(updater::Updater::default())
         .invoke_handler(tauri::generate_handler![
+            updater::check_updates,
+            updater::updater_status,
+            updater::install_update,
             dispatch::dispatch_settings,
             dispatch::dispatch_signed_in,
             dispatch::bind_repository,
