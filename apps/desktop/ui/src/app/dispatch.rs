@@ -191,7 +191,14 @@ pub fn AgentSession(state: AppState, task_id: String, id: String) -> impl IntoVi
     let followup = RwSignal::new(String::new());
     let busy = RwSignal::new(false);
     let alive = RwSignal::new(true);
+    let refreshing = RwSignal::new(false);
     let refresh = Callback::new(move |_: ()| {
+        // The transport timeout exceeds the polling interval. Gate before spawning
+        // so overlapping reads cannot overwrite session data or persisted metadata.
+        if refreshing.get_untracked() {
+            return;
+        }
+        refreshing.set(true);
         spawn_local(async move {
             let result = request(
                 "get",
@@ -203,6 +210,7 @@ pub fn AgentSession(state: AppState, task_id: String, id: String) -> impl IntoVi
             if !alive.try_get().unwrap_or(false) {
                 return;
             }
+            refreshing.set(false);
             match result {
                 Ok(v) => {
                     data.set(v);

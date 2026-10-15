@@ -505,7 +505,7 @@ a { color: inherit; }
 .er-row > span { min-width: 0; }
 .er-head-row {
   position: sticky; top: 0; z-index: 2;
-  background: var(--text-soft); border-bottom: 1px solid var(--text-soft);
+  background: var(--board-surface-2); border-bottom: 1px solid var(--board-line);
 }
 .er-head-row span { font: 700 9px var(--font); letter-spacing: 0.1em; color: var(--board-text-muted); text-transform: uppercase; }
 .er-row-overdue { background: var(--overlay); }
@@ -515,7 +515,7 @@ a { color: inherit; }
 /* Full-width urgency band that introduces each grouped section. */
 .er-band {
   display: flex; align-items: center; gap: 9px; padding: 7px 14px;
-  background: var(--text-soft); border-top: 1px solid var(--board-line); border-bottom: 1px solid var(--board-line);
+  background: var(--board-surface-2); border-top: 1px solid var(--board-line); border-bottom: 1px solid var(--board-line);
   box-shadow: inset 3px 0 0 var(--band, var(--text-muted));
 }
 .er-band-dot { width: 9px; height: 9px; border-radius: 2px; background: var(--band, var(--board-text-muted)); }
@@ -827,11 +827,11 @@ a { color: inherit; }
   display: flex; align-items: center; justify-content: space-between; gap: 18px; flex-wrap: wrap;
 }
 .daily-hero-live { background: linear-gradient(120deg, var(--charcoal) 0%, var(--green-deep) 150%); color: var(--board-text); border: 1px solid var(--board-surface-2); }
-.daily-hero-idle { background: var(--board-text); border: 1px dashed var(--line-strong); color: var(--board-text-muted); }
+.daily-hero-idle { background: var(--surface); border: 1px dashed var(--line-strong); color: var(--text-muted); }
 .daily-hero-info { min-width: 0; }
 .daily-hero-label { font: 700 10px var(--font); letter-spacing: 0.14em; color: var(--lime); }
 .daily-hero-label-pause { color: var(--bucket-due); }
-.daily-hero-idle .daily-hero-label { color: var(--board-text-muted); }
+.daily-hero-idle .daily-hero-label { color: var(--text-muted); }
 .daily-hero-title { font-size: 20px; letter-spacing: -0.01em; margin: 6px 0 4px; color: var(--board-text); }
 .daily-hero-meta { display: flex; align-items: center; gap: 8px; color: var(--board-text-muted); font-size: 13px; }
 .daily-hero-dot { color: var(--board-text-muted); }
