@@ -9,10 +9,10 @@ use std::{
 };
 use tauri::{Manager, State};
 
-// App version is 0.1.0 in tauri.conf.json. Release engineering must increase this
-// monotonic code alongside future version changes and put that code in release.json.
-// Do not derive ordering from tag/semver strings or change versions in this PR.
-pub const UPDATE_VERSION_CODE: u64 = 100;
+// App version is 2026.10.1 in tauri.conf.json, with monotonic code 20261001.
+// Release engineering must increase this code alongside future version changes
+// and put the same code in release.json. Do not derive ordering from tag/semver strings.
+pub const UPDATE_VERSION_CODE: u64 = 20261001;
 const FEED: &str =
     "https://api.github.com/repos/black-candle-technologies/openmgmt/releases?per_page=10";
 const PREFIX: &str = "https://github.com/black-candle-technologies/openmgmt/releases/download/";

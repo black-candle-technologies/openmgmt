@@ -2879,7 +2879,7 @@ dependencies = [
 
 [[package]]
 name = "openmgmt-core"
-version = "0.1.0"
+version = "2026.10.1"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -2893,7 +2893,7 @@ dependencies = [
 
 [[package]]
 name = "openmgmt-desktop"
-version = "0.1.0"
+version = "2026.10.1"
 dependencies = [
  "chrono",
  "open",
@@ -2913,7 +2913,7 @@ dependencies = [
 
 [[package]]
 name = "openmgmt-dispatch"
-version = "0.1.0"
+version = "2026.10.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2933,7 +2933,7 @@ dependencies = [
 
 [[package]]
 name = "openmgmt-mcp"
-version = "0.1.0"
+version = "2026.10.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2951,7 +2951,7 @@ dependencies = [
 
 [[package]]
 name = "openmgmt-protocol"
-version = "0.1.0"
+version = "2026.10.1"
 dependencies = [
  "chrono",
  "openmgmt-core",
@@ -2965,7 +2965,7 @@ dependencies = [
 
 [[package]]
 name = "openmgmt-server"
-version = "0.1.0"
+version = "2026.10.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2988,7 +2988,7 @@ dependencies = [
 
 [[package]]
 name = "openmgmt-sync-client"
-version = "0.1.0"
+version = "2026.10.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -3011,7 +3011,7 @@ dependencies = [
 
 [[package]]
 name = "openmgmt-ui"
-version = "0.1.0"
+version = "2026.10.1"
 dependencies = [
  "chrono",
  "console_error_panic_hook",
