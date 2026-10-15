@@ -476,6 +476,7 @@ mod tests {
     fn remote_project_event(event_id: &str) -> SyncEvent {
         let now = chrono::Utc::now();
         let project = Project {
+            repo_binding: None,
             id: "remote-project".into(),
             organization_id: "remote-org".into(),
             name: "Remote Project".into(),
@@ -510,6 +511,7 @@ mod tests {
     fn remote_task_event(event_id: &str) -> SyncEvent {
         let now = chrono::Utc::now();
         let task = Task {
+            agent: None,
             id: "remote-task".into(),
             project_id: "remote-project".into(),
             title: "Remote Task".into(),
@@ -708,6 +710,7 @@ mod tests {
     async fn replay_failure_does_not_advance_checkpoint_and_records_error() {
         let now = chrono::Utc::now();
         let project = Project {
+            repo_binding: None,
             id: "remote-project".into(),
             organization_id: "missing-org".into(),
             name: "Remote Project".into(),

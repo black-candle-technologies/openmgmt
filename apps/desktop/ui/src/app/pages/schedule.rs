@@ -881,6 +881,10 @@ fn TodayTimeline(ctx: Sched) -> impl IntoView {
                                     }
                                     on:drop=move |ev| { ev.prevent_default(); ev.stop_propagation(); ctx.drop_at(&ev, ty, tmo, td, h); }
                                 >
+                                    {move || (local_ymd(ctx.now.get()) == (ty, tmo, td) && local_hour(ctx.now.get()) == h).then(|| {
+                                        let minute = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ctx.now.get().timestamp_millis() as f64)).get_minutes();
+                                        view! { <div class="sched-now-line" style=format!("top:{}%", minute as f64 / 60.0 * 100.0)><span>"NOW"</span></div> }
+                                    })}
                                     <span class="sched-slot-label">{hour_label(h)}</span>
                                     <div class="sched-slot-body">
                                         {if blocks.is_empty() {

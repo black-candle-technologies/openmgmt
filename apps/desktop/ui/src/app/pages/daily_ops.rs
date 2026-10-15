@@ -2,7 +2,7 @@
 //! timer hero sits above urgency/intent lenses (Now, Due Soon, Blocked,
 //! MVP/Launch, Pinned, Done Today), all backed by `query_tasks`.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use leptos::prelude::*;
 use openmgmt_core::{RecurrenceRule, TaskStatus, TaskWithContext};
 use serde_json::json;
@@ -105,29 +105,41 @@ pub fn DailyOpsPage(
             .cloned()
     });
 
-    let now_bucket = lens(filtered, now_sig, |row, _| {
+    // Exclusive precedence: timer/focus, blocked, overdue, scheduled.
+    let remaining = Signal::derive(move || {
+        let active_id = active_row.get().map(|r| r.task.id);
+        filtered
+            .get()
+            .into_iter()
+            .filter(|r| Some(&r.task.id) != active_id.as_ref())
+            .collect::<Vec<_>>()
+    });
+    let now_bucket = lens(remaining, now_sig, |row, _| {
         row.task.status == TaskStatus::InProgress
     });
-    let due_soon_bucket = lens(filtered, now_sig, |row, now| {
+    let overdue_bucket = lens(remaining, now_sig, |row, now| {
         is_active(row.task.status)
-            && !matches!(row.task.status, TaskStatus::Blocked | TaskStatus::Waiting)
+            && !matches!(
+                row.task.status,
+                TaskStatus::InProgress | TaskStatus::Blocked | TaskStatus::Waiting
+            )
+            && row.task.due_at.is_some_and(|at| at < now)
+    });
+    let scheduled_bucket = lens(remaining, now_sig, |row, now| {
+        is_active(row.task.status)
+            && !matches!(
+                row.task.status,
+                TaskStatus::InProgress | TaskStatus::Blocked | TaskStatus::Waiting
+            )
+            && !row.task.due_at.is_some_and(|at| at < now)
             && row
                 .task
-                .due_at
-                .is_some_and(|at| at >= now && at <= now + Duration::hours(24))
+                .scheduled_start_at
+                .or(row.task.scheduled_at)
+                .is_some_and(|at| at.date_naive() == now.date_naive())
     });
-    let blocked_bucket = lens(filtered, now_sig, |row, _| {
+    let blocked_bucket = lens(remaining, now_sig, |row, _| {
         matches!(row.task.status, TaskStatus::Blocked | TaskStatus::Waiting)
-    });
-    let tagged_bucket =
-        lens(filtered, now_sig, |row, _| {
-            is_active(row.task.status)
-                && row.task.tags.iter().any(|tag| {
-                    tag.eq_ignore_ascii_case("mvp") || tag.eq_ignore_ascii_case("launch")
-                })
-        });
-    let pinned_bucket = lens(filtered, now_sig, |row, _| {
-        row.task.pinned && is_active(row.task.status)
     });
     let done_today_bucket = lens(filtered, now_sig, |row, now| {
         row.task.status == TaskStatus::Done
@@ -143,7 +155,6 @@ pub fn DailyOpsPage(
             title="Daily Operations"
             description="The live desk for today: what's running, what's next, what's stuck, and what's done."
         >
-            <Button variant="ghost" on_click=Callback::new(move |_| state.refresh())>"Refresh"</Button>
             <Button variant="subtle" on_click=Callback::new(move |_| page.set(Page::Tasks))>"All tasks"</Button>
             <Button variant="primary" on_click=Callback::new(move |_| state.open_drawer(Drawer::CreateTask { project_id: None }))>"New task"</Button>
         </PageHeader>
@@ -173,11 +184,12 @@ pub fn DailyOpsPage(
 
         <div class="daily-grid">
             <OpsLens state title="Now" tone="now" rows=now_bucket now=now_sig queried_at=queried_sig empty="Nothing in progress." />
-            <OpsLens state title="Due soon" tone="due" rows=due_soon_bucket now=now_sig queried_at=queried_sig empty="Nothing due in the next day." />
-            <OpsLens state title="Blocked / waiting" tone="waiting" rows=blocked_bucket now=now_sig queried_at=queried_sig empty="Nothing blocked." />
-            <OpsLens state title="MVP / Launch" tone="next" rows=tagged_bucket now=now_sig queried_at=queried_sig empty="No MVP or Launch work tagged." />
-            <OpsLens state title="Pinned" tone="pin" rows=pinned_bucket now=now_sig queried_at=queried_sig empty="Nothing pinned." />
-            <OpsLens state title="Done today" tone="done" rows=done_today_bucket now=now_sig queried_at=queried_sig empty="No tasks completed yet today." />
+            <OpsLens state title="Overdue" tone="due" rows=overdue_bucket now=now_sig queried_at=queried_sig empty="Nothing overdue." />
+            <OpsLens state title="Scheduled today" tone="next" rows=scheduled_bucket now=now_sig queried_at=queried_sig empty="No scheduled tasks." />
+            <OpsLens state title="Blocked & waiting" tone="waiting" rows=blocked_bucket now=now_sig queried_at=queried_sig empty="Nothing blocked." />
+            <details><summary>"Done today"</summary>
+                <OpsLens state title="Done today" tone="done" rows=done_today_bucket now=now_sig queried_at=queried_sig empty="No tasks completed yet today." />
+            </details>
         </div>
     }
 }

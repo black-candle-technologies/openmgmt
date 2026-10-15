@@ -132,7 +132,22 @@ pub fn SettingsPage(state: AppState) -> impl IntoView {
             description="Tune how work is scored and prioritized, and export or back up your local data."
         />
 
-        <Section title="Scoring weights">
+        <Section title="Appearance"><crate::app::theme::ThemeToggle /></Section>
+        <Section title="Board ranking">
+            <div class="settings-actions">
+                {[("Balanced", 12, 100, 90, 40, 55), ("Focus my day", 12, 140, 70, 30, 100), ("Deadline driven", 8, 60, 140, 80, 35)].into_iter().map(move |(label, priority, pinned, overdue, soon, progress)| view! {
+                    <Button variant="subtle" on_click=Callback::new(move |_| {
+                        spawn_local(async move {
+                            let patch = ScoringSettingsPatch { priority_weight: Some(priority), pinned_boost: Some(pinned), overdue_boost: Some(overdue), due_soon_boost: Some(soon), in_progress_boost: Some(progress), blocked_penalty: Some(-45), waiting_penalty: Some(-35), paused_project_penalty: Some(-50), due_soon_window_hours: Some(24) };
+                            match invoke::<ScoringSettings>("update_scoring_settings", json!({"patch": patch})).await {
+                                Ok(settings) => { form.set(ScoringForm::from_settings(&settings)); state.refresh(); state.notice.set(Some(format!("{label} ranking applied."))); }
+                                Err(error) => state.fail("Apply preset failed", error),
+                            }
+                        });
+                    })>{label}</Button>
+                }).collect_view()}
+            </div>
+            <details><summary>"Advanced weights"</summary>
             <p class="settings-note">
                 "Urgency is a sum of these weights. Positive numbers push a task up the board; penalties (negative numbers) push it down. Changes apply across the Board, Tasks, and Daily Operations."
             </p>
@@ -175,8 +190,12 @@ pub fn SettingsPage(state: AppState) -> impl IntoView {
             } else {
                 view! { <LoadingState label="Loading scoring settings…" /> }.into_any()
             }}
+            </details>
         </Section>
 
+        <crate::app::updates::UpdatesSettings />
+        <crate::app::updates::DispatchSettings />
+        <Section title="About"><p>{concat!("OpenMGMT ", env!("CARGO_PKG_VERSION"), " — local-first task management.")}</p></Section>
         <Section title="Data export & backup">
             <p class="settings-note">
                 "Exports download to your browser/webview downloads folder. The database backup writes a consistent SQLite snapshot to a path you choose."

@@ -2896,15 +2896,39 @@ name = "openmgmt-desktop"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "open",
  "openmgmt-core",
  "openmgmt-sync-client",
+ "reqwest 0.12.28",
  "serde",
+ "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "openmgmt-dispatch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "regex",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -2,6 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod dispatch;
+mod updater;
 
 use openmgmt_core::{AppService, Database, default_database_path};
 use std::{
@@ -23,7 +25,16 @@ fn main() {
     tauri::Builder::default()
         .manage(AppService::new(database))
         .manage(commands::SyncRuntimeState::default())
+        .manage(updater::Updater::default())
         .invoke_handler(tauri::generate_handler![
+            updater::check_updates,
+            updater::updater_status,
+            updater::install_update,
+            dispatch::dispatch_settings,
+            dispatch::dispatch_signed_in,
+            dispatch::explain_task_rank,
+            dispatch::bind_repository,
+            dispatch::dispatch_request,
             commands::list_organizations,
             commands::create_organization,
             commands::update_organization,

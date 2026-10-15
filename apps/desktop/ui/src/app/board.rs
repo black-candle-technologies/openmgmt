@@ -125,6 +125,7 @@ fn ErRow(item: ScoredTask, tone: &'static str, now: Signal<DateTime<Utc>>) -> im
     let priority = task.priority;
     let pinned = task.pinned;
     let title = task.title.clone();
+    let agent_pill = view! { <crate::app::dispatch::AgentPill task=task.clone() /> };
     let title_tooltip = task.title.clone();
     let status_label = humanize(&task.status.to_string());
     let org_name = context.organization_name.clone();
@@ -168,7 +169,7 @@ fn ErRow(item: ScoredTask, tone: &'static str, now: Signal<DateTime<Utc>>) -> im
             <span class="er-col-pri"><PriorityBadge value=priority /></span>
             <span class="er-col-task">
                 {pinned.then(|| view! { <span class="er-pin" title="Pinned">"★"</span> })}
-                <span class="er-task-title" title=title_tooltip>{title}</span>
+                <span class="er-task-title" title=title_tooltip>{title}{agent_pill}</span>
                 {recurrence.map(|rule| view! { <span class="er-recur" title="Repeats">{"↻ "}{recurrence_label(rule)}</span> })}
             </span>
             <span class="er-col-org">
@@ -245,6 +246,7 @@ fn BoardCard(
     let priority = task.priority;
     let pinned = task.pinned;
     let title = task.title.clone();
+    let agent_pill = view! { <crate::app::dispatch::AgentPill task=task.clone() /> };
     let title_attr = format!("P{priority} · {} priority", priority_label(priority));
     let status_label = humanize(&task.status.to_string());
     let org = context.organization_name.clone();
@@ -313,7 +315,7 @@ fn BoardCard(
                 <span class=format!("bc-status bc-status-{tone}")>{status_label}</span>
                 {pinned.then(|| view! { <span class="bc-pin" title="Pinned">"★"</span> })}
             </div>
-            <h3 class="bc-title">{title}</h3>
+            <h3 class="bc-title">{title}{agent_pill}</h3>
             <div class="bc-meta">
                 <span class="bc-org">
                     <span class="bc-org-dot" style=format!("background:{org_color}")></span>

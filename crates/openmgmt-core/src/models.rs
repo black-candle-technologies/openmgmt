@@ -222,6 +222,8 @@ pub struct Organization {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
+    #[serde(default)]
+    pub repo_binding: Option<crate::RepoBinding>,
     pub id: String,
     pub organization_id: String,
     pub name: String,
@@ -240,6 +242,8 @@ pub struct Project {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
+    #[serde(default)]
+    pub agent: Option<crate::TaskAgent>,
     pub id: String,
     pub project_id: String,
     pub title: String,

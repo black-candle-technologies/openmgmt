@@ -89,6 +89,7 @@ mod tests {
     fn task(id: &str, status: TaskStatus, now: DateTime<Utc>) -> TaskContext {
         TaskContext {
             task: Task {
+                agent: None,
                 id: id.into(),
                 project_id: "project".into(),
                 title: id.into(),

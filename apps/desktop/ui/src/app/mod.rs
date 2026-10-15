@@ -3,13 +3,17 @@
 
 pub mod board;
 pub mod components;
+pub mod dispatch;
 pub mod forms;
 pub mod pages;
+pub mod rank;
 pub mod records;
 pub mod schedule_modal;
 pub mod state;
 pub mod tags;
+pub mod theme;
 pub mod timer;
+pub mod updates;
 pub mod views;
 
 use chrono::Utc;
@@ -54,6 +58,7 @@ async fn run_auto_start(state: AppState) {
 
 #[component]
 pub fn App() -> impl IntoView {
+    theme::initialize();
     let board_only = is_board_window();
     let state = AppState::new();
     let now = RwSignal::new(Utc::now());
@@ -83,6 +88,8 @@ pub fn App() -> impl IntoView {
         .into_any();
     }
 
+    updates::Updates::initialize();
+
     // Main app: load the full snapshot and refresh it every 10s.
     state.refresh();
     let snapshot_refresh = Interval::new(10_000, move || state.refresh());
@@ -99,6 +106,9 @@ pub fn App() -> impl IntoView {
     auto_start_tick.forget();
 
     let page = RwSignal::new(Page::Dashboard);
+    provide_context(page);
+    provide_context(GlobalSearch(RwSignal::new(String::new())));
+    provide_context(AccountStatus(RwSignal::new(false)));
     view! {
         <div class="app-shell">
             <Sidebar state page />
@@ -106,6 +116,7 @@ pub fn App() -> impl IntoView {
                 <TopBar state page />
                 <main class="app-content">
                     <Feedback state />
+                    <updates::UpdateBanner />
                     {move || match page.get() {
                         Page::Dashboard => view! { <pages::Dashboard state page /> }.into_any(),
                         Page::DailyOps => view! { <pages::DailyOpsPage state page now /> }.into_any(),
@@ -115,6 +126,7 @@ pub fn App() -> impl IntoView {
                         Page::Tasks => view! { <pages::TasksPage state now /> }.into_any(),
                         Page::Schedule => view! { <pages::SchedulePage state now /> }.into_any(),
                         Page::Board => view! { <pages::BoardPage state now /> }.into_any(),
+                        Page::AgentSession(task_id, id) => view! { <dispatch::AgentSession state task_id id /> }.into_any(),
                         Page::Sync => view! { <pages::SyncPage /> }.into_any(),
                         Page::Settings => view! { <pages::SettingsPage state /> }.into_any(),
                     }}
@@ -128,7 +140,17 @@ pub fn App() -> impl IntoView {
 
 #[component]
 fn Sidebar(state: AppState, page: RwSignal<Page>) -> impl IntoView {
-    let _ = state;
+    let signed_in = expect_context::<AccountStatus>().0;
+    Effect::new(move |_| {
+        let _ = state.synced_at.get();
+        spawn_local(async move {
+            signed_in.set(
+                invoke::<bool>("dispatch_signed_in", json!({}))
+                    .await
+                    .unwrap_or(false),
+            );
+        });
+    });
     view! {
         <aside class="sidebar">
             <div class="brand">
@@ -151,6 +173,7 @@ fn Sidebar(state: AppState, page: RwSignal<Page>) -> impl IntoView {
             </nav>
             <div class="sidebar-foot">
                 <span class="local-dot"><i></i>"Local database"</span>
+                <button class="nav-button" on:click=move |_| page.set(Page::Sync)>{move || if signed_in.get() { "Black Candle account →" } else { "Sign in →" }}</button>
             </div>
         </aside>
     }
@@ -180,30 +203,33 @@ fn NavButton(label: &'static str, target: Page, page: RwSignal<Page>) -> impl In
 
 #[component]
 fn TopBar(state: AppState, page: RwSignal<Page>) -> impl IntoView {
+    let search = expect_context::<GlobalSearch>();
     view! {
         <header class="topbar">
             <div class="topbar-lead">
                 <h2 class="topbar-title">{move || page.get().title()}</h2>
-                <span class="topbar-status">
+                <span class="topbar-status" title=move || state.synced_at.get().map(|at| format!("Last updated {}", at.format("%H:%M:%S"))).unwrap_or_default()>
                     {move || if state.loading.get() {
                         view! { <span class="status-pill status-pill-busy"><span class="spinner"></span>"Refreshing"</span> }.into_any()
                     } else if state.error.get().is_some() {
                         view! { <span class="status-pill status-pill-error">"Error"</span> }.into_any()
                     } else {
-                        view! { <span class="status-pill status-pill-ok">"Up to date"</span> }.into_any()
+                        view! { <span class="status-pill status-pill-ok">{state.synced_at.get().map(|at| format!("Updated {} UTC", at.format("%H:%M"))).unwrap_or_else(|| "Ready".into())}</span> }.into_any()
                     }}
                 </span>
             </div>
             <div class="topbar-actions">
-                <Button variant="ghost" on_click=Callback::new(move |_| state.refresh())>"Refresh"</Button>
-                <Button variant="primary" on_click=Callback::new(move |_| {
+                <input class="topbar-search" type="search" aria-label="Search tasks" placeholder="Search tasks…" prop:value=move || search.0.get() on:input=move |e| search.0.set(event_target_value(&e)) on:keydown=move |e| { if e.key() == "Enter" { page.set(Page::Tasks); } } />
+                <theme::ThemeToggle />
+                <button class="btn btn-ghost" title="Refresh" aria-label="Refresh" on:click=move |_| state.refresh()>"↻"</button>
+                <Button variant="ghost" on_click=Callback::new(move |_| {
                     spawn_local(async move {
                         match invoke::<()>("open_tv_board_window", serde_json::json!({})).await {
                             Ok(_) => state.notice.set(Some("TV board opened.".into())),
                             Err(error) => state.fail("Could not open TV board", error),
                         }
                     });
-                })>"Open TV Board"</Button>
+                })><span title="Open TV board" aria-label="Open TV board">"▣"</span></Button>
             </div>
         </header>
     }

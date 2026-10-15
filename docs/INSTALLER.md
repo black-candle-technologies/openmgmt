@@ -130,5 +130,55 @@ Not implemented yet; tracked here for when we go public:
 - **Code signing** — sign `openmgmt-desktop.exe` and the NSIS installer with an
   Authenticode certificate to avoid SmartScreen.
 - **GitHub Releases** — attach the `*-setup.exe` artifact.
-- **Tauri updater** — enable the updater plugin for in-app updates.
+- **Release feed** — publish installer assets and `release.json` as described below;
+  the app uses a consent-based installer downloader, not the Tauri updater plugin.
 - **Release channels** — alpha / beta / stable, distinguished by version suffix.
+
+## Bundle CI and update feed
+
+`.github/workflows/release.yml` builds universal macOS DMGs and Windows x64 NSIS
+installers on `v*` tags or manual dispatch. It uploads workflow artifacts only:
+creating a GitHub release, signing/notarizing, and publishing assets remain
+explicit release-engineering steps. Regular PR CI checks the WASM UI and library
+crates, not the native desktop shell; run the bundle workflow on the candidate
+branch before shipping.
+
+The app checks the latest ten GitHub releases on startup (at most once per hour)
+and via Settings → Updates → Check now. Drafts and prereleases are excluded.
+A release must contain a `release.json` asset and the matching installer asset:
+
+```json
+{
+  "schema": 1,
+  "files": [
+    {
+      "platform": "windows",
+      "arch": "x86_64",
+      "name": "OpenMgmt_0.2.0_x64-setup.exe",
+      "sha256": "REPLACE_WITH_64_HEX_DIGITS_FROM_THE_FINAL_INSTALLER",
+      "version_code": 101
+    }
+  ]
+}
+```
+
+Use `macos` / `universal` for the universal DMG. Names must be portable filenames,
+not paths; hashes must be computed after signing. The example hash is deliberately
+invalid and must be replaced. Selection uses a strictly increasing numeric
+`version_code`, not tag or semver ordering. For each release, increase
+`UPDATE_VERSION_CODE` in `apps/desktop/src-tauri/src/updater.rs` (currently 100)
+alongside the app version and use that code in the manifest. Never reuse a code.
+
+Downloads require explicit consent. The app verifies SHA-256 before opening the
+OS installer; mismatches delete the temporary download. This validates integrity
+against the repository's manifest, not an independent signature. Repository
+release permissions and platform signing remain security boundaries.
+
+Before publishing, smoke-test both platforms: appearance persistence, Sync
+sign-in/out, repository binding, prompt generation/model selection, dispatch,
+session polling/cancel/follow-up/PR link, and update acceptance/dismissal. Exercise
+an invalid manifest and checksum mismatch and confirm no installer opens.
+Dispatch requires the deployed service to implement the `/v1` contract in
+`crates/openmgmt-sync-client/src/dispatch.rs`; automated local checks do not prove
+live-service compatibility. Repository bindings and agent metadata are local-only
+and are intentionally not synced between devices.

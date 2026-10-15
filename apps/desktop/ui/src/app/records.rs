@@ -59,6 +59,7 @@ pub fn TaskTable(
 fn TaskRow(state: AppState, task: Task, project_name: String, show_project: bool) -> impl IntoView {
     let edit_task = task.clone();
     let title = task.title.clone();
+    let agent_pill = view! { <crate::app::dispatch::AgentPill task=task.clone() /> };
     let status = task.status.to_string();
     let priority = task.priority;
     let pinned = task.pinned;
@@ -77,7 +78,7 @@ fn TaskRow(state: AppState, task: Task, project_name: String, show_project: bool
             <span class="task-row-pri"><PriorityBadge value=priority /></span>
             <div class="task-row-main">
                 <button class="task-row-title" on:click=move |_| state.open_drawer(Drawer::EditTask(edit_task.clone()))>
-                    {title}
+                    {title}{agent_pill}
                 </button>
                 <div class="task-row-tags">
                     {pinned.then(|| view! { <Badge label="pinned" tone="ready" /> })}
@@ -117,7 +118,6 @@ pub fn QueryTaskTable(
                 <span>"ORG"</span>
                 <span>"PROJECT"</span>
                 <span>"DUE"</span>
-                <span class="qtask-urg-col">"URG"</span>
                 <span class="qtask-timer-col">"TIMER"</span>
             </div>
             {move || {
@@ -154,6 +154,7 @@ fn QueryTaskRow(
     let edit_task = task.clone();
     let schedule_task = task.clone();
     let title = task.title.clone();
+    let agent_pill = view! { <crate::app::dispatch::AgentPill task=task.clone() /> };
     let status = task.status;
     let status_str = task.status.to_string();
     let priority = task.priority;
@@ -187,7 +188,6 @@ fn QueryTaskRow(
         .clone()
         .unwrap_or_else(|| "#7c867c".into());
     let project_name = row.project_name.clone();
-    let urgency = row.urgency_score;
     let can_cancel = !matches!(status, TaskStatus::Canceled);
 
     view! {
@@ -196,7 +196,7 @@ fn QueryTaskRow(
             <div class="qtask-main">
                 <button class="task-row-title" on:click=move |_| state.open_drawer(Drawer::EditTask(edit_task.clone()))>
                     {pinned.then(|| view! { <span class="qtask-pin" title="Pinned">"★ "</span> })}
-                    {title}
+                    {title}{agent_pill}
                 </button>
                 <div class="qtask-tags">
                     {scheduled_label.map(|label| view! { <span class="task-card-sched" title="Scheduled time">{"◷ "}{label}</span> })}
@@ -211,8 +211,8 @@ fn QueryTaskRow(
             </span>
             <span class="qtask-project">{project_name}</span>
             <span class="qtask-due">{due_label}</span>
-            <span class="qtask-urgency qtask-urg-col" title="Urgency score">{urgency}</span>
             <span class="qtask-timer qtask-timer-col">
+                <crate::app::dispatch::AgentRowAction state task=task.clone() />
                 {can_schedule.then(|| view! {
                     <button class="btn btn-subtle qtask-schedule" type="button" title="Schedule this task" on:click=move |_| {
                         schedule_target.set(Some(schedule_task.clone()));
@@ -248,6 +248,7 @@ pub fn TaskCard(
 ) -> impl IntoView {
     let edit_task = task.clone();
     let title = task.title.clone();
+    let agent_pill = view! { <crate::app::dispatch::AgentPill task=task.clone() /> };
     let status = task.status.to_string();
     let priority = task.priority;
     let elapsed = task
@@ -272,7 +273,7 @@ pub fn TaskCard(
             <span class="task-card-pri"><PriorityBadge value=priority /></span>
             <div class="task-card-body">
                 <button class="task-card-title" on:click=move |_| state.open_drawer(Drawer::EditTask(edit_task.clone()))>
-                    {title}
+                    {title}{agent_pill}
                 </button>
                 <div class="task-card-meta">
                     <StatusBadge status />
@@ -365,6 +366,19 @@ fn TaskActions(state: AppState, task: Task) -> impl IntoView {
 /// Project card used in the projects grid.
 #[component]
 pub fn ProjectCard(state: AppState, project: Project, page: RwSignal<Page>) -> impl IntoView {
+    let count_id = project.id.clone();
+    let count = Signal::derive(move || {
+        state
+            .snapshot
+            .get()
+            .tasks
+            .iter()
+            .filter(|t| {
+                t.project_id == count_id
+                    && !matches!(t.status, TaskStatus::Done | TaskStatus::Canceled)
+            })
+            .count()
+    });
     let open_id = project.id.clone();
     let edit_project = project.clone();
     let name = project.name.clone();
@@ -378,6 +392,7 @@ pub fn ProjectCard(state: AppState, project: Project, page: RwSignal<Page>) -> i
 
     view! {
         <article class="record-card project-card">
+            <div class="open-count"><b>{move || count.get()}</b>" open tasks"</div>
             <div class="record-card-top">
                 <StatusBadge status />
                 <PriorityBadge value=priority />
@@ -431,7 +446,10 @@ pub fn OrganizationCard(
         let task_count = snapshot
             .tasks
             .iter()
-            .filter(|task| project_ids.contains(&task.project_id))
+            .filter(|task| {
+                project_ids.contains(&task.project_id)
+                    && !matches!(task.status, TaskStatus::Done | TaskStatus::Canceled)
+            })
             .count();
         (project_ids.len(), task_count)
     });
@@ -439,6 +457,7 @@ pub fn OrganizationCard(
     view! {
         <article class="record-card org-card" style=format!("--accent:{accent}")>
             <span class="org-accent-bar"></span>
+            <div class="open-count"><b>{move || counts.get().1}</b>" open tasks"</div>
             <div class="org-card-head">
                 <span class="org-icon" style=format!("background:{accent}")>{icon}</span>
                 <button class="btn btn-subtle" on:click=move |_| state.open_drawer(Drawer::EditOrganization(edit_org.clone()))>"Edit"</button>
@@ -447,7 +466,7 @@ pub fn OrganizationCard(
             <p class="record-card-desc">{description}</p>
             <div class="org-counts">
                 <span class="org-count"><b>{move || counts.get().0}</b>" projects"</span>
-                <span class="org-count"><b>{move || counts.get().1}</b>" tasks"</span>
+                <span class="org-count"><b>{move || counts.get().1}</b>" open tasks"</span>
             </div>
             <div class="record-card-foot">
                 <small class="org-slug">{format!("/{slug}")}</small>
