@@ -25,6 +25,17 @@ pub fn dispatch_settings(
     Ok(std::fs::read_to_string(path).unwrap_or_else(|_| DEFAULT_BASE_URL.into()))
 }
 #[tauri::command]
+pub fn explain_task_rank(
+    service: State<'_, AppService>,
+    id: String,
+) -> Result<openmgmt_core::scoring::RankExplanation, String> {
+    service
+        .database()
+        .explain_task_rank(&id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn dispatch_signed_in() -> Result<bool, String> {
     load_access_token(desktop_token_store())
         .map(|t| t.is_some())

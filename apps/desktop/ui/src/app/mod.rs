@@ -6,6 +6,7 @@ pub mod components;
 pub mod dispatch;
 pub mod forms;
 pub mod pages;
+pub mod rank;
 pub mod records;
 pub mod schedule_modal;
 pub mod state;
@@ -193,7 +194,7 @@ fn TopBar(state: AppState, page: RwSignal<Page>) -> impl IntoView {
         <header class="topbar">
             <div class="topbar-lead">
                 <h2 class="topbar-title">{move || page.get().title()}</h2>
-                <span class="topbar-status">
+                <span class="topbar-status" title=move || state.synced_at.get().map(|at| format!("Last updated {}", at.format("%H:%M:%S"))).unwrap_or_default()>
                     {move || if state.loading.get() {
                         view! { <span class="status-pill status-pill-busy"><span class="spinner"></span>"Refreshing"</span> }.into_any()
                     } else if state.error.get().is_some() {

@@ -93,7 +93,13 @@ pub fn priority_label(value: i32) -> &'static str {
 #[component]
 pub fn PriorityBadge(value: i32) -> impl IntoView {
     let title = format!("P{value} · {} priority", priority_label(value));
-    view! { <span class=format!("priority priority-p{value}") title=title>{format!("P{value}")}</span> }
+    view! { <span class=format!("priority priority-p{value}") title=title.clone() aria-label=title>
+        <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+            <rect x="1" y="11" width="4" height="6" fill="currentColor" />
+            <rect x="7" y="6" width="4" height="11" fill="currentColor" opacity=if value <= 3 { "1" } else { "0.2" } />
+            <rect x="13" y="1" width="4" height="16" fill="currentColor" opacity=if value <= 2 { "1" } else { "0.2" } />
+        </svg>
+    </span> }
 }
 
 /// Standard page header with eyebrow, title, optional description, and an

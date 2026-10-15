@@ -55,37 +55,77 @@ pub fn priority_rank(priority: i32) -> i32 {
     LOWEST_PRIORITY + 1 - priority.clamp(HIGHEST_PRIORITY, LOWEST_PRIORITY)
 }
 
-pub fn score_task(task: &TaskContext, now: DateTime<Utc>, weights: ScoringWeights) -> i32 {
-    let mut score = priority_rank(task.task.priority) * weights.priority_step
-        + priority_rank(task.project_priority) * weights.project_priority_step;
-    if task.task.pinned {
-        score += weights.pinned;
-    }
-    score += match task.task.status {
-        TaskStatus::InProgress => weights.in_progress,
-        TaskStatus::Ready => weights.ready,
-        TaskStatus::Blocked => weights.blocked,
-        TaskStatus::Waiting => weights.waiting,
-        _ => 0,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RankExplanation {
+    pub rank: Option<usize>,
+    pub factors: Vec<ScoreFactor>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ScoreFactor {
+    pub label: String,
+    pub points: i32,
+}
+
+/// The same factors used by scoring, exposed for a truthful rank explanation.
+pub fn score_factors(
+    task: &TaskContext,
+    now: DateTime<Utc>,
+    weights: ScoringWeights,
+) -> Vec<ScoreFactor> {
+    let mut factors = Vec::new();
+    let mut add = |label: &str, points: i32| {
+        if points != 0 {
+            factors.push(ScoreFactor {
+                label: label.into(),
+                points,
+            });
+        }
     };
+    add(
+        "Task priority",
+        priority_rank(task.task.priority) * weights.priority_step,
+    );
+    add(
+        "Project priority",
+        priority_rank(task.project_priority) * weights.project_priority_step,
+    );
+    if task.task.pinned {
+        add("Pinned for focus", weights.pinned);
+    }
+    match task.task.status {
+        TaskStatus::InProgress => add("Already in progress", weights.in_progress),
+        TaskStatus::Ready => add("Ready to start", weights.ready),
+        TaskStatus::Blocked => add("Blocked work is ranked lower", weights.blocked),
+        TaskStatus::Waiting => add("Waiting for someone else", weights.waiting),
+        _ => {}
+    }
     if task.project_status == ProjectStatus::Paused {
-        score += weights.paused_project;
+        add("Project is paused", weights.paused_project);
     }
     if let Some(due) = task.task.due_at {
         let until = due - now;
-        score += if until < Duration::zero() {
-            weights.overdue_base + (-until.num_days() as i32 * weights.overdue_per_day)
+        if until < Duration::zero() {
+            add(
+                "Past its due date",
+                weights.overdue_base + (-until.num_days() as i32 * weights.overdue_per_day),
+            );
         } else if until <= Duration::hours(1) {
-            weights.due_within_hour
+            add("Due within an hour", weights.due_within_hour);
         } else if until <= Duration::hours(weights.due_soon_window_hours.max(1)) {
-            weights.due_today
+            add("Due soon", weights.due_today);
         } else if until <= Duration::hours(weights.due_soon_window_hours.max(1) * 2) {
-            weights.due_tomorrow
-        } else {
-            0
-        };
+            add("Approaching its due date", weights.due_tomorrow);
+        }
     }
-    score
+    factors
+}
+
+pub fn score_task(task: &TaskContext, now: DateTime<Utc>, weights: ScoringWeights) -> i32 {
+    score_factors(task, now, weights)
+        .iter()
+        .map(|factor| factor.points)
+        .sum()
 }
 
 #[cfg(test)]
@@ -131,6 +171,21 @@ mod tests {
             organization_name: "Personal".into(),
             organization_color: None,
         }
+    }
+
+    #[test]
+    fn explanation_is_the_score_and_preserves_penalties() {
+        let now = Utc::now();
+        let mut task = context();
+        task.task.status = TaskStatus::Blocked;
+        task.task.pinned = true;
+        let factors = score_factors(&task, now, ScoringWeights::default());
+        assert_eq!(
+            factors.iter().map(|f| f.points).sum::<i32>(),
+            score_task(&task, now, ScoringWeights::default())
+        );
+        assert!(factors.iter().any(|f| f.points == -45));
+        assert!(factors.iter().any(|f| f.label == "Pinned for focus"));
     }
 
     #[test]

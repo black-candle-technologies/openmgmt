@@ -1275,3 +1275,35 @@ input, select, textarea, .form-field input, .filter-control input, .filter-contr
 .bc-status-later, .er-status-later { color: var(--bucket-later); }
 .bc-status-done, .er-status-done { color: var(--bucket-done); }
 :focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+
+:root {
+  --agent-running-bg: #DCEAD2; --agent-running-ink: #294F37;
+  --agent-input-bg: #F8ECD2; --agent-input-ink: #7C5A17;
+  --agent-pr-bg: #D9E4F7; --agent-pr-ink: #2F4D8A;
+  --agent-done-bg: #E7DDF2; --agent-done-ink: #5B4390;
+  --agent-failed-bg: #F6D9D6; --agent-failed-ink: #8D302B;
+}
+[data-theme="dark"], .tv-board, .board-preview {
+  --agent-running-bg: #203323; --agent-running-ink: #A5D695;
+  --agent-input-bg: #392C15; --agent-input-ink: #E0A52E;
+  --agent-pr-bg: #1E2C42; --agent-pr-ink: #9EBFF6;
+  --agent-done-bg: #30243D; --agent-done-ink: #C5A8E8;
+  --agent-failed-bg: #3A1713; --agent-failed-ink: #F39D96;
+}
+.agent-pill { display: inline-block; margin-inline: 6px; padding: 3px 8px; border-radius: var(--radius-pill); font: 500 11px var(--font); background: var(--surface-2); color: var(--text-soft); }
+.agent-Running { background: var(--agent-running-bg); color: var(--agent-running-ink); }
+.agent-NeedsInput { background: var(--agent-input-bg); color: var(--agent-input-ink); }
+.agent-PrOpened { background: var(--agent-pr-bg); color: var(--agent-pr-ink); }
+.agent-Done { background: var(--agent-done-bg); color: var(--agent-done-ink); }
+.agent-Failed { background: var(--agent-failed-bg); color: var(--agent-failed-ink); }
+.agent-section { padding: 16px; margin-block: 12px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); }
+.agent-section textarea { width: 100%; margin-block: 12px; padding: 10px; }
+.skeleton { padding: 24px; background: var(--surface-sunken); border-radius: 8px; }
+.open-count { color: var(--text-muted); margin-bottom: 12px; }
+.open-count b { font: 600 32px var(--mono); color: var(--text); }
+.priority { padding: 3px; background: transparent; }
+summary { cursor: pointer; padding-block: 12px; font-weight: 600; }
+.panel { border-radius: 14px; }
+.metric-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.filter-bar { flex-wrap: wrap; }
+@media (max-width: 1000px) { .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

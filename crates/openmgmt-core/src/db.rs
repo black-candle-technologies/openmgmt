@@ -2174,6 +2174,22 @@ impl Database {
         )
     }
 
+    pub fn explain_task_rank(&self, id: &str) -> Result<crate::scoring::RankExplanation> {
+        let rows = self.query_tasks(TaskQueryFilter::default(), None)?;
+        let rank = rows.iter().position(|row| row.task.id == id).map(|i| i + 1);
+        let context = self
+            .task_context_rows()?
+            .into_iter()
+            .find(|row| row.0.task.id == id)
+            .ok_or(CoreError::NotFound("task"))?
+            .0;
+        let mut factors =
+            crate::scoring::score_factors(&context, Utc::now(), self.scoring_weights()?);
+        factors.sort_by_key(|factor| std::cmp::Reverse(factor.points.unsigned_abs()));
+        factors.truncate(3);
+        Ok(crate::scoring::RankExplanation { rank, factors })
+    }
+
     pub fn query_tasks(
         &self,
         filter: TaskQueryFilter,
@@ -3745,6 +3761,60 @@ mod tests {
         assert!(rows[1].record.detail.is_none());
 
         assert_eq!(database.list_mcp_audit(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dispatch_metadata_survives_migration_and_normal_task_edits() {
+        let db = seeded_database();
+        let task = db.list_tasks().unwrap().remove(0);
+        let binding = crate::RepoBinding {
+            owner: "black-candle-technologies".into(),
+            name: "openmgmt".into(),
+            default_branch: "master".into(),
+        };
+        db.set_repo_binding(&task.project_id, &binding).unwrap();
+        let agent = crate::TaskAgent {
+            state: crate::AgentState::Running,
+            dispatch_id: "job-1".into(),
+            pr_url: None,
+            updated_at: Utc::now(),
+        };
+        db.set_task_agent(&task.id, &agent).unwrap();
+        db.migrate().unwrap();
+        db.update_task(
+            &task.id,
+            TaskPatch {
+                title: Some("Edited title".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_task(&task.id).unwrap().agent.unwrap().dispatch_id,
+            "job-1"
+        );
+        assert_eq!(
+            db.get_project(&task.project_id)
+                .unwrap()
+                .repo_binding
+                .unwrap()
+                .default_branch,
+            "master"
+        );
+        assert!(
+            db.query_tasks(TaskQueryFilter::default(), None)
+                .unwrap()
+                .iter()
+                .any(|row| row.task.agent.is_some())
+        );
+        let mut legacy = serde_json::to_value(&task).unwrap();
+        legacy.as_object_mut().unwrap().remove("agent");
+        assert!(
+            serde_json::from_value::<Task>(legacy)
+                .unwrap()
+                .agent
+                .is_none()
+        );
     }
 
     fn seeded_database() -> Database {

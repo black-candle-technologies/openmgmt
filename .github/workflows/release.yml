@@ -1,0 +1,44 @@
+name: Desktop bundles
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: universal-apple-darwin
+            config: tauri.macos.conf.json
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            config: tauri.windows.conf.json
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || 'x86_64-pc-windows-msvc' }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install frontend bundler
+        run: cargo install trunk --version 0.21.14 --locked
+      - uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: apps/desktop
+          args: --target ${{ matrix.target }} --config src-tauri/${{ matrix.config }}
+          # No tagName/releaseId: build only, never publish GitHub releases.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openmgmt-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/bundle/**/*.dmg
+            target/${{ matrix.target }}/release/bundle/**/*.exe
+            target/${{ matrix.target }}/release/bundle/**/*.msi
+          if-no-files-found: error

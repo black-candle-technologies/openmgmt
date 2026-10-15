@@ -32,6 +32,7 @@ fn main() {
             updater::install_update,
             dispatch::dispatch_settings,
             dispatch::dispatch_signed_in,
+            dispatch::explain_task_rank,
             dispatch::bind_repository,
             dispatch::dispatch_request,
             commands::list_organizations,
